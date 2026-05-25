@@ -2,19 +2,24 @@
 
 MVP subcommands:
 
-  symposium run    --config CONFIG.yaml  --script SCRIPT.json  [--output runs/]  [problem.md]
-      Runs a session against a FakeProvider driven by the given script.
-      The `problem.md` positional overrides `config.problem_statement`.
+  symposium run --config CONFIG.yaml [--script SCRIPT.json] [--output runs/] [problem.md]
+      Runs a session. The runtime resolves `provider` strings on every
+      agent (and on the coordinator) through the adapter registry
+      (§6.11). The built-in registry ships `openai`; the `fake` adapter
+      is registered ad-hoc when `--script` is given.
 
   symposium replay RUN_DIR
-      Re-renders the stored canonical_transcript and verifies the digest.
+      Re-renders the stored canonical_transcript and verifies the
+      transcript_digest.
 
   symposium validate ARTIFACT.json
       Validates an artifact against the v1.0.0 JSON Schemas.
 
-Real provider adapters (OpenAI-shaped, Anthropic-shaped) are not part
-of the walking skeleton and the CLI does not yet wire them in. They
-land in a follow-up milestone.
+Environment variables consumed by built-in adapters:
+
+  OPENAI_API_KEY  — required when any agent declares `provider: openai`.
+                    The OpenAIProvider fails fast at construction
+                    (§6.8) if the variable is missing.
 """
 
 from __future__ import annotations
@@ -28,7 +33,13 @@ import click
 import yaml
 
 from symposium.models import Config, FakeProviderScript
-from symposium.providers import FakeProvider
+from symposium.providers import (
+    FakeProvider,
+    MissingCredentialsError,
+    UnknownProviderError,
+    default_registry,
+    make_fake_factory,
+)
 from symposium.replay import replay_transcript
 from symposium.scheduler import run_session
 
@@ -49,8 +60,8 @@ def main() -> None:
 @click.option(
     "--script", "script_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-    help="FakeProvider script (JSON).",
+    required=False,
+    help="FakeProvider script (JSON). Required when any agent declares `provider: fake`.",
 )
 @click.option(
     "--output", "runs_root",
@@ -64,13 +75,31 @@ def main() -> None:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=False,
 )
-def run_cmd(config_path: Path, script_path: Path, runs_root: Path, problem_path: Optional[Path]) -> None:
-    """Run a Symposium session with a FakeProvider."""
+def run_cmd(
+    config_path: Path,
+    script_path: Optional[Path],
+    runs_root: Path,
+    problem_path: Optional[Path],
+) -> None:
+    """Run a Symposium session against the registered providers."""
     config = _load_config(config_path, problem_path)
-    script = _load_script(script_path)
 
-    fp = FakeProvider(script=script)
-    providers = {"default": fp}
+    registry = default_registry()
+    if script_path is not None:
+        fp = FakeProvider(script=_load_script(script_path))
+        registry.register("fake", make_fake_factory(fp))
+
+    try:
+        providers = registry.build_session_providers(config)
+    except UnknownProviderError as exc:
+        click.echo(
+            f"ERROR: {exc} — either register a factory or set provider correctly in the config.",
+            err=True,
+        )
+        sys.exit(2)
+    except MissingCredentialsError as exc:
+        click.echo(f"ERROR: {exc}", err=True)
+        sys.exit(2)
 
     artifact = run_session(config, providers, runs_root=str(runs_root))
     run_dir = runs_root / config.session_id
@@ -99,7 +128,6 @@ def replay_cmd(run_dir: Path) -> None:
 def validate_cmd(artifact_path: Path) -> None:
     """Validate an artifact.json against the v1.0.0 Artifact schema."""
     from jsonschema import Draft202012Validator
-    from referencing import Registry, Resource
     schemas_dir = (
         Path(__file__).resolve().parents[2] / "docs" / "schemas" / "v1.0.0"
     )
@@ -124,8 +152,6 @@ def _load_config(path: Path, problem_path: Optional[Path]) -> Config:
     raw = _read_yaml_or_json(path)
     if problem_path is not None:
         raw["problem_statement"] = problem_path.read_text().strip()
-    # Resolve inline persona references in `agents[].persona_ref` if they
-    # are strings referring to built-in personas.
     from symposium.personas import persona_by_id
 
     def _resolve(ac: dict) -> dict:
@@ -163,8 +189,6 @@ def _load_registry(schemas_dir: Path):
         data = json.loads(schema_path.read_text())
         if "$id" not in data:
             continue
-        # Register under both absolute $id and bare filename so cross-file
-        # $refs (which use bare filenames) resolve.
         resources.append((data["$id"], Resource.from_contents(data)))
         resources.append((schema_path.name, Resource.from_contents(data)))
     return Registry().with_resources(resources)
