@@ -1,0 +1,252 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Two-round deliberation that converges and finalizes. Drives the walking-skeleton sample: 5 primary_turns + 1 coordination_turn per round + 1 synthesis. No forks, no deferrals, no failures.",
+  "on_exhaustion": "error",
+  "entries": [
+    {
+      "comment": "Round 1 — logician primary_turn",
+      "match": { "agent_id": "logician", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200, "cost_usd": 0.001 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Assume the goal is to make deliberation behavior testable. Then a structured protocol is preferable: it exposes scheduler invariants that can be property-tested. Ad-hoc group chat does not have those invariants. Assumption: 'testable' is a primary design constraint."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 1 — visionary primary_turn",
+      "match": { "agent_id": "visionary", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 130, "completion_tokens": 90, "total_tokens": 220, "cost_usd": 0.0012 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Reframe: rather than 'protocol vs ad-hoc', view the choice as 'one shared formalism vs N divergent reinventions'. The latter is what every team currently does. Analogy: HTTP vs vendor-specific inter-app calls in the 90s. The standardization itself is the value."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 1 — researcher primary_turn",
+      "match": { "agent_id": "researcher", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 140, "completion_tokens": 70, "total_tokens": 210, "cost_usd": 0.001 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "AutoGen group-chat, CrewAI hierarchical, LangGraph state machines, and OpenAI Agents SDK handoffs each define a different 'who speaks next' contract. Replayability is implemented (or not) per framework. Evidence gap: I have no benchmark comparing convergence quality of structured vs unstructured protocols on the same problem set."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 1 — critic primary_turn",
+      "match": { "agent_id": "critic", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 125, "completion_tokens": 85, "total_tokens": 210, "cost_usd": 0.001 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Failure scenario: a structured protocol that over-constrains the conversation leaves no room for emergent collaboration; teams route around it with side-channels and you end up with both the protocol overhead AND ad-hoc behavior. Cost worth knowing, not a fatal flaw — if and only if the protocol leaves escape hatches (the deferred queue, direct_request types). Symposium does."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 1 — engineer primary_turn",
+      "match": { "agent_id": "engineer", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 130, "completion_tokens": 90, "total_tokens": 220, "cost_usd": 0.0012 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Implementation cost: structured protocol = pay upfront in schema authoring + scheduler invariants, then operate cheaply. Ad-hoc = pay nothing upfront, then re-pay per incident debugging non-deterministic conversations. The smallest viable variant: ship the spec + JSON Schemas + FakeProvider tests now; defer real adapters until one is needed."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 1 — coordinator coordination_turn",
+      "match": { "agent_id": "coordinator", "expected_output_schema": "verdict" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 200, "completion_tokens": 110, "total_tokens": 310, "cost_usd": 0.0018 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "next_action": "continue",
+          "rationale": "Panel converged on 'structured is preferable given testability/standardization', with one explicit cost flag from the critic that the protocol must keep escape hatches. Engineer's smallest-viable-variant proposal narrows scope. Worth one more round to surface remaining unresolved disagreements before finalizing.",
+          "confidence": 0.78,
+          "focus": "Identify any remaining unresolved disagreements; pressure-test the smallest-viable-variant proposal.",
+          "next_agents": ["critic", "engineer"],
+          "resolved_disagreements": [
+            {
+              "topic": "Is the value of a structured protocol primarily testability?",
+              "resolution": "Panel agreed testability is a primary anchor but not the only one — standardization across teams is also load-bearing (visionary).",
+              "agents_involved": ["logician", "visionary"]
+            }
+          ],
+          "unresolved_disagreements": [
+            {
+              "topic": "Should adoption be incremental (engineer) or comprehensive (visionary/logician)?",
+              "positions": [
+                { "agent": "engineer", "claim": "Ship smallest variant (spec + FakeProvider), defer real adapters." },
+                { "agent": "visionary", "claim": "Standardization wins only if adoption is broad enough to anchor a norm." }
+              ],
+              "blocker": false
+            }
+          ]
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 2 — logician primary_turn",
+      "match": { "agent_id": "logician", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 200, "completion_tokens": 80, "total_tokens": 280, "cost_usd": 0.0014 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "The unresolved disagreement is decidable: incremental and comprehensive are not mutually exclusive — the smallest viable variant IS the standardization unit, provided the spec is stable. Stability is a property of the artifact (frozen schemas), not the adoption strategy. Both sides agree if 'standardization' is read as 'shared spec', not 'shared deployment'."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 2 — visionary primary_turn",
+      "match": { "agent_id": "visionary", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 210, "completion_tokens": 85, "total_tokens": 295, "cost_usd": 0.0015 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Accept the logician's reframing. The standardization-as-spec reading dissolves the disagreement. Reframe the recommendation: ship the spec + reference impl, and let adoption follow from the artifact rather than from a coordinated rollout. HTTP was not coordinated; CERN published the spec and the ecosystem followed."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 2 — researcher primary_turn",
+      "match": { "agent_id": "researcher", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 215, "completion_tokens": 70, "total_tokens": 285, "cost_usd": 0.0014 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Confirms with weak evidence: every successful protocol I can cite (HTTP, JSON-RPC, OpenAPI) became normative by spec publication, not by coordinated deployment. The unresolved disagreement folds. Remaining evidence gap (no convergence benchmark) is for v1 work, not a blocker."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 2 — critic primary_turn",
+      "match": { "agent_id": "critic", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 215, "completion_tokens": 80, "total_tokens": 295, "cost_usd": 0.0015 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Reservation released. The 'incremental vs comprehensive' framing was the critic's blocker; the logician collapsed it. No new failure scenario emerges from the reframing. Concur: the protocol is ready to publish; adoption is the v1 problem."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 2 — engineer primary_turn",
+      "match": { "agent_id": "engineer", "expected_output_schema": "turn_structured_output" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 220, "completion_tokens": 90, "total_tokens": 310, "cost_usd": 0.0016 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "Implementation recommendation, stated as the smallest viable variant: publish spec + JSON Schemas + a FakeProvider-driven reference impl (validators + golden tests + replay). Cost: weeks, not months. The reference impl is the executable spec; teams adopt by reading both. Real adapters land when a concrete user asks for one."
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Round 2 — coordinator coordination_turn (finalize)",
+      "match": { "agent_id": "coordinator", "expected_output_schema": "verdict" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 320, "completion_tokens": 130, "total_tokens": 450, "cost_usd": 0.0024 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "next_action": "finalize",
+          "rationale": "The Round-1 unresolved disagreement folded under the logician's reframing in Round 2; visionary, researcher, critic, and engineer concur. No new disagreement was raised. The panel converged on a single recommendation with a smallest-viable-variant rollout. Ready for synthesis.",
+          "confidence": 0.88,
+          "focus": "Integrate the panel's recommendation into a final answer.",
+          "next_agents": [],
+          "resolved_disagreements": [
+            {
+              "topic": "Should adoption be incremental or comprehensive?",
+              "resolution": "Folded: 'incremental' and 'comprehensive' both reduce to 'publish a stable spec'; adoption strategy is downstream.",
+              "agents_involved": ["engineer", "visionary", "logician"]
+            }
+          ],
+          "unresolved_disagreements": []
+        },
+        "raw": null,
+        "error": null
+      }
+    },
+    {
+      "comment": "Synthesis invocation",
+      "match": { "agent_id": "coordinator", "expected_output_schema": "synthesis_content" },
+      "result": {
+        "messages": [{ "role": "assistant", "content": "..." }],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 400, "completion_tokens": 200, "total_tokens": 600, "cost_usd": 0.0036 },
+        "finish_reason": "stop",
+        "structured_output": {
+          "integrated_answer": "Adopt a structured deliberation protocol. The case rests on three converging findings: (1) testability — a structured protocol exposes scheduler invariants that ad-hoc orchestration cannot; (2) standardization — a published spec lowers per-team reinvention cost; (3) deployable scope — the smallest viable variant is spec + JSON Schemas + a FakeProvider-driven reference implementation, which is achievable in weeks. Adoption strategy is downstream of artifact stability and should follow rather than precede publication.",
+          "resolved_disagreements": [
+            {
+              "topic": "Is the value of a structured protocol primarily testability?",
+              "resolution": "Resolved across rounds: testability is one of two primary anchors (the other is standardization).",
+              "agents_involved": ["logician", "visionary"]
+            },
+            {
+              "topic": "Should adoption be incremental or comprehensive?",
+              "resolution": "Resolved in Round 2: both framings reduce to 'publish a stable spec'; adoption is downstream.",
+              "agents_involved": ["engineer", "visionary", "logician"]
+            }
+          ],
+          "unresolved_disagreements": [],
+          "confidence": 0.85,
+          "open_questions": [
+            "Empirical benchmark of convergence quality on a shared problem set (researcher-flagged evidence gap; v1 work)."
+          ]
+        },
+        "raw": null,
+        "error": null
+      }
+    }
+  ]
+}
