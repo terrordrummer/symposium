@@ -91,7 +91,7 @@ class AdapterRegistry:
 
 
 def default_registry() -> AdapterRegistry:
-    """Built-in registry with the OpenAI-shaped HTTP adapter.
+    """Built-in registry with the §6 HTTP adapters.
 
     `fake` is NOT registered by default: the FakeProvider requires a
     `FakeProviderScript` at construction, which the registry has no
@@ -100,6 +100,7 @@ def default_registry() -> AdapterRegistry:
     """
     r = AdapterRegistry()
     r.register("openai", _openai_factory)
+    r.register("anthropic", _anthropic_factory)
     return r
 
 
@@ -112,6 +113,21 @@ def _openai_factory(provider_id: str, config: Config) -> ProviderAdapter:
 
     return OpenAIProvider(
         base_url=os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL),
+        max_tool_iterations=config.runtime.max_tool_iterations,
+    )
+
+
+def _anthropic_factory(provider_id: str, config: Config) -> ProviderAdapter:
+    # Late import: same rationale as the OpenAI factory.
+    import os
+
+    from symposium.providers.anthropic import (
+        DEFAULT_ANTHROPIC_BASE_URL,
+        AnthropicProvider,
+    )
+
+    return AnthropicProvider(
+        base_url=os.environ.get("ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL),
         max_tool_iterations=config.runtime.max_tool_iterations,
     )
 

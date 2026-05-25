@@ -6,12 +6,15 @@ Built-in adapters:
   `FakeProviderScript`.
 * `OpenAIProvider` (§6.12) — HTTP adapter for OpenAI-Chat-Completions-
   shaped endpoints (real OpenAI plus self-hosted compatible servers).
+* `AnthropicProvider` (§6.13) — HTTP adapter for Anthropic-Messages-
+  shaped endpoints (real Anthropic plus self-hosted compatible servers).
 
 Discovery happens through `AdapterRegistry` (§6.11). Use
 `default_registry()` to get a registry pre-populated with built-in
 factories; `register` adds custom factories at runtime.
 """
 
+from symposium.providers.anthropic import AnthropicProvider
 from symposium.providers.base import ProviderAdapter
 from symposium.providers.fake import FakeProvider
 from symposium.providers.openai import OpenAIProvider
@@ -27,6 +30,7 @@ from symposium.providers.registry import (
 __all__ = [
     "AdapterFactory",
     "AdapterRegistry",
+    "AnthropicProvider",
     "FakeProvider",
     "MissingCredentialsError",
     "OpenAIProvider",

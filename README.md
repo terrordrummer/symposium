@@ -37,9 +37,10 @@ Two things ship together in this repo:
    in any language. The spec is what conformance means.
 2. **`symposium/`** — the reference Python runtime. Today: full
    scheduler, persistence, replay, the deterministic `FakeProvider`
-   adapter, and an OpenAI-shaped HTTP adapter (real OpenAI plus
-   self-hosted OpenAI-compatible endpoints). The Anthropic-shaped
-   adapter lands in the next milestone.
+   adapter, an OpenAI-shaped HTTP adapter (real OpenAI plus
+   self-hosted OpenAI-compatible endpoints), and an Anthropic-shaped
+   HTTP adapter (real Anthropic plus self-hosted Anthropic-compatible
+   endpoints).
 
 ---
 
@@ -71,11 +72,13 @@ Full discussion in §10 *Competitive Positioning* of the spec.
 
 ## Quick start
 
-The reference runtime ships two adapters out of the box: the
-deterministic `FakeProvider` (for tests and reproducible demos) and
-an OpenAI-shaped HTTP adapter (for real-model sessions against
-`api.openai.com` or any OpenAI-Chat-Completions-compatible endpoint).
-Either flow produces a persisted, byte-identically replayable artifact.
+The reference runtime ships three adapters out of the box: the
+deterministic `FakeProvider` (for tests and reproducible demos), an
+OpenAI-shaped HTTP adapter (for real-model sessions against
+`api.openai.com` or any OpenAI-Chat-Completions-compatible endpoint),
+and an Anthropic-shaped HTTP adapter (for real-model sessions against
+`api.anthropic.com` or any Anthropic-Messages-compatible endpoint).
+Every flow produces a persisted, byte-identically replayable artifact.
 
 ```bash
 # Install (editable, while the package is pre-PyPI)
@@ -113,10 +116,23 @@ symposium run \
   examples/problem.md
 ```
 
+### Anthropic-driven session
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+# Optional: point at a self-hosted Anthropic-compatible endpoint
+# export ANTHROPIC_BASE_URL=https://my-llm-proxy.internal/v1
+
+symposium run \
+  --config examples/configs/anthropic.yaml \
+  --output runs/ \
+  examples/problem.md
+```
+
 The CLI resolves each agent's `provider` string through the adapter
-registry (§6.11). Built-in registrations: `openai` (the HTTP adapter
-above) and — when `--script` is given — `fake`. Plug your own adapter
-in by registering a factory before the run.
+registry (§6.11). Built-in registrations: `openai`, `anthropic`, and
+— when `--script` is given — `fake`. Plug your own adapter in by
+registering a factory before the run.
 
 ### Library use
 
@@ -150,7 +166,7 @@ print(artifact.outcome.kind)             # "synthesis" or "termination"
 │       └── examples/             # 28 positive + 36 negative fixtures + validators
 ├── symposium/                    # Reference Python runtime
 │   ├── models.py                 # Pydantic models mirroring the JSON Schemas
-│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI adapters
+│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic adapters
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest
 │   ├── replay/                   # transcript_replay (§7.5)

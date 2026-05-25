@@ -1,50 +1,66 @@
-"""OpenAI-shaped HTTP provider adapter (§6.12).
+"""Anthropic-shaped HTTP provider adapter (§6.13).
 
 Implements the §6.1 `ProviderAdapter` contract against the
-`POST /v1/chat/completions` endpoint of an OpenAI-compatible API. The
-adapter is transport-only: it has no opinion about prompt-formatting
-(the runtime owns `request.messages` per §6.3), and it does not
-re-derive anything from a `ContextPacket`.
+`POST /v1/messages` endpoint of an Anthropic-compatible Messages API.
+The adapter is structurally a sibling of `OpenAIProvider`: same
+single-pass + tool-loop + corrective-retry + error-classification
+scaffolding, different vendor wire format and §6.6 / §6.10 mapping
+tables.
 
 What this module covers
 -----------------------
 
-* **Happy path** — single round-trip, JSON-decoded structured output
-  validated against `expected_output_schema` before return.
-* **Internal tool-call loop (§6.4)** — up to `max_tool_iterations`
-  iterations; `tool_events[]` populated in execution order; unknown
-  tool / invalid args / handler exception / iteration cap all map to
-  `tool_failure`.
-* **Structured-output enforcement (§6.5)** — validation failure
-  populates `error.kind = "malformed_response"`.
-* **Corrective retry on malformed_response (§6.7)** — one corrective
-  packet is constructed and re-sent in-adapter before the failure
-  surfaces to the runtime. See the "open clarification" note below.
+* **System-message rewire (§6.13)** — `request.messages[0]` (canonical
+  `system` position per §6.3) is hoisted into the top-level `system`
+  field of the Messages API request body. It is NOT re-emitted as a
+  `role = system` entry inside the body's `messages[]`.
+* **Tool loop (§6.4)** — the vendor uses parallel `tool_use` /
+  `tool_result` BLOCKS inside `content[]`; the adapter translates one
+  vendor response into one iteration regardless of how many tool_use
+  blocks it carries. Tool results are sent back as a synthetic
+  `user`-role message whose `content[]` is one `{type:"tool_result",
+  tool_use_id, content}` block per call. The translation is
+  adapter-internal — the outgoing `provider_result.messages[]` still
+  reports the canonical `tool` role (§6.3).
+* **Structured-output enforcement (§6.5)** — the adapter parses the
+  first `text` block of the assistant's `content[]` array as JSON and
+  validates against `expected_output_schema`. On failure,
+  `error.kind = "malformed_response"`.
+* **Corrective retry (§6.7)** — same open-clarification posture as the
+  OpenAI adapter: ONE corrective retry attempt happens in-adapter on
+  `malformed_response` before surfacing the failure to the runtime.
+  The runtime may further retry per §4.9.
 * **Error mapping (§6.6)** — every CLOSED `error.kind` value has a
-  vendor-signal trigger.
-* **Finish-reason normalization (§6.10)** — terminal reason mapped
-  into the CLOSED 5-value enum.
+  vendor-signal trigger. Anthropic-specific signals:
+    - HTTP 529 (`overloaded_error`) → `rate_limit`.
+    - HTTP 429 (`rate_limit_error`) whose body message contains a
+      quota marker → `quota_exhausted`; otherwise → `rate_limit`.
+    - `stop_reason = "refusal"` (Sonnet 4.5+) → `content_filter`.
+    - `stop_reason = "stop_sequence"` → SUCCESS (`finish_reason =
+      stop`, NOT a content_filter).
+* **Finish-reason normalization (§6.10)** — `end_turn` / `stop_sequence`
+  → `stop`; `max_tokens` → `length`; `refusal` → `content_filter`;
+  anything else collapses to `error`.
 * **Credentials (§6.8 + §8.9)** — fail-fast at construction if
-  `OPENAI_API_KEY` is missing; the secret never enters `raw`,
-  `messages`, `tool_events`, or `error.details`.
+  `ANTHROPIC_API_KEY` is missing. Auth uses the `x-api-key` header.
+  The pinned `anthropic-version` header is a module constant; bumping
+  it is a code change, not a config change (vendor versioning is
+  prose, per N4).
+* **Sampling**: `seed` and `reasoning_effort` are silently dropped
+  per §6.2 ("adapters MUST silently drop unrecognized keys"). The
+  Messages API requires `max_tokens`; we default to 1024 if
+  `sampling.max_tokens` is not supplied.
 
-Open clarification (§6.5 vs M2 done-criteria)
----------------------------------------------
+Open clarification (`rate_limit` vs `quota_exhausted`)
+------------------------------------------------------
 
-§6.5 reads "On validation failure. The adapter does NOT retry
-internally (N10)." — the corrective retry is described as a runtime
-concern in §6.7. The M2 prompt's done-criteria list explicitly
-require the adapter to construct and send the corrective-retry
-packet on `malformed_response` up to its internal cap. The
-operational reality is that the current scheduler's
-`_invoke_with_retry` re-issues the original request unchanged on a
-retriable error, so an internal corrective retry is the only way the
-malformed-response → corrective-packet → success path gets exercised
-end-to-end. We resolve the ambiguity in favor of the M2 prompt:
-the adapter does ONE corrective-retry attempt after a
-`malformed_response`. The runtime may further retry per §4.9; this
-does not double-count because the second adapter call is just a
-single `invoke()` from the runtime's perspective.
+§6.6 distinguishes `rate_limit` from `quota_exhausted` for
+"`rate_limit_error` exhausting a daily/monthly hard cap" but Anthropic
+does NOT emit a distinct error type for it. Heuristic: if the response
+body's `error.message` contains "quota", "monthly_limit_reached", or a
+similar vendor-documented marker, classify as `quota_exhausted`;
+otherwise default to `rate_limit`. The heuristic is documented here
+and flagged as a v1+ refinement candidate.
 """
 
 from __future__ import annotations
@@ -78,78 +94,114 @@ from symposium.providers._http_common import (
 from symposium.providers.base import ProviderAdapter
 from symposium.providers.registry import MissingCredentialsError
 
-DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 
-# Minimal per-1k-token price table for cost_usd computation (§6.9).
-# Values approximate public OpenAI pricing at M2 drafting; the adapter
-# treats this as adapter-internal config, not part of the spec body.
+# Pinned `anthropic-version` header value. Bumping this is a code
+# change, NOT a config change — vendor versioning is N4 prose. Pick a
+# value at implementation time that matches the Messages-API contract
+# this adapter was tested against.
+DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+
+# Required-but-defaulted `max_tokens`. The Messages API REQUIRES this
+# field on every request; if the caller didn't supply it via
+# `sampling.max_tokens`, we substitute this default. Surfacing the
+# default here keeps callers from having to know vendor-specific
+# requirements.
+DEFAULT_MAX_TOKENS = 1024
+
+# Per-1k-token price table for `cost_usd` (§6.9). Values approximate
+# public Anthropic pricing at M3 drafting; the adapter treats this as
+# adapter-internal config, NOT part of the spec body (N4).
 # Keys: model id → (prompt_per_1k_usd, completion_per_1k_usd).
 _DEFAULT_PRICES: Dict[str, Tuple[float, float]] = {
-    "gpt-4o": (0.005, 0.015),
-    "gpt-4o-mini": (0.00015, 0.0006),
-    "gpt-4.1": (0.002, 0.008),
-    "gpt-4.1-mini": (0.0004, 0.0016),
-    "gpt-4-turbo": (0.01, 0.03),
-    "gpt-3.5-turbo": (0.0005, 0.0015),
+    "claude-opus-4-7": (0.015, 0.075),
+    "claude-opus-4-6": (0.015, 0.075),
+    "claude-opus-4": (0.015, 0.075),
+    "claude-sonnet-4-6": (0.003, 0.015),
+    "claude-sonnet-4-5": (0.003, 0.015),
+    "claude-sonnet-4": (0.003, 0.015),
+    "claude-haiku-4-5": (0.001, 0.005),
+    "claude-3-5-sonnet": (0.003, 0.015),
+    "claude-3-5-haiku": (0.0008, 0.004),
+    "claude-3-opus": (0.015, 0.075),
+    "claude-3-sonnet": (0.003, 0.015),
+    "claude-3-haiku": (0.00025, 0.00125),
 }
+
+# Vendor markers we use to disambiguate `rate_limit` from
+# `quota_exhausted` on HTTP 429 (`rate_limit_error`). The list is
+# intentionally small and case-insensitive; bumping it is a code
+# change.
+_QUOTA_MARKERS: Tuple[str, ...] = (
+    "quota",
+    "monthly_limit",
+    "credit balance",
+    "daily limit",
+)
 
 ToolHandler = Callable[[Dict[str, Any]], Any]
 
 
-class OpenAIProvider(ProviderAdapter):
-    """OpenAI-shaped Chat Completions adapter (§6.12).
+class AnthropicProvider(ProviderAdapter):
+    """Anthropic-shaped Messages API adapter (§6.13).
 
     Constructor parameters
     ----------------------
 
     api_key:
-        Bearer token. Defaults to `os.environ["OPENAI_API_KEY"]`.
-        Fail-fast at construction if neither is set (§6.8).
+        Bearer token. Defaults to `os.environ["ANTHROPIC_API_KEY"]`.
+        Fail-fast at construction if neither is set (§6.8). The secret
+        is sent as the `x-api-key` HTTP header and NEVER appears in any
+        persisted Artifact field.
     base_url:
-        API root (without trailing slash). Defaults to OpenAI's public
-        endpoint. Override for self-hosted OpenAI-compatible servers.
+        API root (without trailing slash). Defaults to Anthropic's
+        public endpoint. Override for self-hosted Anthropic-compatible
+        servers.
+    anthropic_version:
+        Value of the `anthropic-version` header. Defaults to
+        `DEFAULT_ANTHROPIC_VERSION`. Bumping this is a code change.
     max_tool_iterations:
         Internal tool-call iteration cap (§6.4). Default 8; the runtime
         passes `Config.runtime.max_tool_iterations` here at construction.
     timeout:
         Per-HTTP-call timeout in seconds.
     tool_handlers:
-        Mapping `tool_name -> callable(args_dict) -> result`. M2 ships
-        no built-in handlers; callers register handlers explicitly. A
-        model emitting a tool_call whose name is not in this map maps
-        to `tool_failure` per §6.4.
+        Mapping `tool_name -> callable(args_dict) -> result`. M3 ships
+        no built-in handlers. A model emitting a `tool_use` block whose
+        `name` is not in this map maps to `tool_failure` per §6.4.
     price_table:
         Per-model `(prompt_per_1k, completion_per_1k)` USD overrides.
-        Unknown models fall back to `(0.0, 0.0)` (zero-cost; the
-        runtime's hard-cap is conservative under that flag).
+        Unknown models fall back to `(0.0, 0.0)`.
     http_client:
         Optional pre-built `httpx.Client` (tests inject a transport-
         mocked client via `respx`). When omitted, the adapter owns its
         own client and closes it in `shutdown()`.
     """
 
-    name = "openai"
+    name = "anthropic"
 
     def __init__(
         self,
         *,
         api_key: Optional[str] = None,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str = DEFAULT_ANTHROPIC_BASE_URL,
+        anthropic_version: str = DEFAULT_ANTHROPIC_VERSION,
         max_tool_iterations: int = 8,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         tool_handlers: Optional[Dict[str, ToolHandler]] = None,
         price_table: Optional[Dict[str, Tuple[float, float]]] = None,
         http_client: Optional[httpx.Client] = None,
     ) -> None:
-        key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
+        key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise MissingCredentialsError(
-                "OPENAI_API_KEY is not set; OpenAIProvider requires an API key "
-                "at construction (§6.8)."
+                "ANTHROPIC_API_KEY is not set; AnthropicProvider requires an API "
+                "key at construction (§6.8)."
             )
         self._api_key = key
         self._base_url = base_url.rstrip("/")
+        self._anthropic_version = anthropic_version
         self._max_tool_iterations = max_tool_iterations
         self._timeout = timeout
         self._tool_handlers: Dict[str, ToolHandler] = dict(tool_handlers or {})
@@ -176,8 +228,6 @@ class OpenAIProvider(ProviderAdapter):
         if first.error is not None and first.error.kind == "malformed_response":
             corrective = self._build_corrective_request(request, first)
             second = self._invoke_once(corrective)
-            if second.error is None:
-                return second
             return second
         return first
 
@@ -197,7 +247,7 @@ class OpenAIProvider(ProviderAdapter):
 
             try:
                 resp = self._http.post(
-                    f"{self._base_url}/chat/completions",
+                    f"{self._base_url}/messages",
                     json=body,
                     headers=self._auth_headers(),
                 )
@@ -236,30 +286,30 @@ class OpenAIProvider(ProviderAdapter):
                 )
 
             usage = data.get("usage") or {}
-            aggregate.add(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+            aggregate.add(
+                usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+            )
 
-            try:
-                choice = data["choices"][0]
-            except (KeyError, IndexError, TypeError):
+            content_blocks = data.get("content")
+            if not isinstance(content_blocks, list):
                 return http_error_result(
                     kind="internal",
-                    message="response missing choices[0]",
+                    message="response missing content[] array",
                     retriable=False,
                     usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
                     raw=safe_raw(data),
                     tool_events=tool_events,
                 )
 
-            message = choice.get("message") or {}
-            vendor_finish = choice.get("finish_reason")
+            vendor_stop = data.get("stop_reason")
 
-            if vendor_finish == "content_filter":
+            # Refusal: Sonnet 4.5+ safety stop. Maps to content_filter
+            # regardless of any content[] blocks present.
+            if vendor_stop == "refusal":
+                refusal_text = _first_text_block(content_blocks)
                 return ProviderResult(
                     messages=[
-                        ProviderRawMessage(
-                            role=message.get("role") or "assistant",
-                            content=message.get("content") or "",
-                        )
+                        ProviderRawMessage(role="assistant", content=refusal_text)
                     ],
                     tool_events=tool_events,
                     usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
@@ -268,20 +318,24 @@ class OpenAIProvider(ProviderAdapter):
                     raw=safe_raw(data),
                     error=ProviderError(
                         kind="content_filter",
-                        message="content filtered by provider",
+                        message="Model refused on safety grounds",
                         retriable=False,
-                        details={"vendor_finish_reason": "content_filter"},
+                        details={"stop_reason": "refusal"},
                     ),
                 )
 
-            tool_calls = message.get("tool_calls") or []
-            if tool_calls and vendor_finish in ("tool_calls", "function_call"):
+            tool_use_blocks = [
+                b for b in content_blocks
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            ]
+
+            if tool_use_blocks and vendor_stop == "tool_use":
                 if iteration >= self._max_tool_iterations:
                     return http_error_result(
                         kind="tool_failure",
                         message=(
-                            f"max_tool_iterations ({self._max_tool_iterations}) exceeded; "
-                            "loop cap reached without a terminal response"
+                            f"max_tool_iterations ({self._max_tool_iterations}) "
+                            "exceeded; loop cap reached without a terminal response"
                         ),
                         retriable=False,
                         usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
@@ -289,28 +343,27 @@ class OpenAIProvider(ProviderAdapter):
                         tool_events=tool_events,
                     )
 
+                # Echo the assistant turn (full content[]) into the
+                # outgoing conversation before appending the user
+                # tool_result message.
                 assistant_entry: Dict[str, Any] = {
                     "role": "assistant",
-                    "content": message.get("content"),
-                    "tool_calls": tool_calls,
+                    "content": content_blocks,
                 }
                 next_messages: List[Dict[str, Any]] = list(current_messages) + [assistant_entry]
                 tools_by_name = {t.get("name"): t for t in (request.tools or [])}
 
-                # Process every tool_call in this iteration before re-invoking.
-                # On any tool error, terminate the loop with tool_failure.
-                aborted = self._run_tool_iteration(
-                    tool_calls=tool_calls,
+                aborted, tool_result_blocks = self._run_tool_iteration(
+                    tool_use_blocks=tool_use_blocks,
                     tools_by_name=tools_by_name,
                     tool_events=tool_events,
-                    next_messages=next_messages,
                 )
                 if aborted is not None:
                     return ProviderResult(
                         messages=[
                             ProviderRawMessage(
-                                role=message.get("role") or "assistant",
-                                content=message.get("content") or "",
+                                role="assistant",
+                                content=_first_text_block(content_blocks),
                             )
                         ],
                         tool_events=tool_events,
@@ -321,20 +374,19 @@ class OpenAIProvider(ProviderAdapter):
                         error=aborted,
                     )
 
+                # Anthropic tool_result is delivered as a user-role
+                # message with one tool_result block per call.
+                next_messages.append({"role": "user", "content": tool_result_blocks})
+
                 current_messages = next_messages
                 iteration += 1
                 continue
 
-            # Terminal — parse + validate structured output.
-            content_str = message.get("content")
-            if not isinstance(content_str, str) or content_str == "":
+            # Terminal — parse the first text block as JSON and validate.
+            text = _first_text_block(content_blocks)
+            if not text:
                 return ProviderResult(
-                    messages=[
-                        ProviderRawMessage(
-                            role=message.get("role") or "assistant",
-                            content=content_str if isinstance(content_str, str) else "",
-                        )
-                    ],
+                    messages=[ProviderRawMessage(role="assistant", content="")],
                     tool_events=tool_events,
                     usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
                     finish_reason="error",
@@ -342,17 +394,18 @@ class OpenAIProvider(ProviderAdapter):
                     raw=safe_raw(data),
                     error=ProviderError(
                         kind="internal",
-                        message="assistant message has empty content and no tool_calls",
+                        message="terminal response carries no text block",
                         retriable=False,
+                        details={"stop_reason": vendor_stop},
                     ),
                 )
 
             try:
-                structured = json.loads(content_str)
+                structured = json.loads(text)
             except json.JSONDecodeError as exc:
                 return malformed_result(
                     request=request,
-                    content_str=content_str,
+                    content_str=text,
                     aggregate=aggregate,
                     cost=self._cost(request.model, aggregate),
                     tool_events=tool_events,
@@ -361,11 +414,13 @@ class OpenAIProvider(ProviderAdapter):
                     validator_message=f"content is not valid JSON: {exc}",
                 )
 
-            failure = validate_structured_output(structured, request.expected_output_schema)
+            failure = validate_structured_output(
+                structured, request.expected_output_schema
+            )
             if failure is not None:
                 return malformed_result(
                     request=request,
-                    content_str=content_str,
+                    content_str=text,
                     aggregate=aggregate,
                     cost=self._cost(request.model, aggregate),
                     tool_events=tool_events,
@@ -375,20 +430,10 @@ class OpenAIProvider(ProviderAdapter):
                     raw_attempt=structured,
                 )
 
-            canonical_finish = _normalize_finish_reason(vendor_finish)
+            canonical_finish = _normalize_finish_reason(vendor_stop)
             if canonical_finish == "error":
-                # Vendor reported a non-terminal reason terminally (e.g.
-                # `tool_calls` / `function_call` / null with no actual
-                # tool_calls array). §6.10 maps that to `error`; we
-                # populate an `internal` error to satisfy the §6.5
-                # invariant that `error` finish_reason implies `error != null`.
                 return ProviderResult(
-                    messages=[
-                        ProviderRawMessage(
-                            role=message.get("role") or "assistant",
-                            content=content_str,
-                        )
-                    ],
+                    messages=[ProviderRawMessage(role="assistant", content=text)],
                     tool_events=tool_events,
                     usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
                     finish_reason="error",
@@ -397,20 +442,16 @@ class OpenAIProvider(ProviderAdapter):
                     error=ProviderError(
                         kind="internal",
                         message=(
-                            f"vendor finish_reason {vendor_finish!r} arrived "
-                            "terminally with no consumable tool_calls"
+                            f"vendor stop_reason {vendor_stop!r} arrived terminally "
+                            "with no consumable tool_use blocks"
                         ),
                         retriable=False,
-                        details={"vendor_finish_reason": vendor_finish},
+                        details={"stop_reason": vendor_stop},
                     ),
                 )
+
             return ProviderResult(
-                messages=[
-                    ProviderRawMessage(
-                        role=message.get("role") or "assistant",
-                        content=content_str,
-                    )
-                ],
+                messages=[ProviderRawMessage(role="assistant", content=text)],
                 tool_events=tool_events,
                 usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
                 finish_reason=canonical_finish,
@@ -426,18 +467,25 @@ class OpenAIProvider(ProviderAdapter):
     def _run_tool_iteration(
         self,
         *,
-        tool_calls: List[Dict[str, Any]],
+        tool_use_blocks: List[Dict[str, Any]],
         tools_by_name: Dict[str, Dict[str, Any]],
         tool_events: List[ToolEvent],
-        next_messages: List[Dict[str, Any]],
-    ) -> Optional[ProviderError]:
-        """Execute one tool iteration in order. Returns a ProviderError to
-        abort the loop, or None to continue."""
-        for call in tool_calls:
-            call_id = call.get("id") or ""
-            fn = call.get("function") or {}
-            name = fn.get("name") or ""
-            args_raw = fn.get("arguments") or "{}"
+    ) -> Tuple[Optional[ProviderError], List[Dict[str, Any]]]:
+        """Execute every tool_use block in order, building the matching
+        tool_result blocks for the next user turn.
+
+        Returns `(error, tool_result_blocks)`. On the first failed call
+        the loop aborts: `error` is set, and the partially-built
+        `tool_result_blocks` list is returned for forensic completeness
+        but the caller discards it (the loop terminates with the
+        ProviderError).
+        """
+        tool_result_blocks: List[Dict[str, Any]] = []
+        for block in tool_use_blocks:
+            call_id = block.get("id") or ""
+            name = block.get("name") or ""
+            args_raw = block.get("input")
+            args: Dict[str, Any] = args_raw if isinstance(args_raw, dict) else {}
 
             tool_desc = tools_by_name.get(name)
             if tool_desc is None:
@@ -448,23 +496,14 @@ class OpenAIProvider(ProviderAdapter):
                     details={"tool_name": name},
                 )
                 tool_events.append(
-                    ToolEvent(name=name or "<unnamed>", arguments={}, result=None, error=err)
+                    ToolEvent(
+                        name=name or "<unnamed>",
+                        arguments=args,
+                        result=None,
+                        error=err,
+                    )
                 )
-                return err
-
-            try:
-                args = json.loads(args_raw) if args_raw else {}
-            except json.JSONDecodeError as exc:
-                err = ProviderError(
-                    kind="tool_failure",
-                    message=f"tool arguments not valid JSON: {exc}",
-                    retriable=False,
-                    details={"tool_name": name, "raw_arguments": args_raw},
-                )
-                tool_events.append(
-                    ToolEvent(name=name, arguments={}, result=None, error=err)
-                )
-                return err
+                return err, tool_result_blocks
 
             schema = tool_desc.get("input_schema") or {}
             try:
@@ -481,14 +520,9 @@ class OpenAIProvider(ProviderAdapter):
                     },
                 )
                 tool_events.append(
-                    ToolEvent(
-                        name=name,
-                        arguments=args if isinstance(args, dict) else {},
-                        result=None,
-                        error=err,
-                    )
+                    ToolEvent(name=name, arguments=args, result=None, error=err)
                 )
-                return err
+                return err, tool_result_blocks
 
             handler = self._tool_handlers.get(name)
             if handler is None:
@@ -501,7 +535,7 @@ class OpenAIProvider(ProviderAdapter):
                 tool_events.append(
                     ToolEvent(name=name, arguments=args, result=None, error=err)
                 )
-                return err
+                return err, tool_result_blocks
 
             start = time.monotonic()
             try:
@@ -523,7 +557,7 @@ class OpenAIProvider(ProviderAdapter):
                         error=err,
                     )
                 )
-                return err
+                return err, tool_result_blocks
             latency_ms = int((time.monotonic() - start) * 1000)
 
             normalized_result = normalize_tool_result(result)
@@ -542,58 +576,80 @@ class OpenAIProvider(ProviderAdapter):
                 if isinstance(normalized_result, str)
                 else json.dumps(normalized_result)
             )
-            next_messages.append(
-                {"role": "tool", "tool_call_id": call_id, "content": tool_content}
+            tool_result_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": tool_content,
+                }
             )
 
-        return None
+        return None, tool_result_blocks
 
     # ------------------------------------------------------------------
-    # Translation: ProviderRequest -> OpenAI request body
+    # Translation: ProviderRequest -> Anthropic Messages-API request body
     # ------------------------------------------------------------------
 
     def _build_request_body(self, request: ProviderRequest) -> Dict[str, Any]:
+        # §6.13 step 1: hoist the position-0 system message into the
+        # top-level `system` field. Anthropic does NOT have a `system`
+        # role in the `messages[]` array.
+        messages = list(request.messages)
+        system_field: Optional[str] = None
+        if messages and messages[0].role == "system":
+            system = messages[0]
+            content = system.content
+            if isinstance(content, str):
+                system_field = content
+            else:
+                # Defensive: callers SHOULD pass a string per §6.3, but
+                # we accept and stringify other shapes rather than 400
+                # the request.
+                system_field = json.dumps(content)
+            messages = messages[1:]
+
         body: Dict[str, Any] = {
             "model": request.model,
-            "messages": [_translate_message(m) for m in request.messages],
+            "messages": [_translate_message(m) for m in messages],
         }
+        if system_field is not None:
+            body["system"] = system_field
+
         if request.tools:
             body["tools"] = [
                 {
-                    "type": "function",
-                    "function": {
-                        "name": t["name"],
-                        "description": t.get("description", ""),
-                        "parameters": t.get("input_schema", {}),
-                    },
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "input_schema": t.get("input_schema", {}),
                 }
                 for t in request.tools
             ]
-        if request.expected_output_schema in (
-            "turn_structured_output",
-            "verdict",
-            "synthesis_content",
-        ):
-            body["response_format"] = {"type": "json_object"}
-        reasoning_effort = getattr(request, "reasoning_effort", None)
-        if reasoning_effort:
-            body["reasoning_effort"] = reasoning_effort
+
         sampling = request.sampling or {}
-        for key in ("temperature", "top_p", "seed", "max_tokens", "stop", "stop_sequences"):
-            if key in sampling:
-                # OpenAI uses `stop` not `stop_sequences`.
-                target = "stop" if key == "stop_sequences" else key
-                body[target] = sampling[key]
+        # The Messages API REQUIRES `max_tokens`. Default if absent.
+        body["max_tokens"] = int(sampling.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        if "temperature" in sampling:
+            body["temperature"] = sampling["temperature"]
+        if "top_p" in sampling:
+            body["top_p"] = sampling["top_p"]
+        if "stop_sequences" in sampling:
+            body["stop_sequences"] = sampling["stop_sequences"]
+        elif "stop" in sampling:
+            # Tolerate the OpenAI key; map to Anthropic's name.
+            body["stop_sequences"] = sampling["stop"]
+        # Silently drop `seed` and `reasoning_effort` per §6.2.
+
         return body
 
     def _auth_headers(self) -> Dict[str, str]:
         return {
-            "Authorization": f"Bearer {self._api_key}",
+            "x-api-key": self._api_key,
+            "anthropic-version": self._anthropic_version,
             "Content-Type": "application/json",
         }
 
     # ------------------------------------------------------------------
-    # Error classification (§6.6)
+    # Error classification (§6.6 — Anthropic table)
     # ------------------------------------------------------------------
 
     def _classify_http_error(
@@ -613,25 +669,27 @@ class OpenAIProvider(ProviderAdapter):
         err = body.get("error") if isinstance(body, dict) else None
         if not isinstance(err, dict):
             err = {}
-        vendor_code = err.get("code") or err.get("type") or ""
         vendor_type = err.get("type") or ""
         vendor_message = err.get("message") or (resp.text or f"HTTP {status}")
 
         if status == 408:
             kind, retriable = "timeout", True
-        elif status in (502, 503, 504):
-            kind, retriable = "network", True
         elif status == 429:
-            if vendor_code == "insufficient_quota" or vendor_type == "insufficient_quota":
+            if _looks_like_quota(vendor_message):
                 kind, retriable = "quota_exhausted", False
             else:
                 kind, retriable = "rate_limit", True
+        elif status == 529:
+            # `overloaded_error` — Anthropic's transient overload code.
+            kind, retriable = "rate_limit", True
         elif status in (401, 403):
             kind, retriable = "auth_failure", False
         elif status == 404:
             kind, retriable = "model_unavailable", False
         elif status == 400:
-            if vendor_code == "context_length_exceeded":
+            # `invalid_request_error`. Distinguish context-length blow-up
+            # via vendor message marker.
+            if _looks_like_context_length(vendor_message):
                 kind, retriable = "context_length_exceeded", False
             else:
                 kind, retriable = "invalid_request", False
@@ -641,9 +699,7 @@ class OpenAIProvider(ProviderAdapter):
             kind, retriable = "internal", False
 
         details: Dict[str, Any] = {"status": status}
-        if vendor_code:
-            details["vendor_code"] = vendor_code
-        if vendor_type and vendor_type != vendor_code:
+        if vendor_type:
             details["vendor_type"] = vendor_type
         if kind == "rate_limit":
             retry_after = resp.headers.get("retry-after")
@@ -662,7 +718,7 @@ class OpenAIProvider(ProviderAdapter):
             raw=safe_raw(body),
             error=ProviderError(
                 kind=kind,
-                message=f"{vendor_code or 'http_error'}: {vendor_message}".strip(),
+                message=f"{vendor_type or 'http_error'}: {vendor_message}".strip(),
                 retriable=retriable,
                 details=details,
             ),
@@ -680,12 +736,7 @@ class OpenAIProvider(ProviderAdapter):
         bad_content = ""
         if malformed.raw:
             try:
-                bad_content = (
-                    malformed.raw.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content")
-                    or ""
-                )
+                bad_content = _first_text_block(malformed.raw.get("content"))
             except Exception:  # noqa: BLE001
                 bad_content = ""
 
@@ -712,7 +763,7 @@ class OpenAIProvider(ProviderAdapter):
     def _cost(self, model: str, aggregate: UsageAccum) -> float:
         prices = self._price_table.get(model)
         if prices is None:
-            # Heuristic: try a prefix match (e.g. gpt-4o-mini-2024-07-18 → gpt-4o-mini).
+            # Heuristic: try a prefix match (e.g. claude-sonnet-4-5-20251022 → claude-sonnet-4-5).
             for known, p in self._price_table.items():
                 if model.startswith(known):
                     prices = p
@@ -733,21 +784,83 @@ class OpenAIProvider(ProviderAdapter):
 
 
 def _translate_message(m: ProviderRequestMessage) -> Dict[str, Any]:
-    """Translate one canonical message into an OpenAI Chat Completions entry."""
-    entry: Dict[str, Any] = {"role": m.role, "content": m.content}
-    if m.tool_call_id is not None:
-        entry["tool_call_id"] = m.tool_call_id
-    return entry
+    """Translate one canonical (non-system) message into a Messages-API entry.
+
+    Anthropic accepts either a plain string `content` or an array of
+    typed content blocks. For canonical user/assistant turns we emit a
+    single-block text array; for adapter-internal turns (e.g. echoed
+    assistant content during the tool loop, or a synthetic user
+    tool_result) the caller bypasses this helper and constructs the
+    `content[]` directly.
+    """
+    return {
+        "role": m.role,
+        "content": [{"type": "text", "text": _stringify_content(m.content)}],
+    }
 
 
-def _normalize_finish_reason(vendor_finish: Optional[str]) -> str:
-    """§6.10 OpenAI terminal mapping."""
-    if vendor_finish == "stop":
+def _stringify_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _first_text_block(blocks: Any) -> str:
+    """Return the `text` of the first `type=text` block in `content[]`.
+
+    Returns an empty string if `blocks` is not a list or contains no
+    text block. The Messages API guarantees a `text` block is present
+    on terminal responses for text-mode requests; this helper degrades
+    gracefully on malformed bodies.
+    """
+    if not isinstance(blocks, list):
+        return ""
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "text":
+            t = b.get("text")
+            if isinstance(t, str):
+                return t
+    return ""
+
+
+def _normalize_finish_reason(vendor_stop: Optional[str]) -> str:
+    """§6.10 Anthropic terminal mapping."""
+    if vendor_stop == "end_turn":
         return "stop"
-    if vendor_finish == "length":
+    if vendor_stop == "stop_sequence":
+        return "stop"
+    if vendor_stop == "max_tokens":
         return "length"
-    if vendor_finish == "content_filter":
+    if vendor_stop == "refusal":
         return "content_filter"
-    # tool_calls / function_call / None / anything unexpected at terminal-time
-    # collapses to `error` (the loop is supposed to have consumed those).
     return "error"
+
+
+def _looks_like_quota(message: str) -> bool:
+    """Heuristic to disambiguate `rate_limit` from `quota_exhausted`.
+
+    Anthropic does not emit a distinct `error.type` for daily/monthly
+    hard-cap exhaustion; both surface as `rate_limit_error`. We scan
+    the vendor message for known markers. Case-insensitive.
+    """
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _QUOTA_MARKERS)
+
+
+def _looks_like_context_length(message: str) -> bool:
+    """Heuristic for `context_length_exceeded` inside `invalid_request_error`."""
+    if not message:
+        return False
+    lowered = message.lower()
+    return (
+        "context length" in lowered
+        or "context_length_exceeded" in lowered
+        or "maximum context" in lowered
+        or "too many tokens" in lowered
+        or "exceeds the maximum" in lowered
+    )
