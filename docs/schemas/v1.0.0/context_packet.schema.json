@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/context_packet.schema.json",
+  "title": "ContextPacket",
+  "description": "The per-invocation view derived from the canonical_transcript and passed to a provider_adapter for a single agent invocation (§2.4, §4.3, blocker #3). NOT persisted as a top-level artifact: a context_packet is ephemeral, derivable from the canonical_transcript on demand. This schema exists so adapters and test harnesses (e.g. FakeProvider in §9) can serialize a packet for reproducibility tests. A consumer that has the canonical_transcript plus the derivation policy MUST be able to reproduce a packet (round-trip obligation).",
+  "type": "object",
+  "required": [
+    "problem_statement",
+    "round",
+    "persona",
+    "panel_disclosure",
+    "current_round_messages"
+  ],
+  "properties": {
+    "problem_statement": {
+      "description": "The session's original problem_statement message content (§4.3 item a). Required in every packet.",
+      "type": "string",
+      "minLength": 1
+    },
+    "round": {
+      "description": "Current round number (§4.3 item b).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "persona": {
+      "description": "The invoked agent's own persona material (§4.3 item c). For a domain_persona, includes `domain_scope`/`forbidden_domains`/`must_delegate`.",
+      "$ref": "persona.schema.json"
+    },
+    "panel_disclosure": {
+      "description": "Active_deliberation_panel disclosure (§4.3 item d, Pass 1 row #77). For each panel member, identifier + role/specialty summary. For the coordinator_agent's packet, lists every panel member; for a panel agent's packet, lists its peers.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "role_summary"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "description": "Agent id."},
+          "role_summary": {"type": "string", "minLength": 1, "description": "One-line role/specialty summary."}
+        },
+        "additionalProperties": false
+      }
+    },
+    "most_recent_verdict": {
+      "description": "The most recent verdict if one exists (§4.3 item e). Absent in round 1. The verdict's `focus` SHOULD be highlighted as the round's directive.",
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "verdict.schema.json"}
+      ]
+    },
+    "current_round_messages": {
+      "description": "All messages produced in the current round so far, in `turn_index` ascending order (§4.3 item f). Covers every prior primary_turn, every drained branch turn, and every in-line branch turn dispatched earlier in this round. Required minimum for conversational deliberation.",
+      "type": "array",
+      "items": {"$ref": "message.schema.json"}
+    },
+    "branch_origin": {
+      "description": "Required when the invoked agent is a branch_turn agent (§4.3 item g). Carries the originating direct_request and the parent primary_turn message so the branch agent can answer in context.",
+      "type": "object",
+      "required": ["direct_request", "parent_message"],
+      "properties": {
+        "direct_request": {"$ref": "direct_request.schema.json"},
+        "parent_message": {"$ref": "message.schema.json"}
+      },
+      "additionalProperties": false
+    },
+    "deferred_queue_summary": {
+      "description": "For the coordinator_agent's packet, a summary of the deferred_request queue (target, originator, type — NOT full content) so the Coordinator can frame its verdict.focus (§4.6). Absent otherwise.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["target", "originator", "type"],
+        "properties": {
+          "target": {"type": "string", "minLength": 1},
+          "originator": {"type": "string", "minLength": 1},
+          "type": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "cumulative_disagreements": {
+      "description": "For the synthesis packet (§4.8): the cumulative resolved/unresolved disagreement record across the session. Absent in non-synthesis packets.",
+      "type": "object",
+      "properties": {
+        "resolved": {"type": "array", "items": {"$ref": "verdict.schema.json#/properties/resolved_disagreements/items"}},
+        "unresolved": {"type": "array", "items": {"$ref": "verdict.schema.json#/properties/unresolved_disagreements/items"}}
+      },
+      "additionalProperties": false
+    },
+    "compression_note": {
+      "description": "Optional human-readable note documenting any compression, filtering, or windowing applied beyond the §4.3 minimum. Diagnostic only.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/turn_structured_output.schema.json",
+  "title": "TurnStructuredOutput",
+  "description": "Strict shape for the canonical Message.content of primary_turn and branch_turn messages. The runtime canonicalizes a provider's `structured_output` into this shape before appending to the canonical_transcript; any extra fields a provider returns are discarded. `additionalProperties` is false so no out-of-band field (e.g. an `@AgentName` mention reintroduced as a side channel) can persist into the canonical_transcript.",
+  "type": "object",
+  "required": ["text"],
+  "properties": {
+    "text": {
+      "description": "The agent's free-form turn content (natural language). The runtime does not parse this string for control signals (ADR-003).",
+      "type": "string",
+      "minLength": 1
+    },
+    "direct_requests": {
+      "description": "Zero or more structured inter-agent control signals (ADR-003). The only sanctioned form of addressing another agent.",
+      "type": "array",
+      "items": {"$ref": "direct_request.schema.json"}
+    }
+  },
+  "additionalProperties": false
+}

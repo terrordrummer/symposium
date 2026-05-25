@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/provider_request.schema.json",
+  "title": "ProviderRequest",
+  "description": "Request side of `provider_adapter.invoke(request) -> provider_result` (§6, blocker #5). Derived by the orchestrator_runtime from a ContextPacket (§5.9) plus the invoked agent's AgentConfig (§5.2) immediately before each provider invocation; ephemeral, not persisted. Carries the canonicalized message sequence the adapter dispatches, the tool descriptors visible to the model for this turn, the schema the adapter MUST validate `structured_output` against before returning (permissive-at-boundary, strict-at-persistence — ADR-003), and a vendor-pass-through sampling/metadata bag. The runtime is provider-agnostic by construction (rule N4): no vendor identifier appears in this schema body — `provider` and `model` are OPEN strings, the `sampling` bag's keys/values are interpreted per adapter.",
+  "type": "object",
+  "required": [
+    "agent_id",
+    "provider",
+    "model",
+    "messages",
+    "tools",
+    "expected_output_schema"
+  ],
+  "properties": {
+    "agent_id": {
+      "description": "Stable identifier of the agent this invocation targets (matches `AgentConfig.id`, §5.2). Carried for adapter-side logging/correlation; the adapter MUST NOT mutate it.",
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "description": "Provider adapter id (OPEN string, §5.2). Selects the adapter the runtime dispatches to. Concrete vendor identifiers live in `examples/configs/*.yaml`, never in this schema body (rule N4).",
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "description": "Model identifier within the provider (OPEN string, §5.2). Vendor model strings live in examples/configs, not here.",
+      "type": "string",
+      "minLength": 1
+    },
+    "reasoning_effort": {
+      "description": "Optional reasoning-effort hint forwarded to the provider (OPEN string; vendor-interpreted, §5.2). Adapters that ignore this field MUST do so silently.",
+      "type": "string"
+    },
+    "messages": {
+      "description": "Canonicalized message sequence the adapter dispatches to the provider. Derived by the runtime from the ContextPacket (§4.3, §5.9) per the §6.3 prompt-formatting contract: persona material at `system` role at position 0; problem_statement and panel disclosure at `user` role; prior turns as `assistant` messages with in-text speaker headers (`[speaker: <agent_id>] (turn_index=N)\\n...`) because provider role attribution is unreliable for multi-agent transcripts; tool-call results at `tool` role (only emitted INTERNALLY by the adapter's tool-call loop, §6.4 — never appear in a runtime-built ProviderRequest). Every §4.3 minimum content item MUST be representable; information loss between ContextPacket and `messages` MUST be zero.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": {
+            "description": "Canonical message role. CLOSED enum (§6.3). Adapters map each value to the vendor's equivalent (see §6.3, §6.12, §6.13 mapping tables — vendor names live in prose only, rule N4).",
+            "enum": ["system", "user", "assistant", "tool"]
+          },
+          "content": {
+            "description": "Message content. String for text-only; object for multi-part content (e.g. nested vendor blocks). Adapters MUST preserve full content in vendor translation; no field-level filtering.",
+            "oneOf": [
+              {"type": "string", "minLength": 1},
+              {"type": "object"}
+            ]
+          },
+          "name": {
+            "description": "Optional speaker name. For `tool` role, the tool name whose result this message carries. For `assistant` role, OPTIONAL agent_id annotation (some providers consume this; others ignore — §6.3 in-text speaker headers are the authoritative attribution).",
+            "type": "string",
+            "minLength": 1
+          },
+          "tool_call_id": {
+            "description": "Required on `role = tool` messages produced by the adapter's internal tool-call loop (§6.4). Correlates the tool result with the provider's prior tool_call. The conditional `if role = tool then tool_call_id is required` is enforced via the per-item allOf branch below.",
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {"properties": {"role": {"const": "tool"}}, "required": ["role"]},
+            "then": {"required": ["tool_call_id"]}
+          }
+        ]
+      }
+    },
+    "tools": {
+      "description": "Tool descriptors visible to the model for this invocation (§6.4). Derived from `AgentConfig.tools` (§5.2). Empty array means no tools are exposed. The adapter MUST validate tool inputs the model emits against each tool's `input_schema` BEFORE invoking the tool handler (§6.4); validation failure is a `tool_failure` error.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/tool"}
+    },
+    "expected_output_schema": {
+      "description": "Pointer to the canonical schema the adapter MUST validate the provider's `structured_output` against BEFORE returning a successful provider_result (ADR-003, §6.5). CLOSED enum: `turn_structured_output` for primary_turn / branch_turn invocations; `verdict` for coordination_turn invocations; `synthesis_content` for synthesis invocations; `null` reserved for future free-text invocations (no MVP path uses null). Validation failure populates `provider_result.error.kind = malformed_response` and `structured_output = null` — the adapter does NOT retry internally on schema failure (§6.7).",
+      "enum": ["turn_structured_output", "verdict", "synthesis_content", null]
+    },
+    "sampling": {
+      "description": "Vendor-interpreted sampling parameters (§6.2). Keys are OPEN strings; the spec recommends canonical names `temperature`, `top_p`, `seed`, `max_tokens`, `stop_sequences`, but adapters MAY accept any keys their backend understands. Values are any JSON-compatible type. Adapters MUST silently drop keys they do not recognize (no `additionalProperties: false`).",
+      "type": "object"
+    },
+    "metadata": {
+      "description": "Opaque pass-through bag for adapter-side correlation: trace ids, request ids, logging hints, etc. Not persisted into the canonical_transcript; not interpreted by the runtime.",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "title": "Tool",
+      "description": "Tool descriptor as visible to the model and as registered with the adapter (§6.4). `input_schema` is a JSON Schema describing the arguments object the model is expected to emit; the adapter MUST validate model-emitted tool inputs against it before invoking the tool handler.",
+      "required": ["name", "description", "input_schema"],
+      "properties": {
+        "name": {
+          "description": "Tool name. OPEN string at the schema level; uniqueness across `tools[]` of one ProviderRequest is a runtime invariant (the adapter resolves a model-emitted tool_call by `name`).",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "description": "Human-readable tool description forwarded to the model (vendor APIs typically require this).",
+          "type": "string",
+          "minLength": 1
+        },
+        "input_schema": {
+          "description": "JSON Schema (Draft 2020-12) describing the tool's input arguments object. The adapter validates model-emitted arguments against this schema BEFORE invoking the tool; validation failure is a `tool_failure` (§6.6), distinct from `malformed_response`.",
+          "type": "object"
+        },
+        "metadata": {
+          "description": "Optional adapter-side hints (e.g. timeout overrides, side-effect classification). Not forwarded to the model.",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

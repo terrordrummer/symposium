@@ -1,0 +1,57 @@
+# Pass 4/5 mechanical schema validation
+
+Validator: jsonschema (Python), Draft 2020-12.
+
+Schema dir: /Users/rpix/Workspace/products/symposium/docs/schemas/v1.0.0
+Example dir: /Users/rpix/Workspace/products/symposium/docs/schemas/v1.0.0/examples
+
+[OK ] persona.schema.json <- persona_horizontal.json
+[OK ] persona.schema.json <- persona_domain.json
+[OK ] direct_request.schema.json <- direct_request.json
+[OK ] verdict.schema.json <- verdict_continue.json
+[OK ] verdict.schema.json <- verdict_finalize.json
+[OK ] verdict.schema.json <- verdict_request_user_input.json
+[OK ] provider_result.schema.json <- provider_result.json
+[OK ] provider_result.schema.json <- provider_result_openai_example.json
+[OK ] provider_result.schema.json <- provider_result_anthropic_example.json
+[OK ] provider_result.schema.json <- provider_result_fake_example.json
+[OK ] provider_result.schema.json <- provider_result_malformed_example.json
+[OK ] provider_result.schema.json <- provider_result_invalid_request_example.json
+[OK ] provider_request.schema.json <- provider_request.json
+[OK ] artifact.schema.json <- worked_example_artifact.json
+[OK ] artifact.schema.json <- budget_breach_artifact.json
+[OK ] run_manifest.schema.json <- run_manifest_complete.json
+[OK ] run_manifest.schema.json <- run_manifest_terminated.json
+[OK ] run_manifest.schema.json <- run_manifest_in_progress.json
+[OK ] fake_provider_script.schema.json <- fake_provider_script_example.json
+[OK ] golden_test_case.schema.json <- golden_test_case_example.json
+
+Wrapper cases: 20; failed: 0
+
+## Nested structured_output validation (§6.5)
+
+[OK ] provider_result_openai_example.json.structured_output <- turn_structured_output.schema.json
+[OK ] provider_result_anthropic_example.json.structured_output <- verdict.schema.json
+[OK ] provider_result_fake_example.json.structured_output <- turn_structured_output.schema.json
+[OK ] provider_result.json.structured_output <- turn_structured_output.schema.json
+
+Nested cases: 4; failed: 0
+
+## error.kind prose/schema parity (§6.6)
+
+[OK ] §6.6 prose enum matches provider_result.schema.json error.kind enum
+
+## Artifact semantic validation (§7.7 + cumulative_usage parity)
+
+[OK ] worked_example_artifact.json
+[OK ] budget_breach_artifact.json
+
+Semantic cases: 2; failed: 0
+
+## GoldenTestCase semantic validation (Pass 7 §9.9 roundtrip)
+
+[OK ] golden_test_case_example.json (expected_artifact)
+
+GoldenTestCase semantic cases: 1; failed: 0
+
+TOTAL: 28 cases; failed: 0

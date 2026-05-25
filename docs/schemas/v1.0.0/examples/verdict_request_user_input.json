@@ -1,0 +1,23 @@
+{
+  "next_action": "request_user_input",
+  "rationale": "The panel has identified two distinct framings of the problem with materially different answers. Originator must disambiguate.",
+  "confidence": 0.40,
+  "focus": "Disambiguate problem framing before continuing.",
+  "next_agents": [],
+  "resolved_disagreements": [],
+  "unresolved_disagreements": [
+    {
+      "topic": "Problem framing ambiguity",
+      "positions": [
+        {"agent": "logician", "claim": "Originator means strict consistency"},
+        {"agent": "visionary", "claim": "Originator means eventual consistency"}
+      ],
+      "blocker": true
+    }
+  ],
+  "user_input_request": {
+    "question": "By 'consistency' do you mean strict (linearizable) or eventual (BASE)?",
+    "context": "The panel split on this; the answer changes the recommended architecture entirely.",
+    "blocking": true
+  }
+}

@@ -1,0 +1,234 @@
+{
+  "schema_version": "1.0.0",
+  "session_id": "budget-breach-2026-05-25",
+  "config": {
+    "schema_version": "1.0.0",
+    "session_id": "budget-breach-2026-05-25",
+    "originator": "user:roberto",
+    "problem_statement": "Long-form deliberation triggering a budget cap mid-session for the Pass 6 worked example.",
+    "selector": {
+      "strategy": "fixed",
+      "default_deliberation_panel": ["logician", "researcher", "critic"],
+      "coordinator_agent": "coordinator"
+    },
+    "agents": [
+      {"id": "logician", "persona_ref": "logician", "provider": "provider_a", "model": "reasoning_model"},
+      {"id": "researcher", "persona_ref": "researcher", "provider": "provider_b", "model": "reasoning_model"},
+      {"id": "critic", "persona_ref": "critic", "provider": "provider_a", "model": "reasoning_model"}
+    ],
+    "coordinator": {"id": "coordinator", "persona_ref": "coordinator", "provider": "provider_b", "model": "reasoning_model"},
+    "budget": {
+      "max_total_tokens": 100000,
+      "max_total_cost_usd": 0.50,
+      "max_rounds": 5,
+      "max_wallclock_seconds": 600
+    },
+    "runtime": {
+      "max_branch_depth": 1,
+      "on_budget_exceeded": "stop",
+      "observability_level": "mvp",
+      "synthesize_on_terminate": false
+    }
+  },
+  "canonical_transcript": [
+    {
+      "id": "msg-0",
+      "speaker": "user:roberto",
+      "type": "problem_statement",
+      "content": "Long-form deliberation triggering a budget cap mid-session for the Pass 6 worked example.",
+      "parent_id": null,
+      "round": 0,
+      "turn_index": 0,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:00:00Z",
+      "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    },
+    {
+      "id": "msg-r1-logician",
+      "speaker": "logician",
+      "type": "primary_turn",
+      "content": {"text": "[Round 1] Frames the deliberation problem in formal terms."},
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 1,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:01:30Z",
+      "usage": {"prompt_tokens": 4800, "completion_tokens": 600, "total_tokens": 5400, "cost_usd": 0.0540}
+    },
+    {
+      "id": "msg-r1-researcher",
+      "speaker": "researcher",
+      "type": "primary_turn",
+      "content": {"text": "[Round 1] Surveys prior evidence."},
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 2,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:02:50Z",
+      "usage": {"prompt_tokens": 5200, "completion_tokens": 480, "total_tokens": 5680, "cost_usd": 0.0500}
+    },
+    {
+      "id": "msg-r1-critic",
+      "speaker": "critic",
+      "type": "primary_turn",
+      "content": {"text": "[Round 1] Identifies weaknesses in the framing."},
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 3,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:04:00Z",
+      "usage": {"prompt_tokens": 5800, "completion_tokens": 500, "total_tokens": 6300, "cost_usd": 0.0660}
+    },
+    {
+      "id": "msg-r1-coord",
+      "speaker": "coordinator",
+      "type": "coordination_turn",
+      "content": {
+        "next_action": "continue",
+        "rationale": "Material disagreements remain on the choice of statistical estimator and on validity threats.",
+        "confidence": 0.6,
+        "focus": "tighten estimator choice; address confounding",
+        "next_agents": ["logician", "researcher", "critic"],
+        "resolved_disagreements": [],
+        "unresolved_disagreements": [
+          {"topic": "Choice of estimator", "positions": [{"agent": "logician", "claim": "IV"}, {"agent": "researcher", "claim": "IPW"}]}
+        ]
+      },
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 4,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:05:10Z",
+      "usage": {"prompt_tokens": 3200, "completion_tokens": 300, "total_tokens": 3500, "cost_usd": 0.0100}
+    },
+    {
+      "id": "msg-r2-logician",
+      "speaker": "logician",
+      "type": "primary_turn",
+      "content": {"text": "[Round 2] Defends IV under stated assumptions."},
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 1,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:06:40Z",
+      "usage": {"prompt_tokens": 6200, "completion_tokens": 720, "total_tokens": 6920, "cost_usd": 0.0710}
+    },
+    {
+      "id": "msg-r2-researcher",
+      "speaker": "researcher",
+      "type": "primary_turn",
+      "content": {"text": "[Round 2] Surveys empirical track record of IV vs IPW for this domain."},
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 2,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:07:50Z",
+      "usage": {"prompt_tokens": 6400, "completion_tokens": 540, "total_tokens": 6940, "cost_usd": 0.0610}
+    },
+    {
+      "id": "msg-r2-critic",
+      "speaker": "critic",
+      "type": "primary_turn",
+      "content": {"text": "[Round 2] Critiques both, proposes sensitivity analysis."},
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 3,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:08:55Z",
+      "usage": {"prompt_tokens": 6800, "completion_tokens": 560, "total_tokens": 7360, "cost_usd": 0.0660}
+    },
+    {
+      "id": "msg-r2-coord",
+      "speaker": "coordinator",
+      "type": "coordination_turn",
+      "content": {
+        "next_action": "continue",
+        "rationale": "Sensitivity analysis proposal needs round 3 to be concretized.",
+        "confidence": 0.65,
+        "focus": "sensitivity-bounds plan",
+        "next_agents": ["logician", "researcher"],
+        "resolved_disagreements": [
+          {"topic": "Need for sensitivity analysis", "resolution": "Agreed: apply Rosenbaum-style bounds before claiming a causal estimate."}
+        ],
+        "unresolved_disagreements": [
+          {"topic": "Estimator choice (IV vs IPW)", "positions": [{"agent": "logician", "claim": "IV under monotonicity"}, {"agent": "researcher", "claim": "IPW with overlap diagnostics"}]}
+        ]
+      },
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 4,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:10:00Z",
+      "usage": {"prompt_tokens": 3500, "completion_tokens": 320, "total_tokens": 3820, "cost_usd": 0.0120}
+    },
+    {
+      "id": "msg-r3-logician",
+      "speaker": "logician",
+      "type": "primary_turn",
+      "content": {"text": "[Round 3] Concretizes IV monotonicity check."},
+      "parent_id": null,
+      "round": 3,
+      "turn_index": 1,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:11:30Z",
+      "usage": {"prompt_tokens": 5500, "completion_tokens": 700, "total_tokens": 6200, "cost_usd": 0.0600}
+    },
+    {
+      "id": "msg-r3-researcher",
+      "speaker": "researcher",
+      "type": "primary_turn",
+      "content": {"text": "[Round 3] Presents IPW overlap diagnostics. This message pushes cumulative cost over the 0.50 USD cap, triggering the §4.7 budget_exceeded termination."},
+      "parent_id": null,
+      "round": 3,
+      "turn_index": 2,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T11:12:05Z",
+      "usage": {"prompt_tokens": 5400, "completion_tokens": 600, "total_tokens": 6000, "cost_usd": 0.0610}
+    }
+  ],
+  "outcome": {
+    "kind": "termination",
+    "termination_artifact": {
+      "schema_version": "1.0.0",
+      "reason": "budget_exceeded",
+      "final_round": 3,
+      "cumulative_usage": {
+        "prompt_tokens": 52800,
+        "completion_tokens": 5320,
+        "total_tokens": 58120,
+        "cost_usd": 0.5110,
+        "estimated": false
+      },
+      "most_recent_verdict": {
+        "next_action": "continue",
+        "rationale": "Sensitivity analysis proposal needs round 3 to be concretized.",
+        "confidence": 0.65,
+        "focus": "sensitivity-bounds plan",
+        "next_agents": ["logician", "researcher"],
+        "resolved_disagreements": [
+          {"topic": "Need for sensitivity analysis", "resolution": "Agreed: apply Rosenbaum-style bounds before claiming a causal estimate."}
+        ],
+        "unresolved_disagreements": [
+          {"topic": "Estimator choice (IV vs IPW)", "positions": [{"agent": "logician", "claim": "IV under monotonicity"}, {"agent": "researcher", "claim": "IPW with overlap diagnostics"}]}
+        ]
+      },
+      "unresolved_disagreements": [
+        {"topic": "Estimator choice (IV vs IPW)", "positions": [{"agent": "logician", "claim": "IV under monotonicity"}, {"agent": "researcher", "claim": "IPW with overlap diagnostics"}]}
+      ],
+      "transcript_digest": "4c70f86e970e98ecf118d2a85f5ee2df0b6c56d097036fc26cc4982074293294"
+    }
+  },
+  "cumulative_usage": {
+    "prompt_tokens": 52800,
+    "completion_tokens": 5320,
+    "total_tokens": 58120,
+    "cost_usd": 0.5110,
+    "estimated": false
+  },
+  "cumulative_unresolved": [
+    {"topic": "Estimator choice (IV vs IPW)", "positions": [{"agent": "logician", "claim": "IV under monotonicity"}, {"agent": "researcher", "claim": "IPW with overlap diagnostics"}]}
+  ],
+  "transcript_digest": "4c70f86e970e98ecf118d2a85f5ee2df0b6c56d097036fc26cc4982074293294",
+  "started_at": "2026-05-25T11:00:00Z",
+  "ended_at": "2026-05-25T11:12:08Z"
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/fake_provider_script.schema.json",
+  "title": "FakeProviderScript",
+  "description": "Ordered sequence of pre-scripted ProviderResult responses driving a FakeProvider adapter (§9.1, §9.2, §6.14). Each entry binds by ordinal position to one `provider_adapter.invoke` call the runtime makes during the session; an optional `match` clause turns the binding into an asserted check that the entry was applied to the expected invocation context. The FakeProvider is shipped alongside the runtime as a normal `provider_adapter` per §6.1 / §6.11 — it conforms to the full §6 contract (`invoke(request) -> provider_result`, structured_output canonicalization, CLOSED `error.kind` enum, CLOSED `finish_reason` enum, usage reporting). The only differences from a real adapter are: no network call; the `ProviderResult` is read from this script; `usage` is exactly what the script provides; `structured_output` is pre-authored by the script (the §6.5 validation step still runs, so a deliberately-malformed entry exercises §4.9's `apply_agent_failure_policy`). FakeProvider determinism is unconditional under the §2.7 N3 qualifier: a fixed script and a fixed sequence of `ProviderRequest`s yields bit-identical ProviderResults across runs, on any host, because no LLM is invoked. FakeProvider is NOT a vendor name (rule N4); it is the spec's canonical name for the test adapter.",
+  "type": "object",
+  "required": ["schema_version", "entries"],
+  "properties": {
+    "schema_version": {
+      "description": "Schema version per §5.1. The Pass 7 schema is `1.0.0`.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of the script's purpose (e.g. \"two-round canonical session with one in-line fork and one deferred drain\")."
+    },
+    "on_exhaustion": {
+      "description": "Behavior when the runtime makes more `invoke` calls than the script has entries. CLOSED enum. `error` (default): the FakeProvider returns a synthetic ProviderResult with `error.kind = internal` and `error.message = \"fake_provider_script: entries exhausted\"`, surfacing a script-too-short bug to the test. `loop`: the FakeProvider rewinds to `entries[0]`, allowing stress tests against a constant provider response.",
+      "enum": ["error", "loop"],
+      "default": "error"
+    },
+    "entries": {
+      "description": "Ordered list of scripted responses. The N-th `invoke` call (counting in dispatch order across rounds, branches, and synthesis) receives `entries[N-1].result`. Order MUST be aligned with the runtime's declared-order dispatch (§4.10 invariant 2) and the §4.11 pseudocode flow: per round, the deferred-drain (if any) precedes panel primary_turns in declared order; each primary_turn may emit one in-line branch_turn before the next panel agent fires; the coordination_turn fires last in the round; an additional invocation for synthesis occurs on `verdict.next_action = finalize`.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["result"],
+        "properties": {
+          "match": {
+            "description": "Optional assertion fired before this entry's result is returned. If present, the FakeProvider checks every constraint against the inbound `ProviderRequest`; on mismatch the FakeProvider returns a synthetic ProviderResult with `error.kind = internal` and `error.message = \"fake_provider_script: match assertion failed at entry <ordinal>: <constraint>\"`. The runtime's §4.9 path then terminates the session with a `provider_unrecoverable` reason, surfacing the misalignment loudly to the test. If `match` is absent, the entry binds purely by ordinal position.",
+            "type": "object",
+            "properties": {
+              "agent_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Asserts `ProviderRequest.agent_id` equals this value."
+              },
+              "expected_output_schema": {
+                "enum": ["turn_structured_output", "verdict", "synthesis_content"],
+                "description": "Asserts `ProviderRequest.expected_output_schema` equals this value. `null` (no structured output expected) has no MVP code path and is omitted here for that reason."
+              },
+              "round": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Asserts the round number derivable from the inbound request's context_packet (or from the FakeProvider's own invocation counter when the implementation exposes one). Implementation-defined visibility; RECOMMENDED for test richness, OPTIONAL for minimal harnesses."
+              },
+              "turn_index": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Asserts the turn_index derivable from the inbound request's context_packet. Same visibility caveat as `round`."
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "$ref": "provider_result.schema.json",
+            "description": "The ProviderResult the FakeProvider returns verbatim for this invocation. MUST validate against `provider_result.schema.json`. The script author is responsible for shape correctness; the FakeProvider does NOT mutate the result (other than the §6.5 structured_output validation that every adapter performs). To exercise a §6.6 `error.kind` value, populate `result.error` per the closed enum; to exercise a §6.4 tool lifecycle, populate `result.tool_events[]`; to exercise a malformed_response → §4.9 path, set `result.structured_output = null` and `result.error.kind = \"malformed_response\"`."
+          },
+          "comment": {
+            "type": "string",
+            "description": "Optional inline rationale for this entry (test documentation; not consumed by the FakeProvider)."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

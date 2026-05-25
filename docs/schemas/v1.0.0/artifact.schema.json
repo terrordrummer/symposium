@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/artifact.schema.json",
+  "title": "Artifact",
+  "description": "Top-level persisted artifact at `runs/<session_id>/` (§5.10, Pass 1 rows #96, #154; R2). Bundles the session configuration, the canonical_transcript (append-only ordered log), and either a synthesis (when the session finalized) or a termination_artifact (otherwise) — exactly one of the two. Cumulative usage and unresolved disagreements are surfaced at the top level for indexability. Strict `(round, turn_index)` ordering of canonical_transcript entries is a producer/consumer invariant (N7); JSON Schema cannot fully enforce ordering — a conforming runtime MUST enforce it on read.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "config",
+    "canonical_transcript",
+    "outcome",
+    "cumulative_usage",
+    "cumulative_unresolved",
+    "transcript_digest",
+    "started_at",
+    "ended_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "SemVer of this Artifact schema (§5.1). Pass 4 schemas are `1.0.0`. A consumer MUST refuse to load an artifact whose MAJOR version it does not understand and MUST consult §5.1's migration policy.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "description": "Session identifier; MUST equal `config.session_id`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "config": {
+      "description": "The session configuration that produced this run.",
+      "$ref": "config.schema.json"
+    },
+    "canonical_transcript": {
+      "description": "Append-only ordered log of every message produced during the session (§2.4, §4.10 invariant 9). Sorted by `(round, turn_index)` in execution order. The first message is the `problem_statement`; the last is either the `synthesis` or, on terminate paths, the final `coordination_turn` (or `panel_contraction`) before the session ended.",
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "message.schema.json"}
+    },
+    "outcome": {
+      "description": "Exactly one of: `synthesis` (the session finalized) or `termination` (the session ended without a synthesis). The discriminator is `kind`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "title": "SynthesisOutcome",
+          "required": ["kind", "synthesis_message_id"],
+          "properties": {
+            "kind": {"const": "synthesis"},
+            "synthesis_message_id": {
+              "description": "Id of the synthesis Message inside canonical_transcript. The synthesis content is in that message; this field is a pointer for fast lookup.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "TerminationOutcome",
+          "required": ["kind", "termination_artifact"],
+          "properties": {
+            "kind": {"const": "termination"},
+            "termination_artifact": {"$ref": "termination_artifact.schema.json"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "cumulative_usage": {
+      "description": "Cumulative token/cost usage across every provider invocation in the session.",
+      "$ref": "provider_result.schema.json#/properties/usage"
+    },
+    "cumulative_unresolved": {
+      "description": "Cumulative list of unresolved disagreements collected across the session. Mirrors the final synthesis.unresolved_disagreements (on finalize) or termination_artifact.unresolved_disagreements (on terminate).",
+      "type": "array",
+      "items": {"$ref": "verdict.schema.json#/properties/unresolved_disagreements/items"}
+    },
+    "transcript_digest": {
+      "description": "SHA-256 hex digest (lowercase, 64 chars) of the canonical_transcript at session end, computed using the JCS-canonicalization rule of §7.7. Pass 6 promoted this from TerminationArtifact-only (Pass 4) to top-level Artifact: every persisted session has a digest, regardless of outcome. When `outcome.kind = termination`, this value MUST equal `outcome.termination_artifact.transcript_digest`. When `outcome.kind = synthesis`, this is the only digest field present in the artifact.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "started_at": {
+      "description": "ISO-8601 datetime when the session entered `init`.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "description": "ISO-8601 datetime when the session reached `persist` (after either synthesis append or termination_artifact production).",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

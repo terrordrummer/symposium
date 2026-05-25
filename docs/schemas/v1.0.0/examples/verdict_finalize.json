@@ -1,0 +1,19 @@
+{
+  "next_action": "finalize",
+  "rationale": "All hypotheses now have quantitative criteria; no new failure modes surfaced in round 2; budget is healthy. Synthesis is appropriate.",
+  "confidence": 0.82,
+  "focus": "Produce integrated answer covering both resolved hypotheses and the one open question on instrument validity.",
+  "next_agents": [],
+  "resolved_disagreements": [
+    {
+      "topic": "Whether the dataset is observational",
+      "resolution": "Confirmed observational",
+      "agents_involved": ["researcher", "logician"]
+    },
+    {
+      "topic": "Causal direction of variable X on outcome Y",
+      "resolution": "Settled as 'inconclusive without instrument'; both positions retained in synthesis."
+    }
+  ],
+  "unresolved_disagreements": []
+}

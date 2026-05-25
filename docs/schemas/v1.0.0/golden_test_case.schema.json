@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/golden_test_case.schema.json",
+  "title": "GoldenTestCase",
+  "description": "Self-contained regression-test bundle (§9.3, §9.4). A conforming runtime, driven by `fake_script` against `config + problem_statement`, MUST produce an `Artifact` whose `transcript_digest` (§7.7) equals `expected_artifact.transcript_digest`. This is the primary comparison rule. A stronger secondary assertion — full canonical_transcript byte equality after RFC-8785 JCS canonicalization — is RECOMMENDED. Comparison is byte-level on the JCS-canonical serialization, never on raw JSON formatting (§7.5, §7.7). Update workflow: when intended runtime behavior changes (a bug fix that alters output, a schema extension), the operator regenerates `expected_artifact` and commits the JCS-canonical diff for human review (§9.3). Byte-identity under JCS canonicalization is conditional on the §9.4.1 GoldenTestCase harness pinning requirements (deterministic message-id allocator + fixed-clock source). This is strictly weaker than the §7.6 production `execution_replay` pinning conditions (no provider, model, cache, or tool environment is involved) but stronger than the unconditional `transcript_replay` guarantee (golden tests *produce* a transcript rather than read one). The three contracts remain distinct (rule N12, §2.7 A2/N3 qualifier).",
+  "type": "object",
+  "required": ["schema_version", "case_id", "problem_statement", "config", "fake_script", "expected_artifact"],
+  "properties": {
+    "schema_version": {
+      "description": "Schema version per §5.1. The Pass 7 schema is `1.0.0`.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "Stable identifier for the case. Same charset as `RunManifest.session_id` (§7.1) so a case_id can serve double-duty as a `session_id` when the harness writes the produced Artifact to disk under `runs/<case_id>/`."
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable rationale for the case (what behavior it exercises, what regression it would catch)."
+    },
+    "problem_statement": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Originator's problem statement, forwarded verbatim to the runtime at session **init** (§4.1). Persisted into the canonical_transcript as the round-0 message."
+    },
+    "config": {
+      "$ref": "config.schema.json",
+      "description": "Full Config object driving the run. MUST validate against `config.schema.json`. The harness MUST register the FakeProvider under whatever `provider` identifier the agents reference; the exact registration mechanism is implementation-defined (§6.11)."
+    },
+    "fake_script": {
+      "$ref": "fake_provider_script.schema.json",
+      "description": "Scripted FakeProvider responses driving the run (§9.1, §9.2)."
+    },
+    "expected_artifact": {
+      "$ref": "artifact.schema.json",
+      "description": "Expected Artifact at session end. MUST validate against `artifact.schema.json` AND satisfy the §7.7 semantic check (digest equals JCS-canonical SHA-256 of canonical_transcript; cumulative_usage equals message-level usage sum). The primary regression signal is `expected_artifact.transcript_digest`; the secondary signal is full canonical_transcript byte equality after JCS canonicalization."
+    },
+    "expected_assertions": {
+      "type": "array",
+      "description": "Optional list of scheduler-property assertions the case is designed to exercise. The harness MAY validate each named assertion alongside the primary digest comparison. The `category` enum partitions the §9.5–§9.9 catalogues; `name` identifies the specific invariant within a category (e.g. category=`scheduler_invariant`, name=`declared_order` for §4.10 invariant 2). Canonical names are listed in §9.5 / §9.6 / §9.7 / §9.8 / §9.9; the schema keeps `name` as an open string so future passes can extend the catalogue without a MAJOR bump.",
+      "items": {
+        "type": "object",
+        "required": ["category", "name"],
+        "properties": {
+          "category": {
+            "enum": ["scheduler_invariant", "budget_cap", "failure_kind", "replay", "schema_semantic"]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "note": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

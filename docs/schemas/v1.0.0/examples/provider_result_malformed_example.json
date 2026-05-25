@@ -1,0 +1,29 @@
+{
+  "messages": [
+    {
+      "role": "assistant",
+      "content": "I'll address this — [model returned a plain string instead of the expected structured object]"
+    }
+  ],
+  "tool_events": [],
+  "usage": {
+    "prompt_tokens": 2200,
+    "completion_tokens": 180,
+    "total_tokens": 2380,
+    "cost_usd": 0.024
+  },
+  "finish_reason": "error",
+  "structured_output": null,
+  "raw": {"id": "chatcmpl-redacted-malformed", "model": "redacted"},
+  "error": {
+    "kind": "malformed_response",
+    "message": "/text: 'text' is a required property",
+    "retriable": true,
+    "details": {
+      "validator": "Draft202012Validator",
+      "expected_output_schema": "turn_structured_output",
+      "failing_path": "/text",
+      "validator_message": "'text' is a required property"
+    }
+  }
+}

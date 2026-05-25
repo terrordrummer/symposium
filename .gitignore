@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Symposium spec — internal review trail and archived v0 draft
+research/
+docs/specification-v0-draft.md

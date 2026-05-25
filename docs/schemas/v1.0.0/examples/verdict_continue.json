@@ -1,0 +1,24 @@
+{
+  "next_action": "continue",
+  "rationale": "Round 1 surfaced two competing causal hypotheses (selection bias vs. unobserved confounder). Neither has been ruled out; the panel needs another round focused on adjudication.",
+  "confidence": 0.55,
+  "focus": "Adjudicate selection-bias vs. unobserved-confounder hypotheses; require quantitative criteria.",
+  "next_agents": ["researcher", "critic"],
+  "resolved_disagreements": [
+    {
+      "topic": "Whether the dataset is observational",
+      "resolution": "Confirmed observational; researcher cited the methods section.",
+      "agents_involved": ["researcher", "logician"]
+    }
+  ],
+  "unresolved_disagreements": [
+    {
+      "topic": "Causal direction of variable X on outcome Y",
+      "positions": [
+        {"agent": "logician", "claim": "X→Y under the structural assumption"},
+        {"agent": "critic", "claim": "Reverse causation cannot be excluded without an instrument"}
+      ],
+      "blocker": false
+    }
+  ]
+}

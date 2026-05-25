@@ -1,0 +1,5 @@
+{
+  "target": "researcher",
+  "type": "verification",
+  "content": "Can you confirm whether the cited 2024 study used a randomized control group or a propensity-matched cohort? My next step depends on this."
+}

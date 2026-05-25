@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/termination_artifact.schema.json",
+  "title": "TerminationArtifact",
+  "description": "Persisted record explaining why a session ended without `synthesis` (§2.6, §4.8, R2). A session ends with exactly one of: a `synthesis` message in the canonical_transcript, OR a TerminationArtifact persisted alongside it. The reason enum is extended from the §8 skeleton with `user_input_required` and `external_research_required` (§4.4, §4.7).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "reason",
+    "final_round",
+    "cumulative_usage",
+    "unresolved_disagreements",
+    "transcript_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "SemVer of the schema this artifact validates against (§5.1). Pass 4 schemas are `1.0.0`.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "reason": {
+      "description": "Why the session terminated. CLOSED enum (§4.7).",
+      "enum": [
+        "budget_exceeded",
+        "schema_error",
+        "provider_unrecoverable",
+        "user_cancel",
+        "timeout",
+        "user_input_required",
+        "external_research_required"
+      ]
+    },
+    "final_round": {
+      "description": "Highest round number reached before termination. 0 if termination occurred during `init` or `selector` phases.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "cumulative_usage": {
+      "description": "Aggregated token/cost usage across every provider invocation in the session.",
+      "$ref": "provider_result.schema.json#/properties/usage"
+    },
+    "most_recent_verdict": {
+      "description": "The verdict from the last completed coordination_turn before termination, if any. Null if termination occurred before any round closed.",
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "verdict.schema.json"}
+      ]
+    },
+    "unresolved_disagreements": {
+      "description": "Cumulative unresolved disagreements collected up to the termination point. Same shape as Verdict.unresolved_disagreements.",
+      "type": "array",
+      "items": {"$ref": "verdict.schema.json#/properties/unresolved_disagreements/items"}
+    },
+    "transcript_digest": {
+      "description": "SHA-256 hex digest (lowercase, 64 chars) computed over the JCS-canonicalized canonical_transcript at termination (§7.7). Tightened by Pass 6 from the Pass 4 permissive `minLength: 1`; pre-publication finalization, no version bump. MUST equal `Artifact.transcript_digest` when both are present (terminate paths).",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "pending_user_input_request": {
+      "description": "Present only when `reason = user_input_required` (§4.4). Copy of the verdict's `user_input_request` payload so downstream consumers can resume in a v1 interactive mode.",
+      "$ref": "verdict.schema.json#/properties/user_input_request"
+    },
+    "pending_external_research_request": {
+      "description": "Present only when `reason = external_research_required` (§4.4). Copy of the verdict's `external_research_request` payload.",
+      "$ref": "verdict.schema.json#/properties/external_research_request"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"reason": {"const": "user_input_required"}}, "required": ["reason"]},
+      "then": {
+        "required": ["pending_user_input_request"],
+        "not": {"required": ["pending_external_research_request"]}
+      }
+    },
+    {
+      "if": {"properties": {"reason": {"const": "external_research_required"}}, "required": ["reason"]},
+      "then": {
+        "required": ["pending_external_research_request"],
+        "not": {"required": ["pending_user_input_request"]}
+      }
+    },
+    {
+      "if": {
+        "properties": {"reason": {"enum": ["budget_exceeded", "schema_error", "provider_unrecoverable", "user_cancel", "timeout"]}},
+        "required": ["reason"]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["pending_user_input_request"]},
+            {"required": ["pending_external_research_request"]}
+          ]
+        }
+      }
+    }
+  ]
+}

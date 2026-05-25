@@ -1,0 +1,28 @@
+{
+  "messages": [
+    {
+      "role": "assistant",
+      "content": "[FakeProvider scripted response for agent=logician, round=1, turn_index=1] Two structural assumptions are doing load-bearing work in the proof: (1) the dataset is observational, (2) the unobserved-confounder variable Z is bounded. If either fails, the conclusion collapses."
+    }
+  ],
+  "tool_events": [],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0
+  },
+  "finish_reason": "stop",
+  "structured_output": {
+    "text": "Two structural assumptions are doing load-bearing work in the proof: (1) the dataset is observational, (2) the unobserved-confounder variable Z is bounded. If either fails, the conclusion collapses.",
+    "direct_requests": [
+      {
+        "target": "researcher",
+        "type": "verification",
+        "content": "Is the dataset observational? Methods section reference, please."
+      }
+    ]
+  },
+  "raw": {"fake_script_step": 0, "script_id": "demo-script-001"},
+  "error": null
+}

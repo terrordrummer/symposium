@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0.0",
+  "manifest_version": "1.0.0",
+  "session_id": "budget-breach-2026-05-25",
+  "status": "terminated",
+  "producer": {
+    "name": "symposium-reference",
+    "version": "0.1.0"
+  },
+  "created_at": "2026-05-25T11:00:00Z",
+  "updated_at": "2026-05-25T11:12:08Z",
+  "artifact_path": "artifact.json",
+  "config_path": "config.json",
+  "journal_path": "transcript.jsonl",
+  "transcript_digest": "4c70f86e970e98ecf118d2a85f5ee2df0b6c56d097036fc26cc4982074293294",
+  "outcome_kind": "termination",
+  "notes": "Reference example for §8 worked example: hit max_total_cost_usd mid-round-3; on_budget_exceeded = stop."
+}

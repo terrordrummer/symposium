@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/direct_request.schema.json",
+  "title": "DirectRequest",
+  "description": "Structured inter-agent control signal (ADR-003, §2.5). The only sanctioned form of addressing another agent. `additionalProperties` is false: no side-channel field of any name can carry a routed signal. A turn's `structured_output.direct_requests` is a (possibly empty) array of these objects (§4.5 multiplicity).",
+  "type": "object",
+  "required": ["target", "type", "content"],
+  "properties": {
+    "target": {
+      "description": "Agent id of the addressee. Runtime target-validation policy lives in §4.5.",
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "description": "Request category. OPEN string at the schema level; recommended values per §4.5.",
+      "type": "string",
+      "minLength": 1,
+      "examples": ["question", "verification", "critique", "feasibility", "delegation", "clarification"]
+    },
+    "content": {
+      "description": "Request payload: a free-text question or a structured object.",
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "object"}
+      ]
+    }
+  },
+  "additionalProperties": false
+}

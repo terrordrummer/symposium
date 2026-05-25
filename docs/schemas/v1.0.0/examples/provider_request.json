@@ -1,0 +1,44 @@
+{
+  "agent_id": "researcher",
+  "provider": "provider_a",
+  "model": "reasoning_model",
+  "reasoning_effort": "high",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are the Researcher. reasoning_scope: evidence-based. reasoning_style: empirical. behavioral_constraints: cite sources when available; distinguish fact from speculation. failure_modes: over-extrapolation from a single study; conflating correlation with causation. output_requirements: cite sources; flag confidence levels."
+    },
+    {
+      "role": "user",
+      "content": "Problem: Evaluate whether the dataset in the attached methods section supports a causal claim about treatment X reducing outcome Y.\n\nActive deliberation panel: [logician (formal-structural), researcher (you, evidence-based), critic (adversarial)]. Round: 1. Most recent verdict: none (round 1).\n\nMessages this round so far:\n[speaker: logician]\nTwo structural assumptions are doing load-bearing work: (1) dataset is observational, (2) unobserved confounder Z is bounded.\n\nBranch origin: logician → researcher (type: verification). Request: 'Is the dataset observational? Please cite the methods section.'"
+    }
+  ],
+  "tools": [
+    {
+      "name": "search_papers",
+      "description": "Search a corpus of academic papers and return up to 5 matches with title, authors, abstract, and source url.",
+      "input_schema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {"type": "string", "minLength": 1},
+          "max_results": {"type": "integer", "minimum": 1, "maximum": 20}
+        },
+        "additionalProperties": false
+      }
+    }
+  ],
+  "expected_output_schema": "turn_structured_output",
+  "sampling": {
+    "temperature": 0.2,
+    "max_tokens": 800,
+    "seed": 42
+  },
+  "metadata": {
+    "trace_id": "trace-2026-05-25-001",
+    "session_id": "demo-2026-05-25-001",
+    "round": 1,
+    "turn_index": 2,
+    "branch_depth": 1
+  }
+}

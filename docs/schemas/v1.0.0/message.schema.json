@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/message.schema.json",
+  "title": "Message",
+  "description": "A single entry in the canonical_transcript (§2.4). The `type` discriminator selects the `content` shape and the per-type optional annotations. Ordering across a transcript array (`(round, turn_index)`) is a runtime invariant — §4.10 invariant 7 — not enforced by this schema.",
+  "type": "object",
+  "required": [
+    "id",
+    "speaker",
+    "type",
+    "content",
+    "round",
+    "turn_index",
+    "branch_depth",
+    "timestamp",
+    "usage"
+  ],
+  "properties": {
+    "id": {
+      "description": "Globally unique message id within the session (e.g. UUIDv4 or a session-scoped sequence). The runtime owns id allocation.",
+      "type": "string",
+      "minLength": 1
+    },
+    "speaker": {
+      "description": "Identifier of the producer (agent id, originator id, or the literal `runtime` for `panel_contraction`).",
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "description": "Optional addressee field, advisory at the message level. The canonical list of routed addressees is in `content.direct_requests` for primary/branch turns.",
+      "type": ["string", "null"]
+    },
+    "type": {
+      "description": "Message type discriminator. CLOSED enum (§4.13).",
+      "enum": [
+        "problem_statement",
+        "primary_turn",
+        "coordination_turn",
+        "branch_turn",
+        "synthesis",
+        "panel_contraction"
+      ]
+    },
+    "content": {
+      "description": "Per-type payload. The shape is fixed by the per-type conditional below. The top-level type union accepts string (for `problem_statement`) or object (for every other type); the per-type allOf branch pins the exact shape.",
+      "oneOf": [
+        {"type": "string"},
+        {"type": "object"}
+      ]
+    },
+    "parent_id": {
+      "description": "Reference to the parent message id for `branch_turn`; null for every other type. Per-type constraints enforce non-null on `branch_turn`.",
+      "type": ["string", "null"]
+    },
+    "round": {
+      "description": "Round counter. 0 for `problem_statement`; ≥1 for every other type.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "turn_index": {
+      "description": "Per-round position counter (§2.4, §4.5).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "branch_depth": {
+      "description": "0 at round level; 1 inside a fork. MVP cap enforced in §4.5.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "timestamp": {
+      "description": "ISO-8601 datetime of when the runtime appended the message. Persisted for audit; not used by the scheduler for ordering.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "usage": {
+      "description": "Token and cost accounting attributable to this message. Zero for runtime annotations (`panel_contraction`) and the `problem_statement`.",
+      "$ref": "provider_result.schema.json#/properties/usage"
+    },
+    "suggested_followups": {
+      "description": "Branch-turn annotation: branch-agent direct_requests recorded as suggestions, not routed (§4.5).",
+      "type": "array",
+      "items": {"$ref": "direct_request.schema.json"}
+    },
+    "dropped_deferred": {
+      "description": "Primary-turn annotation: direct_requests whose deferral was rejected by the queue cap (§4.6).",
+      "type": "array",
+      "items": {"$ref": "direct_request.schema.json"}
+    },
+    "schema_failure": {
+      "description": "Primary-turn or branch-turn annotation: request-level schema failures encountered when parsing the turn's direct_requests (§4.5).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["offending_request", "reason"],
+        "properties": {
+          "offending_request": {"description": "The raw request object that failed validation (preserved verbatim for audit).", "type": "object"},
+          "reason": {"type": "string", "minLength": 1, "description": "Why the request was dropped."}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"type": {"const": "problem_statement"}}, "required": ["type"]},
+      "then": {
+        "properties": {
+          "content": {"type": "string", "minLength": 1},
+          "round": {"const": 0},
+          "turn_index": {"const": 0},
+          "branch_depth": {"const": 0},
+          "parent_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "primary_turn"}}, "required": ["type"]},
+      "then": {
+        "properties": {
+          "content": {"$ref": "turn_structured_output.schema.json"},
+          "round": {"minimum": 1},
+          "branch_depth": {"const": 0},
+          "parent_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "coordination_turn"}}, "required": ["type"]},
+      "then": {
+        "properties": {
+          "content": {"$ref": "verdict.schema.json"},
+          "round": {"minimum": 1},
+          "branch_depth": {"const": 0},
+          "parent_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "branch_turn"}}, "required": ["type"]},
+      "then": {
+        "properties": {
+          "content": {"$ref": "turn_structured_output.schema.json"},
+          "round": {"minimum": 1},
+          "branch_depth": {"const": 1},
+          "parent_id": {"type": "string", "minLength": 1}
+        },
+        "required": ["parent_id"]
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "synthesis"}}, "required": ["type"]},
+      "then": {
+        "properties": {
+          "content": {"$ref": "synthesis.schema.json#/$defs/synthesis_content"},
+          "round": {"minimum": 1},
+          "branch_depth": {"const": 0},
+          "parent_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "panel_contraction"}}, "required": ["type"]},
+      "then": {
+        "properties": {
+          "speaker": {"const": "runtime"},
+          "content": {
+            "type": "object",
+            "required": ["agent_id", "reason"],
+            "properties": {
+              "agent_id": {"type": "string", "minLength": 1},
+              "reason": {
+                "description": "Contraction reason; matches a subset of the termination-reason enum used at the agent level.",
+                "enum": ["provider_unrecoverable", "schema_error"]
+              }
+            },
+            "additionalProperties": false
+          },
+          "round": {"minimum": 1}
+        }
+      }
+    }
+  ]
+}

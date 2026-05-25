@@ -1,0 +1,42 @@
+# Pass 4 negative-validation pass
+
+Each case is INTENTIONALLY invalid — success = rejection.
+
+[OK ] N9: verdict.next_action='abort' is forbidden
+[OK ] N9: verdict.next_action='final_answer_ready' is forbidden
+[OK ] horizontal persona MUST NOT carry domain_scope
+[OK ] domain persona MUST carry forbidden_domains and must_delegate
+[OK ] direct_request: no `inline_mention` field allowed (ADR-003)
+[OK ] verdict: request_user_input without user_input_request payload fails
+[OK ] verdict: confidence > 1.0 fails
+[OK ] message: problem_statement with round != 0 fails
+[OK ] message: branch_turn with branch_depth=0 fails (must be 1)
+[OK ] config: schema_version='1.0' (not full SemVer) fails
+[OK ] config: selector strategy='llm' MUST require selector_budget
+[OK ] provider_result: finish_reason not in enum fails
+[OK ] verdict: request_user_input + external_research_request simultaneously fails (turn-2 fix)
+[OK ] termination_artifact: reason=budget_exceeded with pending_user_input_request fails (turn-2 fix)
+[OK ] message: branch_turn with parent_id=null fails (turn-2 fix)
+[OK ] message: primary_turn content with extra field fails (turn-2 fix)
+[OK ] provider_result: error.kind not in closed enum fails (Pass 5 closure)
+[OK ] provider_request: role 'agent' not in CLOSED enum fails (§6.3)
+[OK ] provider_request: expected_output_schema='whatever' not in CLOSED enum fails (§6.5)
+[OK ] provider_request: tool missing required input_schema fails (§6.4)
+[OK ] provider_request: vendor side-channel field 'gpt_model_overrides' rejected by additionalProperties:false (N4)
+[OK ] provider_request: empty messages array fails (must be at least 1)
+[OK ] provider_request: role=tool message without tool_call_id fails (§6.4 conditional)
+[OK ] provider_result: tool_events item missing required 'error' field fails (§6.4)
+[OK ] run_manifest: status='complete' MUST require transcript_digest and outcome_kind (§7.2)
+[OK ] run_manifest: status='in_progress' MUST NOT carry transcript_digest (§7.2)
+[OK ] run_manifest: status='complete' with outcome_kind='termination' is inconsistent (§7.2)
+[OK ] run_manifest: session_id with disallowed characters fails (§7.1 charset)
+[OK ] run_manifest: transcript_digest of wrong length fails (§7.7)
+[OK ] config: on_budget_exceeded='degrade' rejected by closed enum at MVP (§8.2)
+[OK ] config: observability_level='debug' rejected by closed enum (§7.9)
+[OK ] artifact: missing transcript_digest is rejected (Pass 6 promotion to top-level)
+[OK ] provider_result: tool_events item with additional_property fails (§6.4 close)
+[OK ] Pass 7 fake_provider_script: missing required `entries` field
+[OK ] Pass 7 fake_provider_script: match.expected_output_schema='null' outside closed enum
+[OK ] Pass 7 golden_test_case: case_id violates ^[A-Za-z0-9_-]{1,64}$ charset
+
+Total: 36 cases; failed: 0

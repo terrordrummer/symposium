@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/selector_output.schema.json",
+  "title": "SelectorOutput",
+  "description": "Schema for the selector's structured output (Pass 1 row #119). The MVP `fixed` strategy is degenerate — the active_deliberation_panel equals the declared default_deliberation_panel and the coordinator_agent equals config.selector.coordinator_agent, so a SelectorOutput is trivially derivable from Config without invocation. This schema is provided for v1+ strategies (`rules`, `llm`) so adapters can serialize selector decisions for replay and audit. Fields beyond the MVP-degenerate set are marked [v1].",
+  "type": "object",
+  "required": ["strategy", "selected_agents", "coordinator_agent"],
+  "properties": {
+    "strategy": {
+      "description": "Which selector strategy produced this output. Matches Config.selector.strategy.",
+      "enum": ["fixed", "rules", "llm"]
+    },
+    "selected_agents": {
+      "description": "Ordered list of agent ids forming the active_deliberation_panel for this session.",
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "coordinator_agent": {
+      "description": "Agent id of the chosen coordinator.",
+      "type": "string",
+      "minLength": 1
+    },
+    "excluded_agents": {
+      "description": "[v1] Agents the selector considered but declined to include, with rationale.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "reason"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "missing_capabilities": {
+      "description": "[v1] Capability gaps the selector identified for which no available persona fits. Surfaced for offline persona-creation workflow (Pass 1 row #124).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["capability", "reason"],
+        "properties": {
+          "capability": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1},
+          "suggested_persona": {"type": "string", "description": "Suggested persona id to fill the gap, if obvious."}
+        },
+        "additionalProperties": false
+      }
+    },
+    "reasoning": {
+      "description": "[v1] Free-text rationale for the selection decision (LLM strategies only).",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

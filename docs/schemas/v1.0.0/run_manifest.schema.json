@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/run_manifest.schema.json",
+  "title": "RunManifest",
+  "description": "On-disk manifest for a persisted Symposium session under `runs/<session_id>/` (§7.1, §7.2). The manifest is the index a reader consults first: it identifies the implementation that produced the directory, the canonical artifact path, and any sibling files (config snapshot, transcript journal, observability log). The artifact (`artifact.schema.json`) remains the authoritative session output (§5.10); the manifest is a thin metadata layer for directory validation, partial-state recovery, and forward-compat with additional sibling files. `status` distinguishes in-progress sessions (writable, missing `artifact.json`) from complete sessions (read-only, `artifact.json` present). `session_id` MUST match `config.session_id` and `artifact.session_id`; `transcript_digest` MUST equal the digest computed over the canonical_transcript at completion. The manifest is written atomically per §7.4 once the session terminates; for in-progress sessions a `status = in_progress` manifest MAY exist as a journal sidecar.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "manifest_version",
+    "session_id",
+    "status",
+    "producer",
+    "created_at",
+    "artifact_path",
+    "config_path"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "SemVer of the run_manifest schema this instance validates against (§5.1). Pass 6 ships `1.0.0`.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "manifest_version": {
+      "description": "SemVer of the on-disk layout convention. Distinct from `schema_version` so the manifest schema and the layout can evolve independently. Pass 6 ships `1.0.0`.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "description": "Session identifier; MUST equal `config.session_id` and (when `status = complete` or `status = terminated`) `artifact.session_id`. Constrained to a cross-filesystem-safe charset to roundtrip on POSIX, Windows, and case-insensitive filesystems (§7.1).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "status": {
+      "description": "Lifecycle state of the on-disk directory. CLOSED enum. `in_progress` — session is still running; `artifact.json` MAY be absent and `journal_path` SHOULD be present. `complete` — session ended with a synthesis outcome; `artifact.json` MUST be present. `terminated` — session ended with a termination_artifact outcome; `artifact.json` MUST be present. `crashed` — session never reached `persist`; a reader MUST NOT silently re-run, and MUST treat the journal as best-effort partial state (§7.3).",
+      "enum": ["in_progress", "complete", "terminated", "crashed"]
+    },
+    "producer": {
+      "description": "Identifier and version of the implementation that wrote the directory. Used by readers for compatibility decisions and by audits to trace artifact provenance. The `name` is a free string (e.g. an OSS implementation name); the `version` is SemVer. Neither field is a vendor identifier in the rule-N4 sense (it identifies the Symposium implementation, not a model vendor).",
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"}
+      },
+      "additionalProperties": false
+    },
+    "created_at": {
+      "description": "ISO-8601 datetime when the manifest was first written (typically equal to `artifact.started_at`).",
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "description": "ISO-8601 datetime when the manifest was last modified. Optional for `status = complete` / `terminated` (where the manifest is written once and not modified); REQUIRED for `status = in_progress` / `crashed` so a reader can detect staleness.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "artifact_path": {
+      "description": "Relative path (within the run directory) to the canonical artifact JSON file (typically `artifact.json`). REQUIRED for every status; readers consult the manifest BEFORE opening the artifact, so the path is named here even when the file is absent (`status = in_progress` / `crashed`).",
+      "type": "string",
+      "minLength": 1
+    },
+    "config_path": {
+      "description": "Relative path to the resolved Config snapshot (typically `config.json`). The Config is a copy of `artifact.config` extracted for indexability — a reader can inspect the configuration without parsing the full artifact.",
+      "type": "string",
+      "minLength": 1
+    },
+    "journal_path": {
+      "description": "Optional relative path to the transcript journal (a per-turn append-only log, typically `transcript.jsonl`). PRESENT when `status = in_progress` or `status = crashed`; OPTIONAL when `status = complete` / `terminated` (the journal MAY be retained for debugging but the artifact is authoritative). The journal format is implementation-defined; readers MUST NOT rely on it as a source of truth (§7.3).",
+      "type": "string",
+      "minLength": 1
+    },
+    "observability_log_path": {
+      "description": "Optional relative path to a per-session observability log (e.g. `observability.jsonl`). Reserved for v1+ structured observability streams (§7.10); MVP implementations MAY omit. Format is implementation-defined.",
+      "type": "string",
+      "minLength": 1
+    },
+    "transcript_digest": {
+      "description": "SHA-256 hex digest (lowercase, 64 chars) computed over the JCS-canonicalized canonical_transcript at session end (§7.7). REQUIRED when `status = complete` / `terminated`; FORBIDDEN when `status = in_progress` / `crashed` (the transcript is not yet final). When present, MUST equal `artifact.transcript_digest` and (for terminate paths) `termination_artifact.transcript_digest`.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "outcome_kind": {
+      "description": "Mirror of `artifact.outcome.kind` for fast indexability. REQUIRED when `status = complete` (value `synthesis`) or `status = terminated` (value `termination`); FORBIDDEN otherwise.",
+      "enum": ["synthesis", "termination"]
+    },
+    "notes": {
+      "description": "Free-text human-readable notes (operator comments, deployment context, etc.). Schema-opaque. MUST NOT contain credential material (§8.9).",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"enum": ["complete", "terminated"]}}, "required": ["status"]},
+      "then": {
+        "required": ["transcript_digest", "outcome_kind"]
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "complete"}}, "required": ["status"]},
+      "then": {
+        "properties": {"outcome_kind": {"const": "synthesis"}}
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "terminated"}}, "required": ["status"]},
+      "then": {
+        "properties": {"outcome_kind": {"const": "termination"}}
+      }
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["in_progress", "crashed"]}}, "required": ["status"]},
+      "then": {
+        "required": ["updated_at"],
+        "not": {
+          "anyOf": [
+            {"required": ["transcript_digest"]},
+            {"required": ["outcome_kind"]}
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "messages": [],
+  "tool_events": [],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0
+  },
+  "finish_reason": "error",
+  "structured_output": null,
+  "raw": {"id": "req-redacted", "model": "redacted"},
+  "error": {
+    "kind": "invalid_request",
+    "message": "Adapter dispatched a request with an unsupported sampling key 'top_q'; provider returned HTTP 400 invalid_request_error",
+    "retriable": false,
+    "details": {
+      "status": 400,
+      "vendor_code": "invalid_request_error",
+      "vendor_message": "Unknown parameter: 'top_q'"
+    }
+  }
+}

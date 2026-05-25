@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/synthesis.schema.json",
+  "title": "Synthesis",
+  "description": "The integrated final answer produced when the session ends with `verdict.next_action = finalize` and the runtime successfully completes the synthesis step (§2.6, §4.8, R2). A Synthesis is a specialized Message of `type = synthesis` — this file fixes the shape of the `content` payload, referenced from message.schema.json's per-type conditional.",
+  "type": "object",
+  "$ref": "#/$defs/synthesis_content",
+  "$defs": {
+    "synthesis_content": {
+      "type": "object",
+      "title": "SynthesisContent",
+      "description": "The `content` payload of a synthesis Message. Carries the integrated answer plus the cumulative disagreement record collected across the session.",
+      "required": [
+        "integrated_answer",
+        "resolved_disagreements",
+        "unresolved_disagreements"
+      ],
+      "properties": {
+        "integrated_answer": {
+          "description": "The Coordinator's integrated final answer, addressing the original problem_statement. Free-form structured text.",
+          "type": "string",
+          "minLength": 1
+        },
+        "resolved_disagreements": {
+          "description": "Cumulative list of disagreements the panel resolved across all rounds. Same shape as Verdict.resolved_disagreements.",
+          "type": "array",
+          "items": {"$ref": "verdict.schema.json#/properties/resolved_disagreements/items"}
+        },
+        "unresolved_disagreements": {
+          "description": "Cumulative list of disagreements the panel did not reconcile. Same shape as Verdict.unresolved_disagreements. An empty array means the panel converged on every identified disagreement.",
+          "type": "array",
+          "items": {"$ref": "verdict.schema.json#/properties/unresolved_disagreements/items"}
+        },
+        "confidence": {
+          "description": "Coordinator's confidence in the synthesis, 0.0 to 1.0. Optional but RECOMMENDED.",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "open_questions": {
+          "description": "Questions the Coordinator surfaces as still open (not blocking the synthesis but worth tracking).",
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

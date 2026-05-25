@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/provider_result.schema.json",
+  "title": "ProviderResult",
+  "description": "Structured object returned by `provider_adapter.invoke(request)` (blocker #5, §2.8). The provider-side contract (request shape, tool-call lifecycle, retry mechanics) is finalized in §6 Pass 5 — this file fixes only the response side that §4 already references. `structured_output` is open at the provider boundary; the runtime canonicalizes it into a strict shape (e.g. `turn_structured_output.schema.json`) before appending to the canonical_transcript.",
+  "type": "object",
+  "required": ["messages", "tool_events", "usage", "finish_reason", "structured_output", "raw", "error"],
+  "properties": {
+    "messages": {
+      "description": "Raw provider-level messages produced by the invocation. Distinct from the canonical Message (pre-canonicalization).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": {"type": "string", "minLength": 1, "examples": ["assistant", "tool", "system"]},
+          "content": {"description": "Provider-defined content (string or object)."}
+        }
+      }
+    },
+    "tool_events": {
+      "description": "Tool invocation records produced during this provider call (§2.8, §6.4). Persisted alongside the parent canonical message so replays and audits see the tool history. Adapters MUST emit entries in execution order; entries MUST NOT be reordered, deduplicated, or collapsed.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "arguments", "error"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "description": "Tool name as registered with the adapter."},
+          "arguments": {"description": "Tool arguments object (validated against the tool's input_schema BEFORE invocation, §6.4). On `tool_failure` from input-schema validation, this still holds the offending arguments verbatim for audit.", "type": "object"},
+          "result": {"description": "Tool result. `null` when the tool errored (`error != null`); otherwise an object or string returned by the tool handler.", "oneOf": [{"type": "null"}, {"type": "object"}, {"type": "string"}]},
+          "latency_ms": {"type": "integer", "minimum": 0, "description": "Wall-clock latency of the tool handler invocation in milliseconds."},
+          "error": {"description": "`null` on success; otherwise the same shape as the top-level provider_result `error` (closed `kind` enum, §6.6).", "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "required": ["kind", "message", "retriable"],
+              "properties": {
+                "kind": {"$ref": "#/properties/error/oneOf/1/properties/kind"},
+                "message": {"type": "string", "minLength": 1},
+                "retriable": {"type": "boolean"},
+                "details": {"type": ["object", "null"]}
+              },
+              "additionalProperties": false
+            }
+          ]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "usage": {
+      "description": "Token and cost accounting for this invocation.",
+      "type": "object",
+      "required": ["prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"],
+      "properties": {
+        "prompt_tokens": {"type": "integer", "minimum": 0},
+        "completion_tokens": {"type": "integer", "minimum": 0},
+        "total_tokens": {"type": "integer", "minimum": 0},
+        "cost_usd": {"type": "number", "minimum": 0.0},
+        "estimated": {"type": "boolean", "default": false, "description": "True when the adapter estimated tokens because the provider did not report usage (§6.9, Pass 5 §6.15 `usage_estimated` flag promoted to a schema field in Pass 6). When true, the runtime SHOULD propagate the estimation flag into observability metrics and into the session's cumulative_usage surface (§7.9) so operators can interpret cost/token accumulation as approximate. Default `false`; omitted values are treated as `false`."}
+      },
+      "additionalProperties": false
+    },
+    "finish_reason": {
+      "description": "Why the provider stopped generating (§2.8). CLOSED enum.",
+      "enum": ["stop", "length", "tool_call", "content_filter", "error"]
+    },
+    "structured_output": {
+      "description": "Machine-readable portion of the response the runtime consumes (ADR-003). Provider-side adapters MAY return a permissive object here; the runtime canonicalizes it into a strict per-turn-type shape before persisting to the canonical_transcript. Expected canonicalization target depends on the request type — `turn_structured_output.schema.json` for a panel/branch turn, `verdict.schema.json` for a coordination turn, `synthesis.schema.json#/$defs/synthesis_content` for a synthesis. `null` is a schema failure (§4.9).",
+      "type": ["object", "null"]
+    },
+    "raw": {
+      "description": "The raw provider response, preserved for debugging and audit. Schema-opaque from Symposium's perspective.",
+      "type": ["object", "null"]
+    },
+    "error": {
+      "description": "Structured error description, or null on success. `kind` enum is CLOSED (§6.6, 12 values). Runtime handling of `retriable` lives in §4.9; mapping of each `kind` to `retry` / `provider_unrecoverable` / `schema_error` is fixed in §6.6 (§4.7 termination-reason names).",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["kind", "message", "retriable"],
+          "properties": {
+            "kind": {
+              "description": "Error category. CLOSED enum (§6.6). Closed by Pass 5 as a pre-publication finalization before 1.0.0 release; no version bump. Post-publication changes default MINOR per §5.1 for any acceptance-behavior change.",
+              "enum": [
+                "timeout",
+                "network",
+                "rate_limit",
+                "quota_exhausted",
+                "auth_failure",
+                "model_unavailable",
+                "context_length_exceeded",
+                "content_filter",
+                "invalid_request",
+                "malformed_response",
+                "tool_failure",
+                "internal"
+              ]
+            },
+            "message": {"type": "string", "minLength": 1, "description": "Human-readable error message."},
+            "retriable": {"type": "boolean", "description": "Adapter-provided retryability hint. Runtime handling in §4.9; default retriability per `kind` is documented in §6.6."},
+            "details": {"type": ["object", "null"], "description": "Adapter-specific details (status code, vendor error id, validator report for `malformed_response`, etc.)."}
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "additionalProperties": false
+}

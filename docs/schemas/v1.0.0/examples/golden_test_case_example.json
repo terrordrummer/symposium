@@ -1,0 +1,337 @@
+{
+  "schema_version": "1.0.0",
+  "case_id": "pass7-golden-min-001",
+  "description": "Minimal Pass 7 GoldenTestCase: 1 panel agent + coordinator, 1 round, verdict=finalize, synthesis. Exercises \u00a79.5 invariants 2, 3, 7, 9 and \u00a79.9 semantic check.",
+  "problem_statement": "What is the simplest example we can use to demonstrate a one-round Symposium session that finalizes with a synthesis?",
+  "config": {
+    "schema_version": "1.0.0",
+    "session_id": "pass7-golden-min-001",
+    "originator": "user:test",
+    "problem_statement": "What is the simplest example we can use to demonstrate a one-round Symposium session that finalizes with a synthesis?",
+    "selector": {
+      "strategy": "fixed",
+      "default_deliberation_panel": [
+        "agent_a"
+      ],
+      "coordinator_agent": "coordinator"
+    },
+    "agents": [
+      {
+        "id": "agent_a",
+        "persona_ref": "agent_a_persona",
+        "provider": "fake",
+        "model": "fake_model_1"
+      }
+    ],
+    "coordinator": {
+      "id": "coordinator",
+      "persona_ref": "coordinator_persona",
+      "provider": "fake",
+      "model": "fake_model_1"
+    },
+    "budget": {
+      "max_total_tokens": 500000,
+      "max_total_cost_usd": 5.0,
+      "max_rounds": 5,
+      "max_wallclock_seconds": 1800
+    },
+    "runtime": {
+      "max_branch_depth": 1,
+      "max_deferred_queue_length": 8,
+      "max_deferred_drains_per_round": 1,
+      "on_agent_failure": "terminate",
+      "per_agent_retry_budget": 2,
+      "synthesize_on_terminate": false
+    }
+  },
+  "fake_script": {
+    "schema_version": "1.0.0",
+    "description": "Pass 7 minimal GoldenTestCase script: 1-agent panel + coordinator, 1 round, finalize \u2192 synthesis.",
+    "on_exhaustion": "error",
+    "entries": [
+      {
+        "match": {
+          "agent_id": "agent_a",
+          "expected_output_schema": "turn_structured_output",
+          "round": 1,
+          "turn_index": 1
+        },
+        "comment": "agent_a primary_turn \u2014 emits a substantive claim, no direct_requests.",
+        "result": {
+          "messages": [
+            {
+              "role": "assistant",
+              "content": "[FakeProvider scripted: agent_a, round=1, turn_index=1]"
+            }
+          ],
+          "tool_events": [],
+          "usage": {
+            "prompt_tokens": 500,
+            "completion_tokens": 120,
+            "total_tokens": 620,
+            "cost_usd": 0.005
+          },
+          "finish_reason": "stop",
+          "structured_output": {
+            "text": "The smallest illustrative session has one panel agent plus the coordinator. The agent offers a single substantive claim; the coordinator records a verdict; synthesis integrates the claim into a final answer.",
+            "direct_requests": []
+          },
+          "raw": {
+            "fake_script_step": 0
+          },
+          "error": null
+        }
+      },
+      {
+        "match": {
+          "agent_id": "coordinator",
+          "expected_output_schema": "verdict",
+          "round": 1,
+          "turn_index": 2
+        },
+        "comment": "coordinator coordination_turn \u2014 emits verdict with next_action=finalize.",
+        "result": {
+          "messages": [
+            {
+              "role": "assistant",
+              "content": "[FakeProvider scripted: coordinator coordination_turn, round=1, turn_index=2]"
+            }
+          ],
+          "tool_events": [],
+          "usage": {
+            "prompt_tokens": 700,
+            "completion_tokens": 140,
+            "total_tokens": 840,
+            "cost_usd": 0.007
+          },
+          "finish_reason": "stop",
+          "structured_output": {
+            "next_action": "finalize",
+            "rationale": "The single panel agent has provided the only claim the problem requires; no open questions remain.",
+            "confidence": 0.9,
+            "focus": "Integrate the claim into a synthesis.",
+            "next_agents": [],
+            "resolved_disagreements": [],
+            "unresolved_disagreements": []
+          },
+          "raw": {
+            "fake_script_step": 1
+          },
+          "error": null
+        }
+      },
+      {
+        "match": {
+          "agent_id": "coordinator",
+          "expected_output_schema": "synthesis_content",
+          "round": 1,
+          "turn_index": 3
+        },
+        "comment": "coordinator synthesis attempt \u2014 produces final integrated answer.",
+        "result": {
+          "messages": [
+            {
+              "role": "assistant",
+              "content": "[FakeProvider scripted: coordinator synthesis, round=1, turn_index=3]"
+            }
+          ],
+          "tool_events": [],
+          "usage": {
+            "prompt_tokens": 900,
+            "completion_tokens": 200,
+            "total_tokens": 1100,
+            "cost_usd": 0.0095
+          },
+          "finish_reason": "stop",
+          "structured_output": {
+            "integrated_answer": "A one-round Symposium session with a single panel agent plus the coordinator is the simplest illustrative configuration. The panel agent contributes a single primary_turn; the coordinator records a verdict of finalize; the synthesis integrates the agent's claim into a single final answer.",
+            "resolved_disagreements": [],
+            "unresolved_disagreements": [],
+            "confidence": 0.92,
+            "open_questions": []
+          },
+          "raw": {
+            "fake_script_step": 2
+          },
+          "error": null
+        }
+      }
+    ]
+  },
+  "expected_artifact": {
+    "schema_version": "1.0.0",
+    "session_id": "pass7-golden-min-001",
+    "config": {
+      "schema_version": "1.0.0",
+      "session_id": "pass7-golden-min-001",
+      "originator": "user:test",
+      "problem_statement": "What is the simplest example we can use to demonstrate a one-round Symposium session that finalizes with a synthesis?",
+      "selector": {
+        "strategy": "fixed",
+        "default_deliberation_panel": [
+          "agent_a"
+        ],
+        "coordinator_agent": "coordinator"
+      },
+      "agents": [
+        {
+          "id": "agent_a",
+          "persona_ref": "agent_a_persona",
+          "provider": "fake",
+          "model": "fake_model_1"
+        }
+      ],
+      "coordinator": {
+        "id": "coordinator",
+        "persona_ref": "coordinator_persona",
+        "provider": "fake",
+        "model": "fake_model_1"
+      },
+      "budget": {
+        "max_total_tokens": 500000,
+        "max_total_cost_usd": 5.0,
+        "max_rounds": 5,
+        "max_wallclock_seconds": 1800
+      },
+      "runtime": {
+        "max_branch_depth": 1,
+        "max_deferred_queue_length": 8,
+        "max_deferred_drains_per_round": 1,
+        "on_agent_failure": "terminate",
+        "per_agent_retry_budget": 2,
+        "synthesize_on_terminate": false
+      }
+    },
+    "canonical_transcript": [
+      {
+        "id": "msg-000",
+        "speaker": "user:test",
+        "type": "problem_statement",
+        "content": "What is the simplest example we can use to demonstrate a one-round Symposium session that finalizes with a synthesis?",
+        "parent_id": null,
+        "round": 0,
+        "turn_index": 0,
+        "branch_depth": 0,
+        "timestamp": "2026-05-25T12:00:00Z",
+        "usage": {
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0
+        }
+      },
+      {
+        "id": "msg-001",
+        "speaker": "agent_a",
+        "type": "primary_turn",
+        "content": {
+          "text": "The smallest illustrative session has one panel agent plus the coordinator. The agent offers a single substantive claim; the coordinator records a verdict; synthesis integrates the claim into a final answer.",
+          "direct_requests": []
+        },
+        "parent_id": null,
+        "round": 1,
+        "turn_index": 1,
+        "branch_depth": 0,
+        "timestamp": "2026-05-25T12:00:05Z",
+        "usage": {
+          "prompt_tokens": 500,
+          "completion_tokens": 120,
+          "total_tokens": 620,
+          "cost_usd": 0.005
+        }
+      },
+      {
+        "id": "msg-002",
+        "speaker": "coordinator",
+        "type": "coordination_turn",
+        "content": {
+          "next_action": "finalize",
+          "rationale": "The single panel agent has provided the only claim the problem requires; no open questions remain.",
+          "confidence": 0.9,
+          "focus": "Integrate the claim into a synthesis.",
+          "next_agents": [],
+          "resolved_disagreements": [],
+          "unresolved_disagreements": []
+        },
+        "parent_id": null,
+        "round": 1,
+        "turn_index": 2,
+        "branch_depth": 0,
+        "timestamp": "2026-05-25T12:00:10Z",
+        "usage": {
+          "prompt_tokens": 700,
+          "completion_tokens": 140,
+          "total_tokens": 840,
+          "cost_usd": 0.007
+        }
+      },
+      {
+        "id": "msg-003",
+        "speaker": "coordinator",
+        "type": "synthesis",
+        "content": {
+          "integrated_answer": "A one-round Symposium session with a single panel agent plus the coordinator is the simplest illustrative configuration. The panel agent contributes a single primary_turn; the coordinator records a verdict of finalize; the synthesis integrates the agent's claim into a single final answer.",
+          "resolved_disagreements": [],
+          "unresolved_disagreements": [],
+          "confidence": 0.92,
+          "open_questions": []
+        },
+        "parent_id": null,
+        "round": 1,
+        "turn_index": 3,
+        "branch_depth": 0,
+        "timestamp": "2026-05-25T12:00:15Z",
+        "usage": {
+          "prompt_tokens": 900,
+          "completion_tokens": 200,
+          "total_tokens": 1100,
+          "cost_usd": 0.0095
+        }
+      }
+    ],
+    "outcome": {
+      "kind": "synthesis",
+      "synthesis_message_id": "msg-003"
+    },
+    "cumulative_usage": {
+      "prompt_tokens": 2100,
+      "completion_tokens": 460,
+      "total_tokens": 2560,
+      "cost_usd": 0.0215
+    },
+    "cumulative_unresolved": [],
+    "transcript_digest": "66db8894ca3eee7335b4ffe87006957b972efc1de1b948171d15c8942ebbb654",
+    "started_at": "2026-05-25T12:00:00Z",
+    "ended_at": "2026-05-25T12:00:15Z"
+  },
+  "expected_assertions": [
+    {
+      "category": "scheduler_invariant",
+      "name": "declared_order",
+      "note": "single-agent panel; agent_a is the sole primary_turn in round 1."
+    },
+    {
+      "category": "scheduler_invariant",
+      "name": "coordinator_last",
+      "note": "coordination_turn at turn_index=2 follows agent_a primary_turn at turn_index=1."
+    },
+    {
+      "category": "scheduler_invariant",
+      "name": "scheduler_deterministic",
+      "note": "Two runs with this same (config, fake_script) MUST produce identical transcript_digest."
+    },
+    {
+      "category": "scheduler_invariant",
+      "name": "canonical_transcript_sole_truth",
+      "note": "\u00a77.7 semantic check holds: digest == jcs_sha256(canonical_transcript); cumulative_usage == sum(messages.usage)."
+    },
+    {
+      "category": "schema_semantic",
+      "name": "semantic_digest"
+    },
+    {
+      "category": "schema_semantic",
+      "name": "semantic_usage_sum"
+    }
+  ]
+}

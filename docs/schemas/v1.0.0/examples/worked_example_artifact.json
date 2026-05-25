@@ -1,0 +1,306 @@
+{
+  "schema_version": "1.0.0",
+  "session_id": "demo-2026-05-25-001",
+  "config": {
+    "schema_version": "1.0.0",
+    "session_id": "demo-2026-05-25-001",
+    "originator": "user:roberto",
+    "problem_statement": "Given an observational dataset on hospital readmission, can we estimate the average treatment effect of a new discharge protocol, and how robust is the estimate to unobserved confounding?",
+    "selector": {
+      "strategy": "fixed",
+      "default_deliberation_panel": ["logician", "researcher", "critic"],
+      "coordinator_agent": "coordinator"
+    },
+    "agents": [
+      {
+        "id": "logician",
+        "persona_ref": "logician",
+        "provider": "provider_a",
+        "model": "reasoning_model",
+        "reasoning_effort": "high"
+      },
+      {
+        "id": "researcher",
+        "persona_ref": "researcher",
+        "provider": "provider_b",
+        "model": "reasoning_model"
+      },
+      {
+        "id": "critic",
+        "persona_ref": "critic",
+        "provider": "provider_a",
+        "model": "reasoning_model",
+        "reasoning_effort": "high"
+      }
+    ],
+    "coordinator": {
+      "id": "coordinator",
+      "persona_ref": "coordinator",
+      "provider": "provider_b",
+      "model": "reasoning_model"
+    },
+    "budget": {
+      "max_total_tokens": 500000,
+      "max_total_cost_usd": 5.0,
+      "max_rounds": 5,
+      "max_wallclock_seconds": 1800
+    },
+    "runtime": {
+      "max_branch_depth": 1,
+      "max_deferred_queue_length": 8,
+      "max_deferred_drains_per_round": 1,
+      "on_agent_failure": "terminate",
+      "per_agent_retry_budget": 2,
+      "synthesize_on_terminate": false
+    }
+  },
+  "canonical_transcript": [
+    {
+      "id": "msg-000",
+      "speaker": "user:roberto",
+      "type": "problem_statement",
+      "content": "Given an observational dataset on hospital readmission, can we estimate the average treatment effect of a new discharge protocol, and how robust is the estimate to unobserved confounding?",
+      "parent_id": null,
+      "round": 0,
+      "turn_index": 0,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:00Z",
+      "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    },
+    {
+      "id": "msg-001",
+      "speaker": "logician",
+      "type": "primary_turn",
+      "content": {
+        "text": "Two structural assumptions are doing load-bearing work: (1) the dataset is observational; (2) any unobserved confounder Z is bounded. I will ask the researcher to confirm (1) directly, and I will also need the critic to surface any co-varying-intervention concerns that would invalidate (2).",
+        "direct_requests": [
+          {
+            "target": "researcher",
+            "type": "verification",
+            "content": "Is the dataset observational, and do the methods describe any randomization or matching?"
+          },
+          {
+            "target": "critic",
+            "type": "critique",
+            "content": "What unobserved confounders or co-varying interventions would invalidate the bounded-Z assumption in this hospital cohort?"
+          }
+        ]
+      },
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 1,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:05Z",
+      "usage": {"prompt_tokens": 2200, "completion_tokens": 380, "total_tokens": 2580, "cost_usd": 0.0290}
+    },
+    {
+      "id": "msg-002",
+      "speaker": "researcher",
+      "type": "branch_turn",
+      "content": {
+        "text": "The dataset is observational; no randomization. The methods section describes propensity-score matching as a downstream step but the raw assignment is non-randomized. Citing: source_v1.json#methods. Confirming (1)."
+      },
+      "parent_id": "msg-001",
+      "round": 1,
+      "turn_index": 2,
+      "branch_depth": 1,
+      "timestamp": "2026-05-25T10:00:11Z",
+      "usage": {"prompt_tokens": 2600, "completion_tokens": 180, "total_tokens": 2780, "cost_usd": 0.0309}
+    },
+    {
+      "id": "msg-003",
+      "speaker": "researcher",
+      "type": "primary_turn",
+      "content": {
+        "text": "Confirming observational design (see msg-002). Standard ATE estimators (IPW, AIPW) apply; for unobserved confounding, Rosenbaum bounds and E-values are the canonical sensitivity analyses. I recommend reporting both. No requests outstanding."
+      },
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 3,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:18Z",
+      "usage": {"prompt_tokens": 2700, "completion_tokens": 230, "total_tokens": 2930, "cost_usd": 0.0329}
+    },
+    {
+      "id": "msg-004",
+      "speaker": "critic",
+      "type": "primary_turn",
+      "content": {
+        "text": "I have not yet been asked the logician's question (still queued, I see it in the panel disclosure). My own observation: shift changes, season, and attending physician all co-vary with discharge-protocol uptake in real hospitals. Without naming these, any sensitivity analysis is theatre. I will answer the logician's deferred question in the next round when the runtime drains it."
+      },
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 4,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:25Z",
+      "usage": {"prompt_tokens": 3100, "completion_tokens": 250, "total_tokens": 3350, "cost_usd": 0.0381}
+    },
+    {
+      "id": "msg-005",
+      "speaker": "coordinator",
+      "type": "coordination_turn",
+      "content": {
+        "next_action": "continue",
+        "rationale": "Round 1 surfaced one resolved fact (observational design) and one outstanding logician-to-critic question still in the deferred queue. The critic flagged co-varying interventions; we need the logician's response after the queue drains.",
+        "confidence": 0.55,
+        "focus": "Drain the deferred logician→critic question; resolve the co-varying-intervention concern.",
+        "next_agents": ["critic", "logician"],
+        "resolved_disagreements": [
+          {
+            "topic": "Whether the dataset is observational",
+            "resolution": "Confirmed observational (researcher branch turn, msg-002).",
+            "agents_involved": ["logician", "researcher"]
+          }
+        ],
+        "unresolved_disagreements": [
+          {
+            "topic": "Sufficiency of propensity matching under unobserved confounding",
+            "positions": [
+              {"agent": "researcher", "claim": "Matching plus sensitivity analysis is sufficient."},
+              {"agent": "critic", "claim": "Matching ignores co-varying interventions; sensitivity is theatre without those named."}
+            ],
+            "blocker": false
+          }
+        ]
+      },
+      "parent_id": null,
+      "round": 1,
+      "turn_index": 5,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:31Z",
+      "usage": {"prompt_tokens": 4200, "completion_tokens": 540, "total_tokens": 4740, "cost_usd": 0.0526}
+    },
+    {
+      "id": "msg-006",
+      "speaker": "critic",
+      "type": "branch_turn",
+      "content": {
+        "text": "Round-open drain: answering the logician's deferred question from msg-001. Three confounder classes that would invalidate bounded-Z: (a) attending-physician practice variation; (b) seasonal admission mix (winter respiratory cases differ from summer cohorts); (c) shift-handover artifacts at protocol-uptake boundaries. Each is an unobserved intervention co-varying with the discharge protocol; (a) and (c) admit fixed-effect adjustment, (b) admits seasonal blocking."
+      },
+      "parent_id": "msg-001",
+      "round": 2,
+      "turn_index": 1,
+      "branch_depth": 1,
+      "timestamp": "2026-05-25T10:00:38Z",
+      "usage": {"prompt_tokens": 3500, "completion_tokens": 290, "total_tokens": 3790, "cost_usd": 0.0427}
+    },
+    {
+      "id": "msg-007",
+      "speaker": "logician",
+      "type": "primary_turn",
+      "content": {
+        "text": "Given the critic's three confounder classes (msg-006), the Rosenbaum Γ-bound framework formalises this exactly: identification holds up to a bound Γ on the odds ratio of unobserved assignment. Attending-physician and shift-handover FE narrow Γ but cannot eliminate it; seasonal blocking helps further. The honest answer is: report point estimate plus Γ-bound, with the Γ-range as the headline. Pretending we identify a point estimate without Γ would be the 'theatre' the critic warned against."
+      },
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 2,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:45Z",
+      "usage": {"prompt_tokens": 4100, "completion_tokens": 340, "total_tokens": 4440, "cost_usd": 0.0501}
+    },
+    {
+      "id": "msg-008",
+      "speaker": "researcher",
+      "type": "primary_turn",
+      "content": {
+        "text": "Agreed — IPW point estimate with Γ-bound and an E-value covers the critic's concern. Attending-physician and shift FE plus seasonal blocking are standard additions; I'll specify them in the methods. The honest report is: point estimate plus Γ-range as the headline."
+      },
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 3,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:51Z",
+      "usage": {"prompt_tokens": 4200, "completion_tokens": 180, "total_tokens": 4380, "cost_usd": 0.0489}
+    },
+    {
+      "id": "msg-009",
+      "speaker": "critic",
+      "type": "primary_turn",
+      "content": {
+        "text": "Γ-bounds plus named fixed effects is honest. I withdraw the 'theatre' framing; with explicit Γ this is decision-relevant. Caveat: the report MUST present the Γ-range as the headline, not the point estimate — otherwise readers anchor on the point and ignore the bound."
+      },
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 4,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:00:58Z",
+      "usage": {"prompt_tokens": 4350, "completion_tokens": 200, "total_tokens": 4550, "cost_usd": 0.0517}
+    },
+    {
+      "id": "msg-010",
+      "speaker": "coordinator",
+      "type": "coordination_turn",
+      "content": {
+        "next_action": "finalize",
+        "rationale": "The panel converged: IPW + Γ-bound + named fixed effects + headline Γ-range. The deferred logician→critic exchange resolved the round-1 unresolved disagreement. The critic explicitly withdrew the 'theatre' framing. Budget is well under cap. Synthesis is appropriate.",
+        "confidence": 0.84,
+        "focus": "Synthesize: ATE estimable via IPW with named FE; robustness reported as Γ-range, not point estimate.",
+        "next_agents": [],
+        "resolved_disagreements": [
+          {
+            "topic": "Whether the dataset is observational",
+            "resolution": "Confirmed observational.",
+            "agents_involved": ["logician", "researcher"]
+          },
+          {
+            "topic": "Sufficiency of propensity matching under unobserved confounding",
+            "resolution": "Settled: matching alone is insufficient; matching + named FE (attending-physician, shift) + seasonal blocking + Γ-bound + headline Γ-range is sufficient and honest.",
+            "agents_involved": ["researcher", "critic", "logician"]
+          }
+        ],
+        "unresolved_disagreements": []
+      },
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 5,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:01:05Z",
+      "usage": {"prompt_tokens": 5200, "completion_tokens": 460, "total_tokens": 5660, "cost_usd": 0.0631}
+    },
+    {
+      "id": "msg-011",
+      "speaker": "coordinator",
+      "type": "synthesis",
+      "content": {
+        "integrated_answer": "Yes, the average treatment effect of the discharge protocol can be estimated from the observational dataset using inverse-probability weighting (IPW) with the propensity score augmented by attending-physician and shift fixed effects and seasonal blocking. Robustness to unobserved confounding MUST be reported as a Rosenbaum Γ-bound (or equivalently an E-value), and the Γ-range — not the point estimate — should be the headline of the report. Without the Γ-range, readers will anchor on the point estimate and over-interpret the result.",
+        "resolved_disagreements": [
+          {
+            "topic": "Whether the dataset is observational",
+            "resolution": "Confirmed observational.",
+            "agents_involved": ["logician", "researcher"]
+          },
+          {
+            "topic": "Sufficiency of propensity matching under unobserved confounding",
+            "resolution": "Settled: matching alone is insufficient; matching + named FE + seasonal blocking + Γ-bound + headline Γ-range is sufficient and honest.",
+            "agents_involved": ["researcher", "critic", "logician"]
+          }
+        ],
+        "unresolved_disagreements": [],
+        "confidence": 0.84,
+        "open_questions": [
+          "External validity to hospitals with different attending-physician structures was not analyzed — future work."
+        ]
+      },
+      "parent_id": null,
+      "round": 2,
+      "turn_index": 6,
+      "branch_depth": 0,
+      "timestamp": "2026-05-25T10:01:14Z",
+      "usage": {"prompt_tokens": 6100, "completion_tokens": 380, "total_tokens": 6480, "cost_usd": 0.0728}
+    }
+  ],
+  "outcome": {
+    "kind": "synthesis",
+    "synthesis_message_id": "msg-011"
+  },
+  "cumulative_usage": {
+    "prompt_tokens": 42250,
+    "completion_tokens": 3430,
+    "total_tokens": 45680,
+    "cost_usd": 0.5128
+  },
+  "cumulative_unresolved": [],
+  "transcript_digest": "f26b6aad4de1860893eab0a177330c9fb564b18f7011598ea968da3d306e7270",
+  "started_at": "2026-05-25T10:00:00Z",
+  "ended_at": "2026-05-25T10:01:15Z"
+}

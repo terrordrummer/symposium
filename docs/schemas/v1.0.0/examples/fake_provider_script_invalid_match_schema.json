@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Negative: match.expected_output_schema = 'null' is outside the closed enum {turn_structured_output, verdict, synthesis_content}.",
+  "entries": [
+    {
+      "match": {
+        "agent_id": "agent_a",
+        "expected_output_schema": "null"
+      },
+      "result": {
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "[FakeProvider scripted: agent_a, round=1, turn_index=1]"
+          }
+        ],
+        "tool_events": [],
+        "usage": {
+          "prompt_tokens": 500,
+          "completion_tokens": 120,
+          "total_tokens": 620,
+          "cost_usd": 0.005
+        },
+        "finish_reason": "stop",
+        "structured_output": {
+          "text": "The smallest illustrative session has one panel agent plus the coordinator. The agent offers a single substantive claim; the coordinator records a verdict; synthesis integrates the claim into a final answer.",
+          "direct_requests": []
+        },
+        "raw": {
+          "fake_script_step": 0
+        },
+        "error": null
+      }
+    }
+  ]
+}

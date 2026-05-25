@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://symposium.dev/schemas/v1.0.0/verdict.schema.json",
+  "title": "Verdict",
+  "description": "Machine-readable object emitted by the `coordinator_agent` at the end of every `coordination_turn` (ADR-002, ADR-005, §2.5). Runtime handling of each `next_action` value is specified in §4.4 — not in this schema.",
+  "type": "object",
+  "required": [
+    "next_action",
+    "rationale",
+    "confidence",
+    "focus",
+    "next_agents",
+    "resolved_disagreements",
+    "unresolved_disagreements"
+  ],
+  "properties": {
+    "next_action": {
+      "description": "Coordinator semantic intent. CLOSED enum of exactly four values (ADR-002, §2.5).",
+      "enum": [
+        "continue",
+        "finalize",
+        "request_user_input",
+        "request_external_research"
+      ]
+    },
+    "rationale": {
+      "description": "Natural-language justification for the chosen `next_action`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "confidence": {
+      "description": "Coordinator's confidence in the round's deliberation, 0.0 to 1.0 inclusive (Pass 1 row #59d).",
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "focus": {
+      "description": "Brief directive for the next round (semantic hint). Runtime treatment in §4.4.",
+      "type": "string",
+      "minLength": 1
+    },
+    "next_agents": {
+      "description": "Coordinator's advisory agent preference for the next round. Runtime treatment in §4.2.",
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "resolved_disagreements": {
+      "description": "Disagreements the Coordinator considers settled in this round, each with rationale. Carried forward for inclusion in synthesis (M5).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["topic", "resolution"],
+        "properties": {
+          "topic": {"type": "string", "minLength": 1, "description": "Short label for the disagreement."},
+          "resolution": {"type": "string", "minLength": 1, "description": "How the panel settled it (citation, fact, vote, etc.)."},
+          "agents_involved": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "description": "Optional list of agent ids that held the original positions."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "unresolved_disagreements": {
+      "description": "Disagreements the panel did not reconcile this round. Carried forward into synthesis or termination_artifact (M5).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["topic", "positions"],
+        "properties": {
+          "topic": {"type": "string", "minLength": 1, "description": "Short label for the disagreement."},
+          "positions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["agent", "claim"],
+              "properties": {
+                "agent": {"type": "string", "minLength": 1},
+                "claim": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false
+            }
+          },
+          "blocker": {"type": "boolean", "description": "True if this disagreement is a blocker for `finalize`."}
+        },
+        "additionalProperties": false
+      }
+    },
+    "user_input_request": {
+      "description": "Structured payload describing the information needed from the originator. Present only when `next_action = request_user_input` (§4.4). Required fields are intentionally minimal in MVP; richer sub-schemas are deferred to v1.",
+      "type": "object",
+      "required": ["question"],
+      "properties": {
+        "question": {"type": "string", "minLength": 1, "description": "The question for the originator."},
+        "context": {"type": "string", "description": "Optional context the originator needs to answer."},
+        "blocking": {"type": "boolean", "description": "True if the deliberation cannot proceed without this input. Runtime treatment in §4.4."}
+      },
+      "additionalProperties": false
+    },
+    "external_research_request": {
+      "description": "Structured payload describing the external research action requested. Present only when `next_action = request_external_research` (§4.4). Sub-schemas for specific research types (web, retrieval, tool-augmented agent) are deferred to v1.",
+      "type": "object",
+      "required": ["query"],
+      "properties": {
+        "query": {"type": "string", "minLength": 1, "description": "What needs to be researched."},
+        "rationale": {"type": "string", "description": "Why the research is needed (separate from the verdict-level `rationale` for completeness)."},
+        "suggested_sources": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "Hints about where to look (e.g. `web_search`, `arxiv`, `internal_docs`)."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"next_action": {"const": "request_user_input"}}, "required": ["next_action"]},
+      "then": {
+        "required": ["user_input_request"],
+        "not": {"required": ["external_research_request"]}
+      }
+    },
+    {
+      "if": {"properties": {"next_action": {"const": "request_external_research"}}, "required": ["next_action"]},
+      "then": {
+        "required": ["external_research_request"],
+        "not": {"required": ["user_input_request"]}
+      }
+    },
+    {
+      "if": {"properties": {"next_action": {"enum": ["continue", "finalize"]}}, "required": ["next_action"]},
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["user_input_request"]},
+            {"required": ["external_research_request"]}
+          ]
+        }
+      }
+    }
+  ]
+}
