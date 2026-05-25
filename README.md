@@ -35,10 +35,11 @@ Two things ship together in this repo:
 
 1. **`docs/specification.md`** — the normative protocol. Implementable
    in any language. The spec is what conformance means.
-2. **`symposium/`** — the reference Python runtime. Walking-skeleton
-   scope today: full scheduler, persistence, replay, and a deterministic
-   `FakeProvider` adapter. Real provider adapters (OpenAI-shaped,
-   Anthropic-shaped) land in a follow-up milestone.
+2. **`symposium/`** — the reference Python runtime. Today: full
+   scheduler, persistence, replay, the deterministic `FakeProvider`
+   adapter, and an OpenAI-shaped HTTP adapter (real OpenAI plus
+   self-hosted OpenAI-compatible endpoints). The Anthropic-shaped
+   adapter lands in the next milestone.
 
 ---
 
@@ -70,18 +71,22 @@ Full discussion in §10 *Competitive Positioning* of the spec.
 
 ## Quick start
 
-The reference runtime ships with a deterministic `FakeProvider`. You
-can drive a complete two-round deliberation against scripted agent
-responses end-to-end — no API keys, no network — and inspect the
-persisted, byte-identical artifact:
+The reference runtime ships two adapters out of the box: the
+deterministic `FakeProvider` (for tests and reproducible demos) and
+an OpenAI-shaped HTTP adapter (for real-model sessions against
+`api.openai.com` or any OpenAI-Chat-Completions-compatible endpoint).
+Either flow produces a persisted, byte-identically replayable artifact.
 
 ```bash
 # Install (editable, while the package is pre-PyPI)
 git clone https://github.com/terrordrummer/symposium
 cd symposium
 pip install -e .
+```
 
-# Run a session
+### Fake-driven session (no API key, no network)
+
+```bash
 symposium run \
   --config examples/configs/walking-skeleton.yaml \
   --script examples/scripts/walking-skeleton.json \
@@ -95,15 +100,39 @@ symposium replay runs/demo-walking-skeleton-001
 symposium validate runs/demo-walking-skeleton-001/artifact.json
 ```
 
-Or use it as a library:
+### OpenAI-driven session
+
+```bash
+export OPENAI_API_KEY=sk-...
+# Optional: point at a self-hosted OpenAI-compatible endpoint
+# export OPENAI_BASE_URL=https://my-llm-proxy.internal/v1
+
+symposium run \
+  --config examples/configs/openai.yaml \
+  --output runs/ \
+  examples/problem.md
+```
+
+The CLI resolves each agent's `provider` string through the adapter
+registry (§6.11). Built-in registrations: `openai` (the HTTP adapter
+above) and — when `--script` is given — `fake`. Plug your own adapter
+in by registering a factory before the run.
+
+### Library use
 
 ```python
 from symposium import Config, FakeProviderScript
-from symposium.providers import FakeProvider
+from symposium.providers import FakeProvider, default_registry
 from symposium.scheduler import run_session
 
+# Fake-driven: pass an explicit per-agent map
 artifact = run_session(config, {"default": FakeProvider(script=script)},
                        runs_root="runs/")
+
+# OpenAI-driven: build providers from the registry
+providers = default_registry().build_session_providers(config)
+artifact = run_session(config, providers, runs_root="runs/")
+
 print(artifact.transcript_digest)        # 64-hex JCS-SHA-256 digest
 print(artifact.outcome.kind)             # "synthesis" or "termination"
 ```
@@ -121,7 +150,7 @@ print(artifact.outcome.kind)             # "synthesis" or "termination"
 │       └── examples/             # 28 positive + 36 negative fixtures + validators
 ├── symposium/                    # Reference Python runtime
 │   ├── models.py                 # Pydantic models mirroring the JSON Schemas
-│   ├── providers/                # ProviderAdapter contract + FakeProvider
+│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI adapters
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest
 │   ├── replay/                   # transcript_replay (§7.5)
