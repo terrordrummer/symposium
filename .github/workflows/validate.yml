@@ -30,3 +30,22 @@ jobs:
       - name: Run negative validator (36 cases)
         working-directory: docs/schemas/v1.0.0/examples
         run: python3 validate_negative.py
+
+  python-tests:
+    name: python reference impl (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + test extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run pytest
+        run: pytest -q

@@ -1,0 +1,69 @@
+# Walking-skeleton session config. Drives the FakeProvider sample
+# (`examples/scripts/walking-skeleton.json`) through a single 2-round
+# deliberation that ends in `next_action = finalize`.
+#
+# Persona refs are built-in IDs resolved at load time by
+# `symposium.personas.persona_by_id`. To use a fully inline persona,
+# replace the string with an embedded Persona object matching
+# `docs/schemas/v1.0.0/persona.schema.json`.
+
+schema_version: "1.0.0"
+session_id: "demo-walking-skeleton-001"
+originator: "user"
+problem_statement: |
+  Should we adopt a structured deliberation protocol for AI agent
+  collaboration, or continue with ad-hoc group-chat orchestration?
+
+selector:
+  strategy: "fixed"
+  default_deliberation_panel:
+    - logician
+    - visionary
+    - researcher
+    - critic
+    - engineer
+  coordinator_agent: "coordinator"
+
+agents:
+  - id: logician
+    persona_ref: logician
+    provider: fake
+    model: fake-deterministic
+  - id: visionary
+    persona_ref: visionary
+    provider: fake
+    model: fake-deterministic
+  - id: researcher
+    persona_ref: researcher
+    provider: fake
+    model: fake-deterministic
+  - id: critic
+    persona_ref: critic
+    provider: fake
+    model: fake-deterministic
+  - id: engineer
+    persona_ref: engineer
+    provider: fake
+    model: fake-deterministic
+
+coordinator:
+  id: coordinator
+  persona_ref: coordinator
+  provider: fake
+  model: fake-deterministic
+
+budget:
+  max_total_tokens: 100000
+  max_total_cost_usd: 5.0
+  max_rounds: 4
+  max_wallclock_seconds: 60
+
+runtime:
+  max_branch_depth: 1
+  max_deferred_queue_length: 8
+  max_deferred_drains_per_round: 1
+  on_agent_failure: "terminate"
+  per_agent_retry_budget: 2
+  on_budget_exceeded: "stop"
+  observability_level: "mvp"
+  max_tool_iterations: 8

@@ -11,7 +11,8 @@
 <p align="center">
   <a href="docs/specification.md"><img alt="Spec" src="https://img.shields.io/badge/spec-1.0-1a365d?style=flat-square"></a>
   <a href="docs/schemas/v1.0.0/"><img alt="Schemas" src="https://img.shields.io/badge/JSON%20Schema-v1.0.0-d4a017?style=flat-square"></a>
-  <a href="https://github.com/terrordrummer/symposium/actions/workflows/validate.yml"><img alt="Validators" src="https://img.shields.io/github/actions/workflow/status/terrordrummer/symposium/validate.yml?branch=main&label=validators&style=flat-square"></a>
+  <a href="symposium/"><img alt="Reference impl" src="https://img.shields.io/badge/reference%20impl-Python%203.11%2B-3776ab?style=flat-square"></a>
+  <a href="https://github.com/terrordrummer/symposium/actions/workflows/validate.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/terrordrummer/symposium/validate.yml?branch=main&label=ci&style=flat-square"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-333333?style=flat-square"></a>
 </p>
 
@@ -19,9 +20,9 @@
 
 ## What is this?
 
-Symposium is a **specification**, not a library. It defines how a runtime
-should orchestrate a small panel of LLM-backed agents through a
-structured, turn-based deliberation that produces a single, replayable,
+Symposium is a **protocol specification** + a **reference Python
+runtime** that orchestrates a small panel of LLM-backed agents through
+a structured, turn-based deliberation, producing a single, replayable,
 schema-validated artifact.
 
 It is **not** a generic agent framework. It enforces exactly one
@@ -30,7 +31,14 @@ round, one structurally-separated coordinator, bounded forks — and
 trades topology flexibility for **testable scheduler invariants** and
 **byte-identical replay** of any past session.
 
-Read the specification: **[`docs/specification.md`](docs/specification.md)**.
+Two things ship together in this repo:
+
+1. **`docs/specification.md`** — the normative protocol. Implementable
+   in any language. The spec is what conformance means.
+2. **`symposium/`** — the reference Python runtime. Walking-skeleton
+   scope today: full scheduler, persistence, replay, and a deterministic
+   `FakeProvider` adapter. Real provider adapters (OpenAI-shaped,
+   Anthropic-shaped) land in a follow-up milestone.
 
 ---
 
@@ -60,6 +68,48 @@ Full discussion in §10 *Competitive Positioning* of the spec.
 
 ---
 
+## Quick start
+
+The reference runtime ships with a deterministic `FakeProvider`. You
+can drive a complete two-round deliberation against scripted agent
+responses end-to-end — no API keys, no network — and inspect the
+persisted, byte-identical artifact:
+
+```bash
+# Install (editable, while the package is pre-PyPI)
+git clone https://github.com/terrordrummer/symposium
+cd symposium
+pip install -e .
+
+# Run a session
+symposium run \
+  --config examples/configs/walking-skeleton.yaml \
+  --script examples/scripts/walking-skeleton.json \
+  --output runs/ \
+  examples/problem.md
+
+# Replay (byte-identity check on the stored canonical_transcript)
+symposium replay runs/demo-walking-skeleton-001
+
+# Validate the artifact against the v1.0.0 JSON Schemas
+symposium validate runs/demo-walking-skeleton-001/artifact.json
+```
+
+Or use it as a library:
+
+```python
+from symposium import Config, FakeProviderScript
+from symposium.providers import FakeProvider
+from symposium.scheduler import run_session
+
+artifact = run_session(config, {"default": FakeProvider(script=script)},
+                       runs_root="runs/")
+print(artifact.transcript_digest)        # 64-hex JCS-SHA-256 digest
+print(artifact.outcome.kind)             # "synthesis" or "termination"
+```
+
+---
+
 ## What's in this repo
 
 ```
@@ -69,6 +119,19 @@ Full discussion in §10 *Competitive Positioning* of the spec.
 │   ├── repository-strategy.md    # Reference-impl conventions (non-normative)
 │   └── schemas/v1.0.0/           # 16 JSON Schemas (Draft 2020-12)
 │       └── examples/             # 28 positive + 36 negative fixtures + validators
+├── symposium/                    # Reference Python runtime
+│   ├── models.py                 # Pydantic models mirroring the JSON Schemas
+│   ├── providers/                # ProviderAdapter contract + FakeProvider
+│   ├── scheduler/                # §4.11 pseudocode → executable loop
+│   ├── storage/                  # Run directory layout + JCS digest
+│   ├── replay/                   # transcript_replay (§7.5)
+│   ├── personas/                 # MVP default panel (R3)
+│   └── cli/                      # `symposium` command
+├── examples/                     # Walking-skeleton config + script
+├── tests/                        # pytest suite (FakeProvider determinism,
+│                                 #   scheduler invariants, e2e schema
+│                                 #   validation, replay byte-identity)
+├── pyproject.toml
 ├── .github/workflows/validate.yml
 ├── LICENSE                       # Apache 2.0
 └── README.md
@@ -80,17 +143,16 @@ every MUST / MUST NOT there and validates against the schemas. Sections
 §10–§13 are positioning, integration, roadmap, and vision (non-binding).
 §14 is a thin pointer to the non-normative companion.
 
-**What's not in this repo**: there is no reference implementation in
-this repository yet. The spec is the deliverable; runtimes can be
-written in any language. The repo-strategy companion sketches a
-Python-flavoured layout for the eventual reference implementation
-(`pip install symposium`).
+**What's reference, not normative**: everything under `symposium/`,
+`examples/`, and `tests/`. The Python package is one valid implementation
+of the protocol; a different runtime in a different language is equally
+valid as long as it conforms to the spec.
 
 ---
 
 ## Conformance check
 
-The schemas ship with two validators. Any contributor or implementor
+Two validators ship with the schemas. Any contributor or implementor
 can re-run them locally:
 
 ```bash
@@ -98,6 +160,14 @@ cd docs/schemas/v1.0.0/examples
 pip install "jsonschema==4.26.0" "referencing>=0.35" "rfc8785>=0.1.4"
 python3 validate.py            # 28/28
 python3 validate_negative.py   # 36/36
+```
+
+The reference runtime's own test suite (pytest) cross-checks the
+artifact it emits against those same schemas:
+
+```bash
+pip install -e ".[test]"
+pytest -q
 ```
 
 CI runs both on every push and every pull request (see badge above).
