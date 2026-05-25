@@ -1,0 +1,32 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  schemas:
+    name: schemas (positive + negative)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "jsonschema==4.26.0" "referencing>=0.35" "rfc8785>=0.1.4"
+
+      - name: Run positive validator (28 cases)
+        working-directory: docs/schemas/v1.0.0/examples
+        run: python3 validate.py
+
+      - name: Run negative validator (36 cases)
+        working-directory: docs/schemas/v1.0.0/examples
+        run: python3 validate_negative.py
