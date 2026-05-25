@@ -1,0 +1,84 @@
+# Anthropic-backed session config. Drives a real-API session against
+# `https://api.anthropic.com/v1/messages` via the built-in
+# AnthropicProvider adapter (§6.13).
+#
+# Prerequisites:
+#   - Export ANTHROPIC_API_KEY before invoking `symposium run`. The
+#     adapter fails fast at construction time (§6.8) if the variable
+#     is missing.
+#   - Optional: export ANTHROPIC_BASE_URL to point at a self-hosted
+#     Anthropic-compatible endpoint.
+#
+# Run:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   symposium run --config examples/configs/anthropic.yaml examples/problem.md
+#
+# Persona refs are built-in IDs resolved at load time by
+# `symposium.personas.persona_by_id`. Vendor strings (`anthropic`,
+# `claude-sonnet-4-5`, etc.) live in this config — they MUST NOT
+# appear in the spec body or schema fields (rule N4).
+#
+# The `anthropic-version` header is pinned inside the adapter module
+# (DEFAULT_ANTHROPIC_VERSION). Bumping it is a code change, not a
+# config knob.
+
+schema_version: "1.0.0"
+session_id: "demo-anthropic-001"
+originator: "user"
+problem_statement: |
+  Should we adopt a structured deliberation protocol for AI agent
+  collaboration, or continue with ad-hoc group-chat orchestration?
+
+selector:
+  strategy: "fixed"
+  default_deliberation_panel:
+    - logician
+    - visionary
+    - researcher
+    - critic
+    - engineer
+  coordinator_agent: "coordinator"
+
+agents:
+  - id: logician
+    persona_ref: logician
+    provider: anthropic
+    model: claude-sonnet-4-5
+  - id: visionary
+    persona_ref: visionary
+    provider: anthropic
+    model: claude-sonnet-4-5
+  - id: researcher
+    persona_ref: researcher
+    provider: anthropic
+    model: claude-sonnet-4-5
+  - id: critic
+    persona_ref: critic
+    provider: anthropic
+    model: claude-sonnet-4-5
+  - id: engineer
+    persona_ref: engineer
+    provider: anthropic
+    model: claude-sonnet-4-5
+
+coordinator:
+  id: coordinator
+  persona_ref: coordinator
+  provider: anthropic
+  model: claude-sonnet-4-5
+
+budget:
+  max_total_tokens: 200000
+  max_total_cost_usd: 2.50
+  max_rounds: 4
+  max_wallclock_seconds: 300
+
+runtime:
+  max_branch_depth: 1
+  max_deferred_queue_length: 8
+  max_deferred_drains_per_round: 1
+  on_agent_failure: "terminate"
+  per_agent_retry_budget: 2
+  on_budget_exceeded: "stop"
+  observability_level: "mvp"
+  max_tool_iterations: 8
