@@ -60,6 +60,11 @@ from symposium.models import (
     SelectorBudget,
     SelectorConfig,
 )
+from symposium.integrations.persona_factory import (
+    PersonaGenerationError,
+    generate_persona as _generate_persona,
+    make_cli_persona_caller,
+)
 from symposium.observability import compute_metrics
 from symposium.personas import COORDINATOR, DEFAULT_PANEL, persona_by_id
 from symposium.providers import (
@@ -327,6 +332,198 @@ def list_personas() -> List[Dict[str, str]]:
         ]
     except Exception as exc:  # noqa: BLE001 — keep the transport alive
         return [_error(exc)]
+
+
+@mcp.tool()
+def generate_persona(
+    need: str, *, persona_class: str = "domain", prefer_cli: str = "claude"
+) -> Dict[str, Any]:
+    """Design a new expert `Persona` for a capability gap and return it.
+
+    Asks an installed terminal CLI (`claude` preferred, `codex` fallback)
+    to design ONE persona whose output is constrained to the `Persona`
+    JSON Schema, then validates it. Returns
+    ``{"persona": <persona dict>}`` or ``{"error": ...}``. The returned
+    persona can be used as a `panel` member or fed to `deliberate_adaptive`.
+    """
+    try:
+        caller = make_cli_persona_caller(prefer=prefer_cli)
+        persona = _generate_persona(need, caller=caller, persona_class=persona_class)
+        return {"persona": persona.model_dump(mode="json", exclude_none=True)}
+    except Exception as exc:  # noqa: BLE001 — structured result, never crash
+        return _error(exc)
+
+
+@mcp.tool()
+def deliberate_adaptive(
+    problem: str,
+    *,
+    panel: Optional[List[str]] = None,
+    coordinator: str = "coordinator",
+    provider: str = "cli-auto",
+    experts: Optional[List[str]] = None,
+    max_expansions: int = 2,
+    max_rounds: int = 4,
+    max_total_tokens: int = 100000,
+    max_total_cost_usd: float = 5.0,
+    max_wallclock_seconds: int = 300,
+    output_dir: str = "runs",
+) -> Dict[str, Any]:
+    """Deliberate with dynamic agent generation — early-start AND runtime.
+
+    Two ways a *new* expert agent joins the panel, both host-orchestrated
+    over the frozen runtime (no spec / schema changes):
+
+      * **early-start** — for each capability in `experts` (free-text
+        needs), a domain `Persona` is generated and added to the panel
+        *before* the first session.
+      * **runtime** — if a session terminates asking for help
+        (`user_input_required` / `external_research_required`), a persona
+        is generated for that need and the deliberation **continues** in a
+        fresh session with the augmented panel, up to `max_expansions`.
+
+    Returns ``{final, sessions, generated_agents, expansions, panel_final}``
+    where `final` is the last session's summary (same shape as
+    `deliberate`), `generated_agents` lists who was created and in which
+    phase, and `panel_final` is the panel after all expansions. On a setup
+    failure returns ``{"error": ...}``.
+    """
+    try:
+        caller = make_cli_persona_caller()
+        return _run_adaptive(
+            problem=problem, panel=panel, coordinator=coordinator, provider=provider,
+            experts=experts, max_expansions=max_expansions, max_rounds=max_rounds,
+            max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
+            max_wallclock_seconds=max_wallclock_seconds, output_dir=output_dir,
+            persona_caller=caller,
+        )
+    except Exception as exc:  # noqa: BLE001 — structured result, never crash
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive orchestration core (dynamic agent generation; host-side, frozen
+# runtime). `persona_caller` and `run_one` are injectable so tests never
+# spawn a CLI or a real session.
+# ---------------------------------------------------------------------------
+
+
+def _run_adaptive(
+    *,
+    problem: str,
+    panel: Optional[List[str]],
+    coordinator: str,
+    provider: str,
+    experts: Optional[List[str]],
+    max_expansions: int,
+    max_rounds: int,
+    max_total_tokens: int,
+    max_total_cost_usd: float,
+    max_wallclock_seconds: int,
+    output_dir: str,
+    persona_caller,
+    run_one=None,
+) -> Dict[str, Any]:
+    """Core adaptive loop. `run_one(config) -> (artifact, result_dict)`."""
+    runner = run_one or (lambda cfg: _default_adaptive_run_one(cfg, provider, output_dir))
+    panel_ids = list(panel) if panel else list(_DEFAULT_PANEL_IDS)
+    add_provider = "claude-cli" if provider == "cli-auto" else provider
+    add_model = "sonnet" if provider in ("cli-auto", "claude-cli") else _default_model(provider)
+
+    config = _build_config(
+        problem=problem, session_id="adaptive-seed", panel_ids=panel_ids,
+        coordinator_id=coordinator,
+        provider="claude-cli" if provider == "cli-auto" else provider,
+        model="sonnet" if provider == "cli-auto" else _default_model(provider),
+        selector_strategy="fixed", max_rounds=max_rounds,
+        max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
+        max_wallclock_seconds=max_wallclock_seconds,
+    )
+    existing = {a.id for a in config.agents} | {config.coordinator.id}
+    generated: List[Dict[str, Any]] = []
+
+    # --- early-start expansion ------------------------------------------------
+    for need in (experts or []):
+        persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+        config = _add_persona(config, persona, provider=add_provider, model=add_model)
+        existing.add(persona.id)
+        generated.append({"id": persona.id, "need": need, "phase": "early_start"})
+
+    # --- run + runtime expansion ---------------------------------------------
+    sessions: List[Dict[str, Any]] = []
+    expansions = 0
+    while True:
+        cfg = config.model_copy(update={"session_id": f"mcp-adaptive-{uuid.uuid4().hex}"})
+        artifact, result = runner(cfg)
+        sessions.append(result)
+        if artifact.outcome.kind == "synthesis":
+            break
+        need = _pending_need(artifact)
+        if need is None or expansions >= max_expansions:
+            break
+        persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+        config = _add_persona(config, persona, provider=add_provider, model=add_model)
+        existing.add(persona.id)
+        generated.append({"id": persona.id, "need": need, "phase": "runtime"})
+        config = _augment_problem(config, prior=result, need=need)
+        expansions += 1
+
+    return {
+        "final": sessions[-1],
+        "sessions": sessions,
+        "generated_agents": generated,
+        "expansions": expansions,
+        "panel_final": [a.id for a in config.agents],
+    }
+
+
+def _add_persona(config: Config, persona: Persona, *, provider: str, model: str) -> Config:
+    """Return a copy of `config` with `persona` added as a panel agent."""
+    agent = AgentConfig(id=persona.id, persona_ref=persona, provider=provider, model=model)
+    agents = list(config.agents) + [agent]
+    panel = list(config.selector.default_deliberation_panel) + [persona.id]
+    selector = config.selector.model_copy(update={"default_deliberation_panel": panel})
+    return config.model_copy(update={"agents": agents, "selector": selector})
+
+
+def _pending_need(artifact: Artifact) -> Optional[str]:
+    """The 'we need help with X' text from an expansion-triggering termination."""
+    outcome = artifact.outcome
+    if outcome.kind != "termination":
+        return None
+    ta = outcome.termination_artifact
+    if ta.reason == "user_input_required" and ta.pending_user_input_request is not None:
+        return ta.pending_user_input_request.question
+    if ta.reason == "external_research_required" and ta.pending_external_research_request is not None:
+        return ta.pending_external_research_request.query
+    return None
+
+
+def _augment_problem(config: Config, *, prior: Dict[str, Any], need: str) -> Config:
+    """Carry the prior session's outcome forward so the continuation has context."""
+    prior_outcome = prior.get("synthesis_answer") or prior.get("termination_reason") or "(none)"
+    addition = (
+        f"\n\n[CONTINUATION] A new expert has joined the panel to address: {need}. "
+        f"Prior deliberation outcome: {prior_outcome} "
+        "Continue the deliberation, integrating the new expertise."
+    )
+    return config.model_copy(update={"problem_statement": config.problem_statement + addition})
+
+
+def _default_adaptive_run_one(config: Config, provider: str, output_dir: str):
+    """Build providers for `config`, run one session, return (artifact, result)."""
+    if provider == "cli-auto":
+        from symposium.integrations.cli_routing import route_cli_providers
+
+        rc, providers = route_cli_providers(config)
+    else:
+        rc = config
+        providers = default_registry().build_session_providers(config)
+    artifact = run_session(rc, providers, runs_root=output_dir)
+    result = _build_result(
+        artifact, Path(output_dir) / config.session_id, [a.id for a in rc.agents]
+    )
+    return artifact, result
 
 
 # ---------------------------------------------------------------------------

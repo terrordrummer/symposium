@@ -315,7 +315,7 @@ it for fake-driven, deterministic runs:
 }
 ```
 
-The server exposes four tools:
+The server exposes six tools:
 
 - **`deliberate(problem, …)`** — build a `Config` from arguments (panel
   persona ids resolved into inline personas exactly as the CLI does), run a
@@ -326,6 +326,18 @@ The server exposes four tools:
   produces it** (every agent turn, each coordinator verdict, the final
   synthesis) via MCP progress + log notifications, so you can follow the
   discussion as it evolves instead of waiting for the whole session.
+- **`deliberate_adaptive(problem, *, experts=None, max_expansions=2, …)`** —
+  deliberate with **dynamic agent generation**. *Early-start*: each
+  capability in `experts` (free-text needs) becomes a generated domain
+  persona added to the panel before the first session. *Runtime*: if a
+  session terminates asking for help (`user_input_required` /
+  `external_research_required`), a persona is generated for that need and
+  the deliberation continues in a fresh session with the augmented panel
+  (up to `max_expansions`). Returns `{final, sessions, generated_agents,
+  expansions, panel_final}`. Host-orchestrated over the frozen runtime.
+- **`generate_persona(need, …)`** — design one new expert `Persona` for a
+  capability gap (constrained to the `Persona` JSON Schema, validated) and
+  return it, to use as a `panel` member.
 - **`get_run_summary(run_dir)`** — load a persisted run, recompute the §7.9
   metrics, verify the §7.5 transcript replay, and return a compact summary.
 - **`list_personas()`** — the six built-in personas (R3 default panel +
