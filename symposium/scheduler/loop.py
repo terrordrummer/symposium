@@ -17,10 +17,47 @@ Walking-skeleton scope:
 
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+# Exponential backoff bounds for retriable provider failures (§4.9). The
+# initial sleep is small enough to not slow down tests against the
+# FakeProvider; the cap is small enough to not blow past a session
+# wallclock cap. Jitter is multiplicative ±25%.
+_BACKOFF_BASE_SECONDS = 0.25
+_BACKOFF_MAX_SECONDS = 8.0
+_BACKOFF_JITTER = 0.25
+
+
+def _backoff_delay(
+    attempt_idx: int,
+    retry_after: Optional[float] = None,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """Compute the sleep before attempt `attempt_idx` (1-indexed retry count).
+
+    Honors `retry_after` from the upstream when present (e.g. rate_limit /
+    quota_exhausted), bounded by `_BACKOFF_MAX_SECONDS` so a hostile server
+    cannot pin a deliberation past its caps. Otherwise uses exponential
+    backoff base*2**(attempt-1), clamped, with multiplicative jitter to
+    avoid synchronized thundering-herd retries across agents.
+
+    `rng` is a session-bound `random.Random` instance so that, with the
+    same seed (derived from session_id), replays produce the same jitter
+    sequence — keeping backoff sleeps out of the §7.6 replay-divergence
+    surface (otherwise an unrelated retry could push wallclock past a cap
+    and flip a termination decision between runs).
+    """
+    if retry_after is not None and retry_after >= 0:
+        return min(float(retry_after), _BACKOFF_MAX_SECONDS)
+    raw = _BACKOFF_BASE_SECONDS * (2 ** (max(attempt_idx, 1) - 1))
+    bounded = min(raw, _BACKOFF_MAX_SECONDS)
+    source = rng if rng is not None else random
+    jitter = 1.0 + source.uniform(-_BACKOFF_JITTER, _BACKOFF_JITTER)
+    return max(bounded * jitter, 0.0)
 
 from symposium.models import (
     AgentConfig,
@@ -104,6 +141,19 @@ class Session:
     last_verdict: Optional[Verdict] = None
     started_at: str = field(default_factory=now_utc_iso)
     started_monotonic: float = field(default_factory=time.monotonic)
+    # Session-bound RNG used for retry-backoff jitter. Seeded deterministically
+    # from a *replay-stable* identity so the jitter sequence in the original
+    # run matches the replay (§7.6 replay-divergence guard). The default
+    # derives from `session_id`, but execution_replay overrides via
+    # `rng_seed=` to keep the seed identical across the original and the
+    # `<session_id>-replay` reproduction.
+    rng_seed: Optional[str] = None
+    rng: random.Random = field(default=None)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.rng is None:
+            seed_token = self.rng_seed or self.config.session_id
+            self.rng = random.Random(f"symposium:backoff:{seed_token}")
 
     # ------------------------------------------------------------------
     # Derived helpers
@@ -252,9 +302,13 @@ def build_provider_request(
         provider=ac.provider,
         model=ac.model,
         agent_id=agent_id,
+        # §6.2: forward the optional reasoning_effort hint from AgentConfig
+        # so adapters that consume it (OpenAI o-series, Anthropic extended-
+        # thinking) actually see the operator's intent.
+        reasoning_effort=ac.reasoning_effort,
         messages=messages,
         sampling=None,
-        tools=ac.tools,
+        tools=list(ac.tools) if ac.tools else [],
         expected_output_schema=expected_output_schema,  # type: ignore[arg-type]
     )
 
@@ -282,13 +336,31 @@ def _invoke_with_retry(
     *,
     agent_id: str,
     request: ProviderRequest,
+    sleep=time.sleep,
 ) -> _InvokeResult:
+    """Invoke `agent_id`'s provider with `per_agent_retry_budget` retries.
+
+    Retry semantics:
+      - Non-retriable errors short-circuit to the §4.9 failure-policy path
+        (terminate or panel_contraction) without waiting.
+      - Retriable errors trigger an exponential backoff (with jitter) before
+        the next attempt. If the upstream supplied `error.details.retry_after`
+        (or `retry_after_seconds`), it is honored, capped to keep wallclock
+        bounded.
+
+    NOTE — adapter-internal corrective retry: the openai / anthropic /
+    claude-cli / codex-cli adapters currently perform ONE internal corrective
+    call on `malformed_response` before returning. That extra upstream call
+    does NOT count against `per_agent_retry_budget`. Reconciling this with
+    the spec (runtime-owned corrective retry, budget-counted) is scheduled
+    for the next minor (Codex ↔ Claude review T2 — "Deferred To Next Minor").
+    """
     ac = session.agent_by_id(agent_id)
     budget = ac.retry_budget if ac.retry_budget is not None else session.config.runtime.per_agent_retry_budget
     attempts = 1 + budget
 
     last_err_kind: Optional[str] = None
-    for _ in range(attempts):
+    for attempt_idx in range(attempts):
         provider = _provider_for(session, agent_id)
         # If FakeProvider: stash round/turn_index hints so match assertions work.
         if hasattr(provider, "last_request_round"):
@@ -316,9 +388,15 @@ def _invoke_with_retry(
                     panel_contracted=True,
                     contraction_reason=reason,  # type: ignore[arg-type]
                 )
+            # Retriable failure: backoff before next attempt (unless we're done).
+            if attempt_idx + 1 < attempts:
+                retry_after = _extract_retry_after(result.error.details)
+                sleep(_backoff_delay(attempt_idx + 1, retry_after, rng=session.rng))
         else:
             # structured_output is None without error — treat as malformed
             last_err_kind = "malformed_response"
+            if attempt_idx + 1 < attempts:
+                sleep(_backoff_delay(attempt_idx + 1, rng=session.rng))
 
     # Retries exhausted.
     final_reason = _classify_unrecoverable(last_err_kind or "internal")
@@ -338,6 +416,26 @@ def _classify_unrecoverable(kind: str) -> str:
     return "provider_unrecoverable"
 
 
+def _extract_retry_after(details: Optional[Dict[str, object]]) -> Optional[float]:
+    """Pull a `retry_after_seconds` (or `retry_after`) hint out of error.details.
+
+    Adapters set this when an upstream surface (`Retry-After` header or
+    vendor-specific field) suggests a wait time. The runtime honors it as
+    the floor for the next backoff sleep, capped by `_BACKOFF_MAX_SECONDS`.
+    """
+    if not isinstance(details, dict):
+        return None
+    for key in ("retry_after_seconds", "retry_after"):
+        v = details.get(key)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 # ---------------------------------------------------------------------------
 # §4.11 main loop
 # ---------------------------------------------------------------------------
@@ -349,6 +447,7 @@ def run_session(
     *,
     runs_root: Optional[str] = None,
     selector_providers: Optional[Dict[str, _ProviderAdapter]] = None,
+    rng_seed: Optional[str] = None,
 ) -> Artifact:
     """Run a session to completion. Returns the persisted Artifact.
 
@@ -361,10 +460,16 @@ def run_session(
     than the deliberation — e.g. the CLI's `--selector-script`. `fixed` /
     `rules` make no provider call, so the value is irrelevant for them.
 
+    `rng_seed` is an OPTIONAL replay-stable seed for the retry-backoff
+    jitter RNG (§7.6). Defaults to `config.session_id`; execution_replay
+    overrides with the *original* session id so the replay's backoff
+    sequence matches the original even though the replay run dir uses a
+    `-replay`-suffixed session id.
+
     If `runs_root` is given, the session is persisted under
     `runs_root/<session_id>/`.
     """
-    session = Session(config=config, providers=providers)
+    session = Session(config=config, providers=providers, rng_seed=rng_seed)
 
     writer: Optional[RunWriter] = None
     if runs_root is not None:
@@ -455,7 +560,9 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             return _terminate(session, writer, reason=breach)
 
         # §4.6 deferred queue drain (at round-open, before any primary_turn)
-        _drain_deferred_queue(session, writer)
+        terminating = _drain_deferred_queue(session, writer)
+        if terminating:
+            return _terminate(session, writer, reason=terminating)
 
         # §4.2 step 1–3: panel members in declared order
         for agent_id in list(session.active_panel):
@@ -497,9 +604,12 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                 usage=inv.result.usage,
             )
 
-            # §4.5 fork dispatch over direct_requests
+            # §4.5 classify direct_requests (do NOT dispatch yet — the
+            # primary_turn MUST be appended to the canonical_transcript before
+            # any branch_turn it parents, so the execution order is preserved
+            # and `branch_turn.parent_id` never points forward in the journal.
             schema_failures: List[SchemaFailureRecord] = []
-            dispatched_inline = False
+            inline_request: Optional[DirectRequest] = None
             deferred_for_msg: List[DirectRequest] = []
             for dr in tso.direct_requests or []:
                 if not is_routable_direct_request(
@@ -512,10 +622,8 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                         reason="target not in active_panel, is originator, or is coordinator",
                     ))
                     continue
-                if not dispatched_inline and session.config.runtime.max_branch_depth >= 1:
-                    # in-line dispatch
-                    _dispatch_branch(session, writer, parent_msg=primary_msg, request=dr)
-                    dispatched_inline = True
+                if inline_request is None and session.config.runtime.max_branch_depth >= 1:
+                    inline_request = dr
                 else:
                     deferred_for_msg.append(dr)
 
@@ -532,9 +640,21 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             if dropped:
                 primary_msg.dropped_deferred = dropped
 
+            # APPEND primary_msg BEFORE dispatching any branch — required so
+            # branch_turn.parent_id always refers to a transcript entry that
+            # precedes it (spec §5.4 + §4.5).
             session.transcript.append(primary_msg)
             if writer:
                 writer.append_message(primary_msg)
+
+            # Now dispatch the at-most-one inline branch. Propagate any
+            # termination it bubbles up (on_agent_failure="terminate").
+            if inline_request is not None:
+                terminating = _dispatch_branch(
+                    session, writer, parent_msg=primary_msg, request=inline_request,
+                )
+                if terminating:
+                    return _terminate(session, writer, reason=terminating)
 
         # §4.2 step 4: coordination_turn
         breach = check_hard_caps(session)
@@ -603,7 +723,20 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             )
 
 
-def _dispatch_branch(session: Session, writer: Optional[RunWriter], *, parent_msg: Message, request: DirectRequest) -> None:
+def _dispatch_branch(
+    session: Session,
+    writer: Optional[RunWriter],
+    *,
+    parent_msg: Message,
+    request: DirectRequest,
+) -> Optional[str]:
+    """Dispatch one branch_turn. Returns a termination reason if
+    `on_agent_failure="terminate"` was honored mid-branch; otherwise None.
+
+    Callers MUST check the return value and propagate termination up to the
+    main loop (§4.9 — failure policy is global, not modulated by whether the
+    failing invocation happened to be a branch).
+    """
     target = request.target
     packet = derive_context_packet(
         session,
@@ -620,17 +753,14 @@ def _dispatch_branch(session: Session, writer: Optional[RunWriter], *, parent_ms
     session.turn_index += 1
     inv = _invoke_with_retry(session, agent_id=target, request=req)
     if inv.terminating:
-        # We cannot bubble up termination through _dispatch_branch without
-        # restructuring. Pragmatic walking-skeleton: treat as panel contraction.
-        _append_panel_contraction(session, writer, target, "provider_unrecoverable")
-        if target in session.active_panel:
-            session.active_panel.remove(target)
-        return
+        # §4.9: honor the failure policy — propagate termination instead of
+        # silently demoting the failure to panel_contraction.
+        return inv.terminating
     if inv.panel_contracted:
         _append_panel_contraction(session, writer, target, inv.contraction_reason)
         if target in session.active_panel:
             session.active_panel.remove(target)
-        return
+        return None
     assert inv.result is not None and inv.result.structured_output is not None
     tso = TurnStructuredOutput.model_validate(inv.result.structured_output)
 
@@ -654,9 +784,15 @@ def _dispatch_branch(session: Session, writer: Optional[RunWriter], *, parent_ms
     session.transcript.append(branch_msg)
     if writer:
         writer.append_message(branch_msg)
+    return None
 
 
-def _drain_deferred_queue(session: Session, writer: Optional[RunWriter]) -> None:
+def _drain_deferred_queue(session: Session, writer: Optional[RunWriter]) -> Optional[str]:
+    """Drain queued direct_requests as §4.6 branch_turns at round-open.
+
+    Returns a termination reason if any drained branch hits the failure policy
+    `terminate`; otherwise None. Callers MUST honor the return value.
+    """
     drains = 0
     max_drains = session.config.runtime.max_deferred_drains_per_round
     while session.deferred_queue and drains < max_drains:
@@ -669,8 +805,13 @@ def _drain_deferred_queue(session: Session, writer: Optional[RunWriter]) -> None
             coordinator=session.config.coordinator.id,
         ):
             continue
-        _dispatch_branch(session, writer, parent_msg=parent_msg, request=request)
+        terminating = _dispatch_branch(
+            session, writer, parent_msg=parent_msg, request=request,
+        )
         drains += 1
+        if terminating:
+            return terminating
+    return None
 
 
 def _attempt_finalize(session: Session, writer: Optional[RunWriter]):

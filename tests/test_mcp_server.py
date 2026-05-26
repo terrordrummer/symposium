@@ -276,6 +276,34 @@ def test_deliberate_streaming_forwards_each_turn_to_context(tmp_path, script_pat
     assert ctx.progress == sorted(ctx.progress)  # monotonic
 
 
+def test_put_sentinel_breaks_through_a_full_queue():
+    """The streaming `_DONE` sentinel MUST reach the consumer even if the
+    queue is saturated with un-consumed messages — otherwise the async
+    consumer would block on `events_q.get` forever.
+    """
+    import queue as _q
+
+    from symposium.integrations.mcp_server import _put_sentinel, _STREAM_QUEUE_MAXSIZE
+
+    q = _q.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+    for i in range(_STREAM_QUEUE_MAXSIZE):
+        q.put({"event": "filler", "i": i})
+    assert q.full(), "precondition: queue must be saturated"
+
+    sentinel = {"event": "__done__"}
+    _put_sentinel(q, sentinel)
+
+    # Drain the queue — the sentinel MUST be in there somewhere; the helper
+    # drops the oldest events to make room rather than wedge the producer.
+    seen_sentinel = False
+    while not q.empty():
+        item = q.get_nowait()
+        if item is sentinel:
+            seen_sentinel = True
+            break
+    assert seen_sentinel, "sentinel was dropped — consumer would hang"
+
+
 def test_deliberate_streaming_error_returns_structured_error(tmp_path):
     ctx = _FakeCtx()
     result = asyncio.run(

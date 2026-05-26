@@ -85,8 +85,9 @@ def test_argv_translation_and_system_folded_into_prompt():
     assert argv[:3] == ["codex", "exec", "--json"]
     assert "--output-schema" in argv  # schema passed as a file path
     assert "-m" in argv and argv[argv.index("-m") + 1] == "gpt-5"
-    # codex has no --system-prompt: the system block is folded into the prompt arg
-    prompt = argv[-1]
+    # The prompt is sent via stdin (positional "-") to avoid leaking it via `ps`.
+    assert argv[-1] == "-"
+    prompt = runner.calls[0]["input"]
     assert "[SYSTEM]" in prompt and "You are the visionary." in prompt
     assert "Should we adopt the protocol?" in prompt
 
@@ -115,7 +116,7 @@ def test_corrective_retry_then_success():
     assert result.error is None
     assert result.structured_output == {"text": "fixed"}
     assert len(runner.calls) == 2
-    assert "did not conform" in runner.calls[1]["argv"][-1]
+    assert "did not conform" in runner.calls[1]["input"]
 
 
 def test_schema_invalid_after_retry_returns_malformed():

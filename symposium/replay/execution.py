@@ -341,6 +341,33 @@ def execution_replay(
                     "adapter for it was supplied in the providers map; cannot guarantee "
                     "the same AdapterFactory registration (§6.11)",
                 )
+
+    # Per-agent provider IDENTITY check: when the caller supplies adapters
+    # directly, each adapter's `name` MUST equal the AgentConfig.provider.
+    # Without this guard, an artifact produced by `openai` could be silently
+    # "replayed" against a FakeProvider — a §7.6 pinning hole that defeats
+    # the audit/reproducibility intent of the replay surface.
+    #
+    # Exception: an all-FakeProvider replay against an artifact that was
+    # itself produced under all-fake providers is the canonical golden-test
+    # path and is allowed even when adapter.name="fake" diverges from a
+    # vendor-shaped `provider` string — the adapter is acting as a captured
+    # snapshot of vendor responses, not as the vendor.
+    artifact_all_fake = all(ac.provider == "fake" for ac in agents_all)
+    if providers and not (all_fake and artifact_all_fake):
+        for ac in agents_all:
+            adapter = providers.get(ac.id) or providers.get("default")
+            if adapter is None:
+                continue  # registry-resolution branch (above) covers this
+            adapter_name = getattr(adapter, "name", None)
+            if adapter_name != ac.provider:
+                raise PinningViolation(
+                    "provider",
+                    f"agent {ac.id!r} declares provider={ac.provider!r} but the "
+                    f"supplied adapter reports name={adapter_name!r}; replay would "
+                    "execute against a different provider than the original run "
+                    "(§7.6 condition #3 — provider identity must match)",
+                )
     conditions_checked.append("adapter")
     conditions_checked.append("provider")
 
@@ -456,7 +483,14 @@ def execution_replay(
     id_source = _recorded_id_source(original_artifact)
     with pinned_runtime(id_source=id_source, clock=clock_source):
         fresh_artifact = run_session(
-            fresh_config, dict(providers), runs_root=str(fresh_runs_root)
+            fresh_config,
+            dict(providers),
+            runs_root=str(fresh_runs_root),
+            # §7.6: keep the retry-backoff RNG seeded from the ORIGINAL
+            # session_id, not from the `-replay`-suffixed fresh id. Otherwise
+            # the original and the replay sleep different amounts, which can
+            # flip a wallclock-cap decision and diverge the digest.
+            rng_seed=config.session_id,
         )
     fresh_run_dir = fresh_runs_root / fresh_session_id
 

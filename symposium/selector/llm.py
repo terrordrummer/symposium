@@ -8,9 +8,9 @@ the §3 milestone defaults), documented here at the call site:
   * **Invocation shape.** `SelectorOutput` is NOT a member of the §6.2
     `expected_output_schema` closed enum `{turn_structured_output,
     verdict, synthesis_content, null}`, so the adapter cannot validate it.
-    We invoke with ``expected_output_schema = "null"`` (the spec-reserved
-    free-text path) and the selector parses + validates the model's JSON
-    into a `SelectorOutput` itself.
+    We invoke with ``expected_output_schema = None`` — the spec-reserved
+    free-text path encoded as JSON ``null`` per §6.2 — and the selector
+    parses + validates the model's JSON into a `SelectorOutput` itself.
 
   * **Which agent drives the call.** The MVP `Config` has no dedicated
     selector-agent field, so we reuse the `coordinator` agent's
@@ -113,10 +113,14 @@ def _build_selector_request(config: Config) -> ProviderRequest:
         provider=coord.provider,
         model=coord.model,
         agent_id=coord.id,
+        # Forward the coordinator's reasoning_effort to the selector call too —
+        # the selector hits the same provider/model as the coordinator, so any
+        # operator-set hint should apply here as well.
+        reasoning_effort=coord.reasoning_effort,
         messages=messages,
         sampling=None,
-        tools=None,
-        expected_output_schema="null",  # §6.2 free-text path (see module docstring)
+        tools=[],
+        expected_output_schema=None,  # §6.2 free-text path (JSON null per schema)
     )
 
 
