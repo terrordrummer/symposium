@@ -102,6 +102,7 @@ def default_registry() -> AdapterRegistry:
     r.register("openai", _openai_factory)
     r.register("anthropic", _anthropic_factory)
     r.register("claude-cli", _claude_cli_factory)
+    r.register("codex-cli", _codex_cli_factory)
     return r
 
 
@@ -140,6 +141,14 @@ def _claude_cli_factory(provider_id: str, config: Config) -> ProviderAdapter:
     from symposium.providers.claude_cli import ClaudeCliProvider
 
     return ClaudeCliProvider()
+
+
+def _codex_cli_factory(provider_id: str, config: Config) -> ProviderAdapter:
+    # Late import: keeps the `codex` CLI optional. Needs NO API key — it
+    # reuses the locally-installed CLI's existing auth.
+    from symposium.providers.codex_cli import CodexCliProvider
+
+    return CodexCliProvider()
 
 
 def make_fake_factory(provider: "ProviderAdapter") -> AdapterFactory:

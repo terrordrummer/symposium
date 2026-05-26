@@ -334,9 +334,13 @@ The server exposes four tools:
 A typical `deliberate` call from a Claude client:
 
 ```jsonc
-// default: drives the local `claude` CLI in your terminal — NO API key,
-// it reuses Claude Code's existing login (provider="claude-cli")
+// default: route each persona across the installed terminal CLIs — NO API
+// key (provider="cli-auto"): visionary → codex, the rest → claude, with
+// fallback to whichever CLI is installed
 deliberate(problem="Should we adopt a structured deliberation protocol?")
+
+// force a single terminal CLI for all agents
+deliberate(problem="…", provider="claude-cli")   // or "codex-cli"
 
 // real HTTP API instead (reads ANTHROPIC_API_KEY from the env)
 deliberate(problem="…", provider="anthropic")
@@ -349,14 +353,20 @@ deliberate(
 )
 ```
 
-**No API key needed.** The default `provider="claude-cli"` runs each
-panel turn through the locally-installed `claude` command
-(`claude -p --output-format json --json-schema …`), reusing the CLI's
-OAuth/keychain login. Each turn is a real, billed `claude` invocation, so
-a full panel run costs accordingly; use `provider="fake"` for free,
-deterministic demos. The HTTP adapters (`anthropic`, `openai`) remain
-available when you prefer an API key. The `claude-cli` provider also
-works from the plain CLI: `provider: claude-cli` in a config's agents.
+**No API key needed.** The default `provider="cli-auto"` runs each panel
+turn through a locally-installed terminal CLI, reusing its existing login
+(OAuth/keychain) — no `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`. It routes by
+persona — the lateral/creative **visionary** to `codex-cli`
+(`codex exec --output-schema …`), the technical/systematic personas
+(logician, engineer, researcher, critic, coordinator) to `claude-cli`
+(`claude -p --output-format json --json-schema …`) — and **falls back** to
+whichever CLI is actually installed (only `claude` installed → the whole
+panel runs on claude, and vice-versa). Force one CLI with
+`provider="claude-cli"` / `"codex-cli"`. Each turn is a real, billed CLI
+invocation, so a full panel run costs accordingly; use `provider="fake"`
+for free, deterministic demos. The HTTP adapters (`anthropic`, `openai`)
+remain available when you prefer an API key. Both CLI providers also work
+from the plain CLI: `provider: claude-cli` / `codex-cli` in a config's agents.
 
 The `mcp` dependency is optional: `import symposium` and the `symposium`
 CLI work without it. See `symposium/integrations/mcp_server.py`.
@@ -374,7 +384,7 @@ CLI work without it. See `symposium/integrations/mcp_server.py`.
 │       └── examples/             # 28 positive + 36 negative fixtures + validators
 ├── symposium/                    # Reference Python runtime
 │   ├── models.py                 # Pydantic models mirroring the JSON Schemas
-│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic/Claude-CLI adapters
+│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic/Claude-CLI/Codex-CLI adapters
 │   ├── selector/                 # §4.1 selector: fixed / rules / llm strategies
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest
