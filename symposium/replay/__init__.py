@@ -9,14 +9,17 @@ Two distinct contracts share this namespace and NOTHING else (§7.8):
     only when every non-deterministic source is pinned; aborts with a
     `PinningViolation` otherwise (silent best-effort replay is forbidden).
 
-`pinned_runtime` is the deterministic-runtime context a library user wraps
-around `run_session` to produce a *reproducible* original run.
+`pinned_runtime` is the deterministic-runtime context (sequential message
+ids + an optional fixed clock) a library user can wrap around `run_session`
+to record a reproducible run for §9.4.1-style golden tests; `persona_hash`
+computes the §7.6 condition #9 hash the same way the replay check does.
 """
 
 from symposium.replay.execution import (
     ExecutionReplayResult,
     PinningViolation,
     execution_replay,
+    persona_hash,
     pinned_runtime,
 )
 from symposium.replay.transcript import (
@@ -29,6 +32,7 @@ __all__ = [
     "PinningViolation",
     "TranscriptReplayResult",
     "execution_replay",
+    "persona_hash",
     "pinned_runtime",
     "replay_transcript",
 ]

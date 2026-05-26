@@ -267,11 +267,11 @@ def execution_replay_cmd(
     """Re-run a persisted session under the §7.6 pinning conditions.
 
     The library API also accepts `fixed_clock` and `persona_hashes`; both
-    are caller-side knobs not exposed on the command line in M5. A
-    FakeProvider replay with no fixed clock proceeds on the system clock
-    (its `transcript_digest` may therefore diverge — surfaced as a
-    warning). Exit codes: 0 match, 3 pinning violation, 4 digest mismatch,
-    1 any other error.
+    are caller-side knobs not exposed on the command line in M5. With no
+    `fixed_clock`, message ids and timestamps are replayed from the
+    recorded transcript (§7.6 #8 fixed clock source), so a deterministic
+    FakeProvider run reproduces its `transcript_digest`. Exit codes: 0
+    match, 3 pinning violation, 4 digest mismatch, 1 any other error.
     """
     config_path = run_dir / "config.json"
     if not config_path.exists():

@@ -183,12 +183,16 @@ forbids silent best-effort replay. Exit codes: `0` digest match, `3`
 pinning violation, `4` digest mismatch, `1` any other error.
 
 Reproducibility is conditional, not free (§7.8: *replayable ≠
-reproducible*). A vanilla `symposium run` mints message ids with
-`uuid4` and stamps wall-clock timestamps, so its `execution-replay`
-reports a mismatch — that is the honest result, not a bug. To produce a
-*reproducible* original run, wrap `run_session` in `pinned_runtime`
-(deterministic ids + a fixed clock) and pass the same `fixed_clock` to
-`execution_replay`; see the library example below.
+reproducible*). Two runtime-allocated fields feed the digest but aren't
+produced by the provider — `Message.id` (`uuid4`) and `Message.timestamp`
+(wall-clock). `execution-replay` pins both to the values recorded in the
+original transcript (§7.6 condition #8's *fixed clock source* + §9.4.1's
+*deterministic id allocator*), so a deterministic `FakeProvider` run
+reproduces its digest exactly — no special recording step required. A
+re-execution that genuinely diverges (different content, count, or
+routing) desyncs from the recorded sequence and reports a mismatch with
+the first diverging message id, never a spurious match. A caller can
+override the timestamp source with `fixed_clock` (a library knob).
 
 ### Library use
 
@@ -208,19 +212,18 @@ artifact = run_session(config, providers, runs_root="runs/")
 print(artifact.transcript_digest)        # 64-hex JCS-SHA-256 digest
 print(artifact.outcome.kind)             # "synthesis" or "termination"
 
-# Reproducible original run + §7.6 execution_replay (digest-matching)
-from datetime import datetime, timezone
-from symposium.replay import execution_replay, pinned_runtime
+# §7.6 execution_replay — re-execute under the ten pinning conditions and
+# compare the fresh digest. ids/timestamps are replayed from the recording,
+# so a deterministic run reproduces its digest with no extra setup.
+from symposium.replay import execution_replay, PinningViolation
 
-clock = lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
-with pinned_runtime(fixed_clock=clock):                       # deterministic ids + fixed clock
-    run_session(config, {"default": FakeProvider(script=script)}, runs_root="runs/")
-
-result = execution_replay("runs/" + config.session_id,
-                          providers={"default": FakeProvider(script=script)},
-                          fixed_clock=clock)
-print(result.digest_matches)             # True — every pinning condition satisfied
-print(result.conditions_checked, result.conditions_assumed)
+try:
+    result = execution_replay("runs/" + config.session_id,
+                              providers={"default": FakeProvider(script=script)})
+    print(result.digest_matches)         # True — every pinning condition satisfied
+    print(result.conditions_checked, result.conditions_assumed)
+except PinningViolation as exc:
+    print("aborted on §7.6 condition:", exc.condition)
 ```
 
 ---

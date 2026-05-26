@@ -24,24 +24,40 @@ This module implements the §7.6 contract:
          raises `PinningViolation` *before* the runtime executes.
      §7.6 forbids silent best-effort replay: a condition that is neither
      checked nor assumed is a bug, not a tolerated "unknown" tier.
-  3. Only after every condition passes, re-run `run_session(...)` under a
-     deterministic-runtime context (see `pinned_runtime`) into a *fresh*
-     run directory (`<session_id>-replay/`), and compare the fresh
-     `transcript_digest` against the original. The digest match/mismatch
-     is reported, never raised — the caller decides how to surface it.
+  3. Only after every condition passes, re-run `run_session(...)` with the
+     runtime's two non-deterministic-but-digest-bearing fields pinned (see
+     "Message-id and timestamp pinning" below) into a *fresh* run directory
+     (`<session_id>-replay/`), and compare the fresh `transcript_digest`
+     against the original. The digest match/mismatch is reported, never
+     raised — the caller decides how to surface it.
 
-Open clarifications (no spec edits — see Hard-rule §3 of the milestone):
+Message-id and timestamp pinning (open clarification — no spec edits; see
+Hard-rule §3 of the milestone):
 
-  * **Message-id minting.** The reference scheduler mints message ids
-    with `uuid.uuid4()` (`symposium.scheduler.loop._new_id`). That is a
-    non-deterministic source the `transcript_digest` depends on, yet
-    §7.6's ten-condition enum does *not* name id generation. We treat it
-    as part of condition #1 ("Runtime-level logic ... is part of the
-    reproduction surface") and pin it deterministically inside
-    `pinned_runtime`. A run that was *not* produced under the same
-    deterministic id regime is simply not reproducible: its replay
-    yields `digest_matches=False` rather than a spurious match. This is
-    the §7.8 "replayable ≠ reproducible" statement made operational.
+  Two `Message` fields feed `transcript_digest` (§7.7) but are NOT supplied
+  by the provider: `Message.id` (the reference scheduler mints it with
+  `uuid.uuid4()` via `symposium.scheduler.loop._new_id`) and
+  `Message.timestamp` (wall-clock via `now_utc_iso`). §7.6's ten-condition
+  enum names only the wall-clock seed (#8), not id minting — §9.4.1 calls
+  the deterministic-id allocator a *golden-test* addition and explicitly
+  notes that the §7.6 digest comparison is "broken" when two runs each mint
+  ids their own way. To make the §7.6 comparison *meaningful* without a
+  spec edit, M5 pins BOTH fields to the values recorded in the original
+  Artifact: the fresh run dispatches in the same deterministic order (same
+  Config + same deterministic provider), so feeding back the recorded id
+  sequence (a deterministic allocator per §9.4.1's "byte-identical ids for
+  byte-identical dispatch sequences") and the recorded timestamp sequence
+  (the §7.6 #8 "fixed clock source for replay") reconstructs each message
+  byte-for-byte iff the re-execution genuinely reproduces it. A re-execution
+  that diverges (different content, count, or routing) desyncs from the
+  recorded sequences and yields `digest_matches=False` — never a spurious
+  match. This is §7.8's "replayable ≠ reproducible" made operational, and
+  it lets `execution_replay` work on an ordinary persisted run (random ids +
+  wall-clock), not only on runs recorded under a pinned harness. A caller may
+  override the timestamp source with `fixed_clock`.
+
+Further open clarifications:
+
   * **"adapter-internal version" (condition #2).** The MVP registry
     (§6.11) keys on `provider_id` only; adapters carry no separately
     versioned identity. We decide #2 / #3 on registry resolvability (or
@@ -62,7 +78,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Mapping, Optional
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Union
 
 from symposium.models import Artifact, Config, Persona, RunManifest
 from symposium.providers.base import ProviderAdapter
@@ -90,6 +106,9 @@ PINNING_CONDITIONS = (
 # Fresh-session-id suffix (§3 Hard-rule: never reuse the original id, or
 # the replay would overwrite the original on disk — a data-loss footgun).
 REPLAY_SUFFIX = "-replay"
+
+# Second-resolution UTC format, mirroring symposium.models.now_utc_iso.
+_ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 class PinningViolation(ValueError):
@@ -133,56 +152,106 @@ class ExecutionReplayResult:
 
 @contextmanager
 def pinned_runtime(
-    fixed_clock: Optional[Callable[[], datetime]] = None,
+    *,
+    id_source: Optional[Callable[[], str]] = None,
+    clock: Optional[Callable[[], str]] = None,
 ) -> Iterator[None]:
-    """Pin the runtime's non-deterministic sources for the duration of a run.
+    """Pin the runtime's two non-deterministic, digest-bearing sources.
 
     Patches, on the scheduler module that actually calls them:
 
       * `_new_id` — message-id minting (normally `uuid.uuid4().hex`) is
-        replaced with a per-context counter (`m000000`, `m000001`, ...).
-        Two runs that drive the scheduler through the same deterministic
-        control flow (e.g. the same `FakeProvider` script) mint identical
-        id sequences, so the `transcript_digest` becomes reproducible.
-      * `now_utc_iso` — only when `fixed_clock` is supplied: every message
+        replaced by `id_source`. When `id_source` is None it defaults to a
+        sequential `msg-NNN` allocator (the §9.4.1 RECOMMENDED canonical
+        scheme), so a standalone "record a reproducible run" use case
+        works without arguments. `execution_replay` instead feeds the
+        recorded id sequence (see module docstring).
+      * `now_utc_iso` — only when `clock` is supplied: every message
         `timestamp` (§7.6 condition #8 "wall-clock seed") is sourced from
-        `fixed_clock()` instead of the host clock. Patched on both
+        `clock()` (an ISO-8601 string). Patched on both
         `symposium.scheduler.loop` and `symposium.models` so no call site
-        escapes the pin.
+        escapes the pin (per §7.6 #8's "any wall-clock-reading function").
 
-    Library users who want a *reproducible* original run (one whose
-    `execution_replay` can produce a digest-matching fresh artifact)
-    should produce it inside this context with the same `fixed_clock`.
+    Both `id_source` and `clock` are plain zero-arg callables returning
+    strings; the runtime calls them once per appended message in dispatch
+    order (`now_utc_iso` is additionally called once for `Artifact.ended_at`,
+    which does not enter the digest).
     """
     import symposium.models as _models
     from symposium.scheduler import loop as _loop
+
+    if id_source is None:
+        id_source = _sequential_id_source()
 
     saved_new_id = _loop._new_id
     saved_loop_now = _loop.now_utc_iso
     saved_models_now = _models.now_utc_iso
 
-    counter = itertools.count()
-
-    def _det_id() -> str:
-        return f"m{next(counter):06d}"
-
-    _loop._new_id = _det_id  # type: ignore[assignment]
-
-    if fixed_clock is not None:
-
-        def _det_now() -> str:
-            # Mirror models.now_utc_iso's second-resolution UTC format.
-            return fixed_clock().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        _loop.now_utc_iso = _det_now  # type: ignore[assignment]
-        _models.now_utc_iso = _det_now  # type: ignore[assignment]
-
+    _loop._new_id = id_source  # type: ignore[assignment]
+    if clock is not None:
+        _loop.now_utc_iso = clock  # type: ignore[assignment]
+        _models.now_utc_iso = clock  # type: ignore[assignment]
     try:
         yield
     finally:
         _loop._new_id = saved_new_id  # type: ignore[assignment]
         _loop.now_utc_iso = saved_loop_now  # type: ignore[assignment]
         _models.now_utc_iso = saved_models_now  # type: ignore[assignment]
+
+
+def _sequential_id_source(prefix: str = "msg-", width: int = 3) -> Callable[[], str]:
+    """The §9.4.1 RECOMMENDED canonical id scheme: `msg-000`, `msg-001`, …"""
+    counter = itertools.count()
+    return lambda: f"{prefix}{next(counter):0{width}d}"
+
+
+def _recorded_id_source(artifact: Artifact) -> Callable[[], str]:
+    """Replay the original's exact id sequence in dispatch order.
+
+    Falls back to a distinct `replay-extra-NNN` id once the recording is
+    exhausted (only reached if the re-execution allocates *more* messages
+    than the original — a genuine divergence that will surface as a digest
+    mismatch, never a spurious match)."""
+    it = iter([m.id for m in artifact.canonical_transcript])
+    overflow = itertools.count()
+
+    def _next() -> str:
+        try:
+            return next(it)
+        except StopIteration:
+            return f"replay-extra-{next(overflow):06d}"
+
+    return _next
+
+
+def _recorded_clock_source(artifact: Artifact) -> Callable[[], str]:
+    """Replay the original's exact timestamp sequence (§7.6 #8 fixed clock).
+
+    Clamps to the last recorded timestamp once exhausted — the runtime calls
+    the clock once more for `Artifact.ended_at` after the final message, and
+    that value does not enter the `transcript_digest`."""
+    stamps = [m.timestamp for m in artifact.canonical_transcript]
+    it = iter(stamps)
+    state = {"last": stamps[-1]}
+
+    def _next() -> str:
+        try:
+            state["last"] = next(it)
+        except StopIteration:
+            pass
+        return state["last"]
+
+    return _next
+
+
+def _fixed_clock_source(fixed_clock: Callable[[], datetime]) -> Callable[[], str]:
+    """Adapt a caller's `() -> datetime` clock to the ISO-string the runtime emits."""
+
+    def _next() -> str:
+        v = fixed_clock()
+        return v if isinstance(v, str) else v.strftime(_ISO_FORMAT)
+
+    return _next
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +277,11 @@ def execution_replay(
             optional `"default"` fallback) that `run_session` consumes.
             The caller owns adapter state — pass a *fresh* `FakeProvider`
             so its `invocation_count` starts at zero.
-        fixed_clock: pins message timestamps (§7.6 condition #8). Required
-            for a live-provider replay; optional (system clock + warning)
-            under an all-FakeProvider replay.
+        fixed_clock: OPTIONAL override for the message-timestamp source
+            (§7.6 condition #8). When omitted, timestamps are replayed
+            from the original Artifact; when supplied, `fixed_clock()` is
+            used instead. Required for a live-provider replay (an
+            all-FakeProvider replay may omit it).
         persona_hashes: optional `agent_id -> sha256(JCS(Persona))` map
             captured at original run time (§7.6 condition #9).
         fresh_runs_root: where to persist the fresh run; defaults to the
@@ -316,12 +387,18 @@ def execution_replay(
     conditions_checked.append("tool_env")
 
     # --- #8 wallclock -------------------------------------------------------
+    # Decide the message-timestamp source. fixed_clock overrides; otherwise we
+    # replay the recorded timestamps (a §7.6 #8 "fixed clock source for
+    # replay"). A live provider with no fixed_clock cannot be pinned (its fresh
+    # content would not match the recording anyway) → abort.
     if fixed_clock is not None:
+        clock_source: Callable[[], str] = _fixed_clock_source(fixed_clock)
         conditions_checked.append("wallclock")
     elif all_fake:
+        clock_source = _recorded_clock_source(original_artifact)
         warnings.append(
-            "wallclock: no fixed_clock supplied; the replay uses the system clock, so message "
-            "timestamps (and therefore the transcript_digest) may diverge from the original"
+            "wallclock: no explicit fixed_clock; message timestamps are replayed from the "
+            "recorded transcript (§7.6 #8 fixed clock source). Pass fixed_clock to override"
         )
         conditions_checked.append("wallclock")
     else:
@@ -344,7 +421,7 @@ def execution_replay(
                     "persona",
                     f"agent {aid!r} persona_ref is an unresolved registry id; cannot hash it",
                 )
-            actual = _persona_hash(ac.persona_ref)
+            actual = persona_hash(ac.persona_ref)
             if actual != expected:
                 raise PinningViolation(
                     "persona",
@@ -376,7 +453,8 @@ def execution_replay(
     validate_session_id(fresh_session_id)  # ValueError → generic error path
     fresh_config = config.model_copy(update={"session_id": fresh_session_id})
 
-    with pinned_runtime(fixed_clock):
+    id_source = _recorded_id_source(original_artifact)
+    with pinned_runtime(id_source=id_source, clock=clock_source):
         fresh_artifact = run_session(
             fresh_config, dict(providers), runs_root=str(fresh_runs_root)
         )
@@ -425,8 +503,11 @@ def _load_run(run_dir: Path) -> tuple[RunManifest, Config, Artifact]:
     return manifest, config, artifact
 
 
-def _persona_hash(persona: Persona) -> str:
-    """SHA-256 over the RFC-8785 JCS canonicalization of a resolved Persona."""
+def persona_hash(persona: Persona) -> str:
+    """SHA-256 over the RFC-8785 JCS canonicalization of a resolved Persona.
+
+    Public so callers can compute the `persona_hashes` map they pass back to
+    `execution_replay` (§7.6 condition #9) the same way the check does."""
     return sha256_hex(canonicalize(persona.model_dump(mode="json", exclude_none=True)))
 
 
