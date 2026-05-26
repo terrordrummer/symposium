@@ -3,7 +3,10 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "symposium"
+# PyPI distribution name. The `symposium` name is taken on PyPI by an
+# unrelated project, so the distribution is `symposium-protocol`; the
+# import package stays `symposium` (cf. scikit-learn → sklearn).
+name = "symposium-protocol"
 version = "1.5.0"
 description = "Reference implementation of the Symposium protocol — structured, sequential, adversarial multi-agent deliberation."
 readme = "README.md"

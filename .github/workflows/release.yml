@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/symposium/
+      url: https://pypi.org/project/symposium-protocol/
     permissions:
       id-token: write  # OIDC token for PyPI Trusted Publishing
     steps:

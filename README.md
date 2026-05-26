@@ -81,8 +81,9 @@ and an Anthropic-shaped HTTP adapter (for real-model sessions against
 Every flow produces a persisted, byte-identically replayable artifact.
 
 ```bash
-# Stable install (PyPI)
-pip install symposium
+# Stable install (PyPI). Distribution name is `symposium-protocol`;
+# the import package is `symposium` (cf. scikit-learn → sklearn).
+pip install symposium-protocol      # then: import symposium
 
 # Development install (editable, from a clone)
 git clone https://github.com/terrordrummer/symposium
