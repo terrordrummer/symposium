@@ -54,3 +54,11 @@ Wrapping the runtime as an **MCP server** or a Claude Code / IDE skill is a
 host-integration pattern (spec §11.4 / §11.5), built on the stable
 `run_session(config, providers) -> Artifact` API without modifying the
 runtime. These are downstream of the protocol, not part of it.
+
+- ✅ **MCP server (`symposium-mcp`, v1.6.0)** — `symposium/integrations/`
+  exposes the runtime as MCP tools (`deliberate`, `get_run_summary`,
+  `list_personas`) so a Claude client can launch a deliberation and read
+  its result, replay status, and metrics. Optional `[mcp]` extra; the core
+  install and CLI are unchanged. See the README "Use in Claude Code"
+  section. This realizes the §12 "HTTP / RPC service host pattern" /
+  IDE-integration line as a pure consumer of the public API.

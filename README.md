@@ -281,6 +281,70 @@ except PinningViolation as exc:
 
 ---
 
+## Use in Claude Code (MCP server)
+
+Symposium ships an optional **MCP server** that exposes the runtime as
+tools, so a Claude client (Claude Code, Claude Desktop, claude.ai) can
+launch a structured deliberation and read back its result, replay status,
+and metrics — over the same `run_session(...)` API, with no changes to the
+runtime or the protocol.
+
+```bash
+# Install with the optional MCP extra
+pip install "symposium-protocol[mcp]"
+# …or from the released tag:
+pip install "symposium-protocol[mcp] @ git+https://github.com/terrordrummer/symposium@v1.6.0"
+
+# Register the stdio server with Claude Code
+claude mcp add symposium -- symposium-mcp
+```
+
+For **Claude Desktop**, add the server to your `mcpServers` config
+(`claude_desktop_config.json`). Set `ANTHROPIC_API_KEY` (or
+`OPENAI_API_KEY`) in `env` when you want real-provider deliberations; omit
+it for fake-driven, deterministic runs:
+
+```json
+{
+  "mcpServers": {
+    "symposium": {
+      "command": "symposium-mcp",
+      "env": { "ANTHROPIC_API_KEY": "sk-ant-..." }
+    }
+  }
+}
+```
+
+The server exposes three tools:
+
+- **`deliberate(problem, …)`** — build a `Config` from arguments (panel
+  persona ids resolved into inline personas exactly as the CLI does), run a
+  session, and return `{outcome, synthesis_answer | termination_reason,
+  selected_agents, transcript_digest, cumulative_usage, run_dir, rounds}`.
+- **`get_run_summary(run_dir)`** — load a persisted run, recompute the §7.9
+  metrics, verify the §7.5 transcript replay, and return a compact summary.
+- **`list_personas()`** — the six built-in personas (R3 default panel +
+  coordinator) to use as `panel` / `coordinator` arguments.
+
+A typical `deliberate` call from a Claude client:
+
+```jsonc
+// real Anthropic providers (reads ANTHROPIC_API_KEY from the env)
+deliberate(problem="Should we adopt a structured deliberation protocol?")
+
+// deterministic, network-free (used by the tests and demos)
+deliberate(
+  problem="demo",
+  provider="fake",
+  fake_script_path="examples/scripts/walking-skeleton.json"
+)
+```
+
+The `mcp` dependency is optional: `import symposium` and the `symposium`
+CLI work without it. See `symposium/integrations/mcp_server.py`.
+
+---
+
 ## What's in this repo
 
 ```
@@ -299,6 +363,7 @@ except PinningViolation as exc:
 │   ├── replay/                   # transcript_replay (§7.5) + execution_replay (§7.6)
 │   ├── observability/            # §7.9 MVP metric set (offline)
 │   ├── personas/                 # MVP default panel (R3)
+│   ├── integrations/             # Host integrations — MCP server (`symposium-mcp`)
 │   └── cli/                      # `symposium` command
 ├── examples/                     # Walking-skeleton + rules/llm selector configs + scripts
 ├── tests/                        # pytest suite (FakeProvider determinism,
