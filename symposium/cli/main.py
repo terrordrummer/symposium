@@ -15,6 +15,10 @@ MVP subcommands:
   symposium validate ARTIFACT.json
       Validates an artifact against the v1.0.0 JSON Schemas.
 
+  symposium metrics RUN_DIR
+      Computes the §7.9 MVP observability metric set offline from
+      `<RUN_DIR>/artifact.json` and writes `<RUN_DIR>/metrics.json`.
+
 Environment variables consumed by built-in adapters:
 
   OPENAI_API_KEY  — required when any agent declares `provider: openai`.
@@ -32,7 +36,12 @@ from typing import Optional
 import click
 import yaml
 
-from symposium.models import Config, FakeProviderScript
+from symposium.models import Artifact, Config, FakeProviderScript
+from symposium.observability import (
+    MetricsConsistencyError,
+    compute_metrics,
+    write_metrics,
+)
 from symposium.providers import (
     FakeProvider,
     MissingCredentialsError,
@@ -141,6 +150,85 @@ def validate_cmd(artifact_path: Path) -> None:
             click.echo(f"ERROR: {err.message} at {list(err.absolute_path)}", err=True)
         sys.exit(1)
     click.echo("VALID")
+
+
+@main.command("metrics")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--output", "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write metrics.json here instead of <run_dir>/metrics.json.",
+)
+@click.option(
+    "--quiet", is_flag=True,
+    help="Suppress the human-readable summary on stdout.",
+)
+def metrics_cmd(run_dir: Path, output_path: Optional[Path], quiet: bool) -> None:
+    """Compute §7.9 MVP observability metrics from a persisted run directory."""
+    artifact_path = run_dir / "artifact.json"
+    if not artifact_path.exists():
+        click.echo(f"ERROR: {artifact_path} not found", err=True)
+        sys.exit(1)
+    try:
+        raw = json.loads(artifact_path.read_text())
+        artifact = Artifact.model_validate(raw)
+    except Exception as exc:  # noqa: BLE001 — surface any parse/validation failure as exit 1
+        click.echo(f"ERROR: failed to load artifact: {exc}", err=True)
+        sys.exit(1)
+
+    try:
+        metrics = compute_metrics(artifact)
+    except MetricsConsistencyError as exc:
+        click.echo(f"ERROR: metrics-consistency invariant failed: {exc}", err=True)
+        sys.exit(2)
+
+    if output_path is None:
+        out_path = write_metrics(run_dir, metrics)
+    else:
+        # Inline mirror of write_metrics with a caller-chosen destination.
+        from symposium.observability.metrics import _atomic_write_text
+
+        payload = metrics.model_dump(mode="json", exclude_none=False)
+        text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        _atomic_write_text(output_path, text)
+        out_path = output_path
+
+    if not quiet:
+        _print_metrics_summary(metrics, out_path)
+
+
+def _print_metrics_summary(metrics, out_path: Path) -> None:
+    click.echo(f"session_id={metrics.session_id}")
+    click.echo(f"transcript_digest={metrics.transcript_digest}")
+    if metrics.outcome_kind == "termination":
+        click.echo(f"outcome=termination ({metrics.termination_reason})")
+    else:
+        click.echo("outcome=synthesis")
+    tc = metrics.tokens_cumulative
+    click.echo(
+        f"tokens={tc.total_tokens} "
+        f"(prompt={tc.prompt_tokens}, completion={tc.completion_tokens})"
+    )
+    click.echo(f"cost_usd={metrics.cost_cumulative.cost_usd}")
+
+    top3 = sorted(
+        metrics.tokens_per_agent.items(),
+        key=lambda kv: kv[1].total_tokens,
+        reverse=True,
+    )[:3]
+    if top3:
+        click.echo("top_agents_by_tokens:")
+        for agent, tb in top3:
+            click.echo(f"  {agent}: {tb.total_tokens}")
+
+    click.echo(f"branch_depth_max={metrics.branch_depth_max}")
+    click.echo(f"deferred_queue_length_max={metrics.deferred_queue_length_max}")
+    click.echo(
+        f"panel_contraction_total={sum(p.count for p in metrics.panel_contraction_count)}"
+    )
+    click.echo(f"usage_estimated={metrics.usage_estimated}")
+    click.echo(f"persisted_to={out_path}")
 
 
 # ---------------------------------------------------------------------------

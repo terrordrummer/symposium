@@ -129,6 +129,29 @@ symposium run \
   examples/problem.md
 ```
 
+### Inspecting metrics
+
+Every persisted run directory can be analysed offline with `symposium
+metrics`, which computes the §7.9 MVP observability set (token / cost
+usage per agent and per `(provider, model)`, latency per invocation,
+participation per round, branch depth, deferred-queue length, panel
+contractions, schema-failure counts, termination reason, the
+`usage_estimated` flag) and writes `metrics.json` next to the
+artifact:
+
+```bash
+symposium metrics runs/demo-walking-skeleton-001
+# → runs/demo-walking-skeleton-001/metrics.json (full breakdown)
+# → stdout: one-screen human-readable summary
+```
+
+The §7.9 set is deliberately MVP — `role_purity_score`,
+`disagreement_frequency`, `interaction_graph`,
+`delegation_frequency`, per-invocation provider-retry counts and a
+live `observability_event` stream are §7.10 v1+ extensions and
+formally deferred. The MVP set is fully derivable from the persisted
+`artifact.json` alone; no live event bus required.
+
 The CLI resolves each agent's `provider` string through the adapter
 registry (§6.11). Built-in registrations: `openai`, `anthropic`, and
 — when `--script` is given — `fake`. Plug your own adapter in by
@@ -170,6 +193,7 @@ print(artifact.outcome.kind)             # "synthesis" or "termination"
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest
 │   ├── replay/                   # transcript_replay (§7.5)
+│   ├── observability/            # §7.9 MVP metric set (offline)
 │   ├── personas/                 # MVP default panel (R3)
 │   └── cli/                      # `symposium` command
 ├── examples/                     # Walking-skeleton config + script
