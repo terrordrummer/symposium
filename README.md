@@ -374,11 +374,22 @@ persona — the lateral/creative **visionary** to `codex-cli`
 (`claude -p --output-format json --json-schema …`) — and **falls back** to
 whichever CLI is actually installed (only `claude` installed → the whole
 panel runs on claude, and vice-versa). Force one CLI with
-`provider="claude-cli"` / `"codex-cli"`. Each turn is a real, billed CLI
-invocation, so a full panel run costs accordingly; use `provider="fake"`
-for free, deterministic demos. The HTTP adapters (`anthropic`, `openai`)
-remain available when you prefer an API key. Both CLI providers also work
-from the plain CLI: `provider: claude-cli` / `codex-cli` in a config's agents.
+`provider="claude-cli"` / `"codex-cli"`.
+
+**Billing.** When a CLI is logged in with a **subscription** (Claude
+Pro/Max for `claude`, a ChatGPT plan for `codex`), turns run against that
+subscription's usage and **rate limits — not metered, per-token API
+billing**. There is no separate dollar charge to an API account; you are
+spending subscription quota, so a full panel (≈ one call per turn) and
+especially `deliberate_adaptive` (multiple linked sessions) consume that
+quota faster and can hit plan limits. The `cost_usd` Symposium records for
+a CLI turn is an **API-equivalent reference** (what the tokens would cost
+at API rates), reported as estimated — not a bill. (Only if a CLI is
+authenticated via an **API key** instead of a subscription login is the
+usage metered.) Use `provider="fake"` for free, deterministic, offline
+demos. The HTTP adapters (`anthropic`, `openai`) call the metered API and
+do read an API key. Both CLI providers also work from the plain CLI:
+`provider: claude-cli` / `codex-cli` in a config's agents.
 
 The `mcp` dependency is optional: `import symposium` and the `symposium`
 CLI work without it. See `symposium/integrations/mcp_server.py`.

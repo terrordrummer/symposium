@@ -33,8 +33,13 @@ How it maps onto the contract
   surfacing `malformed_response`; the runtime may retry further (§4.9).
 * **Usage / cost (§5.7).** Tokens come from the CLI's `usage`
   (`input_tokens` + cache tokens → prompt; `output_tokens` →
-  completion); `cost_usd` is the CLI's own `total_cost_usd` (so
-  `estimated = False` — it is the vendor's reported cost, not a guess).
+  completion). `cost_usd` is the CLI's `total_cost_usd`, but it is the
+  **API-equivalent reference** cost (what the tokens would cost at API
+  rates), recorded with `estimated = True`: under a subscription login
+  (Claude Pro/Max) turns draw on the subscription's usage / rate limits,
+  NOT metered per-token billing, so this figure is a reference, not a
+  charge. (It would be an actual charge only if the CLI were authenticated
+  via an API key rather than a subscription.)
 * **Errors (§6.6).** A missing `claude` binary, a non-zero exit, a CLI
   `is_error`, a parse failure, or a timeout map to CLOSED `error.kind`
   values, so the runtime's §4.9 failure handling applies unchanged.
@@ -311,12 +316,15 @@ def _usage_from_cli(data: Dict[str, Any]) -> Usage:
     )
     completion = int(u.get("output_tokens", 0) or 0)
     cost = data.get("total_cost_usd")
+    # `total_cost_usd` is the API-EQUIVALENT cost (what the tokens would cost
+    # at API rates). Under a subscription login it is not a metered charge, so
+    # mark the usage `estimated` — the figure is a reference, not a bill.
     return Usage(
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=prompt + completion,
         cost_usd=float(cost) if isinstance(cost, (int, float)) else 0.0,
-        estimated=False,
+        estimated=True,
     )
 
 

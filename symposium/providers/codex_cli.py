@@ -22,6 +22,8 @@ Vendor specifics
   (``input_tokens`` + ``cached_input_tokens`` → prompt;
   ``output_tokens`` + ``reasoning_output_tokens`` → completion). Codex
   reports **no cost**, so ``cost_usd = 0.0`` and ``estimated = True``.
+  Under a subscription login (a ChatGPT plan) turns draw on that plan's
+  usage / rate limits, not metered per-token API billing.
 * Errors (§6.6): a missing binary, a non-zero exit, a ``turn.failed`` /
   ``error`` event, a parse failure, or a timeout map to CLOSED
   ``error.kind`` values; one corrective retry (§6.7) on a schema miss.
@@ -289,7 +291,8 @@ def _usage_from_event(usage_event: Optional[Dict[str, Any]]) -> Usage:
     completion = (
         int(u.get("output_tokens", 0) or 0) + int(u.get("reasoning_output_tokens", 0) or 0)
     )
-    # Codex exec reports no cost → mark estimated so the runtime/metrics know.
+    # Codex exec reports no cost; under a subscription login there is no
+    # metered charge anyway → cost 0.0 + estimated so the metrics flag it.
     return Usage(
         prompt_tokens=prompt,
         completion_tokens=completion,

@@ -90,8 +90,10 @@ def test_successful_turn_extracts_structured_output_and_usage():
     assert result.usage.prompt_tokens == 110
     assert result.usage.completion_tokens == 50
     assert result.usage.total_tokens == 160
+    # cost is the CLI's API-equivalent figure, recorded as estimated (under a
+    # subscription login it is a reference, not a metered charge)
     assert result.usage.cost_usd == 0.01
-    assert result.usage.estimated is False
+    assert result.usage.estimated is True
 
 
 def test_argv_and_stdin_translation():
