@@ -508,6 +508,142 @@ def deliberate_adaptive(
         return _error(exc)
 
 
+@mcp.tool()
+async def deliberate_adaptive_streaming(
+    problem: str,
+    *,
+    panel: Optional[List[str]] = None,
+    coordinator: str = "coordinator",
+    provider: str = "cli-auto",
+    experts: Optional[List[str]] = None,
+    max_expansions: int = 2,
+    max_rounds: int = 4,
+    max_total_tokens: int = 100000,
+    max_total_cost_usd: float = 5.0,
+    max_wallclock_seconds: int = 300,
+    output_dir: str = "runs",
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Combined: adaptive (dynamic agent generation) + streaming (live events).
+
+    Same arguments / final return shape as ``deliberate_adaptive``. The
+    difference is that each persona generation, session start/end, and
+    every per-turn transcript message is pushed live to the MCP client
+    via ``ctx.info`` and ``ctx.report_progress`` as the deliberation
+    unfolds.
+
+    Streamed events (in order):
+      * ``agent_generated`` — one per persona designed (early-start /
+        runtime).
+      * ``session_start`` — when a new adaptive session begins, with its
+        ``session_id`` and the panel composition at that point.
+      * per-turn ``message`` — same shape as ``deliberate_streaming``.
+      * ``session_end`` — when a session completes, with its outcome.
+
+    On any failure the streaming stops and the final return value is the
+    structured ``{"error": ...}`` — the transport never crashes.
+    """
+    events_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+    _DONE = {"event": "__done__"}
+    stop_event = threading.Event()
+
+    # Clamp max_expansions to the server-side ceiling (same policy as
+    # deliberate_adaptive). Negatives → 0.
+    effective_expansions = min(int(max_expansions), _MAX_RUNTIME_EXPANSIONS)
+    if effective_expansions < 0:
+        effective_expansions = 0
+
+    def _producer() -> None:
+        try:
+            for ev in stream_adaptive(
+                problem,
+                panel=panel,
+                coordinator=coordinator,
+                provider=provider,
+                experts=experts,
+                max_expansions=effective_expansions,
+                max_rounds=max_rounds,
+                max_total_tokens=max_total_tokens,
+                max_total_cost_usd=max_total_cost_usd,
+                max_wallclock_seconds=max_wallclock_seconds,
+                output_dir=output_dir,
+            ):
+                if stop_event.is_set():
+                    return
+                try:
+                    events_q.put(ev, timeout=_STREAM_PUT_TIMEOUT_SECONDS)
+                except queue.Full:
+                    stop_event.set()
+                    return
+        except Exception as exc:  # noqa: BLE001 — defensive; generator already wraps
+            try:
+                events_q.put(
+                    {"event": "error", "error": _error(exc)["error"]},
+                    timeout=_STREAM_PUT_TIMEOUT_SECONDS,
+                )
+            except queue.Full:
+                pass
+        finally:
+            _put_sentinel(events_q, _DONE)
+
+    worker = threading.Thread(target=_producer, daemon=True)
+    worker.start()
+
+    final: Optional[Dict[str, Any]] = None
+    _SENTINEL_EMPTY = object()
+
+    def _blocking_get_with_timeout():
+        try:
+            return events_q.get(timeout=_STREAM_GET_TIMEOUT_SECONDS)
+        except queue.Empty:
+            return _SENTINEL_EMPTY
+
+    try:
+        while True:
+            ev = await asyncio.to_thread(_blocking_get_with_timeout)
+            if ev is _SENTINEL_EMPTY:
+                if not worker.is_alive():
+                    final = final or {"error": "RuntimeError: streaming worker exited without sentinel"}
+                    break
+                continue
+            if ev is _DONE:
+                break
+            kind = ev.get("event")
+            if kind == "message":
+                await ctx.info(ev["line"])
+                try:
+                    await ctx.report_progress(progress=float(ev["index"]), total=None)
+                except Exception:  # noqa: BLE001 — progress is best-effort
+                    pass
+            elif kind == "agent_generated":
+                await ctx.info(
+                    f"[+agent] {ev['id']} ({ev['phase']}) — need: {ev['need']}"
+                )
+            elif kind == "session_start":
+                await ctx.info(
+                    f"[session #{ev['session_index']} start] panel="
+                    f"{', '.join(ev['panel'])}"
+                )
+            elif kind == "session_end":
+                await ctx.info(
+                    f"[session #{ev['session_index']} end] outcome={ev['outcome']}"
+                )
+            elif kind == "result":
+                final = ev["result"]
+            elif kind == "error":
+                final = {"error": ev["error"]}
+    except asyncio.CancelledError:
+        stop_event.set()
+        raise
+    finally:
+        stop_event.set()
+        worker.join(timeout=_STREAM_JOIN_TIMEOUT_SECONDS)
+
+    return final if final is not None else {
+        "error": "RuntimeError: adaptive streaming produced no result"
+    }
+
+
 def _validate_experts_input(experts: Optional[List[str]]) -> None:
     """Bound the early-start `experts` array (count + per-need length).
 
@@ -609,6 +745,211 @@ def _run_adaptive(
         "expansions": expansions,
         "panel_final": [a.id for a in config.agents],
     }
+
+
+def stream_adaptive(
+    problem: str,
+    *,
+    panel: Optional[List[str]] = None,
+    coordinator: str = "coordinator",
+    provider: str = "cli-auto",
+    experts: Optional[List[str]] = None,
+    max_expansions: int = 2,
+    max_rounds: int = 4,
+    max_total_tokens: int = 100000,
+    max_total_cost_usd: float = 5.0,
+    max_wallclock_seconds: int = 300,
+    output_dir: str = "runs",
+    persona_caller=None,
+    stream_one=None,
+) -> Iterator[Dict[str, Any]]:
+    """Adaptive deliberation as a live event stream (testable core behind
+    `deliberate_adaptive_streaming`).
+
+    Yields, in order:
+      * ``{"event": "agent_generated", "id", "need", "phase"}`` once per
+        persona generated (early-start or runtime).
+      * ``{"event": "session_start", "session_index", "session_id", "panel"}``
+        at the start of each adaptive session.
+      * ``{"event": "message", ...}`` for each transcript message as
+        the session progresses (forwarded from the per-session journal
+        tail).
+      * ``{"event": "session_end", "session_index", "session_id", "outcome"}``
+        when a session completes.
+      * ``{"event": "result", "result": <aggregate adaptive dict>}`` once
+        at the end of a successful adaptive run.
+      * ``{"event": "error", "error": "..."}`` on any failure.
+
+    `persona_caller` and `stream_one` are injectable seams so tests
+    never spawn CLIs or real provider calls.
+    """
+    if persona_caller is None:
+        persona_caller = make_cli_persona_caller()
+    if stream_one is None:
+        stream_one = lambda cfg: _default_adaptive_stream_one(  # noqa: E731
+            cfg, provider, output_dir
+        )
+
+    try:
+        _validate_experts_input(experts)
+    except Exception as exc:  # noqa: BLE001
+        yield {"event": "error", "error": _error(exc)["error"]}
+        return
+
+    panel_ids = list(panel) if panel else list(_DEFAULT_PANEL_IDS)
+    add_provider = "claude-cli" if provider == "cli-auto" else provider
+    add_model = "sonnet" if provider in ("cli-auto", "claude-cli") else _default_model(provider)
+
+    try:
+        config = _build_config(
+            problem=problem, session_id="adaptive-seed", panel_ids=panel_ids,
+            coordinator_id=coordinator,
+            provider="claude-cli" if provider == "cli-auto" else provider,
+            model="sonnet" if provider == "cli-auto" else _default_model(provider),
+            selector_strategy="fixed", max_rounds=max_rounds,
+            max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
+            max_wallclock_seconds=max_wallclock_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        yield {"event": "error", "error": _error(exc)["error"]}
+        return
+
+    existing = {a.id for a in config.agents} | {config.coordinator.id}
+    generated: List[Dict[str, Any]] = []
+    sessions: List[Dict[str, Any]] = []
+
+    # --- early-start expansion ---------------------------------------------
+    for need in (experts or []):
+        try:
+            persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+        except Exception as exc:  # noqa: BLE001
+            yield {"event": "error", "error": _error(exc)["error"]}
+            return
+        config = _add_persona(config, persona, provider=add_provider, model=add_model)
+        existing.add(persona.id)
+        generated.append({"id": persona.id, "need": need, "phase": "early_start"})
+        yield {
+            "event": "agent_generated",
+            "id": persona.id, "need": need, "phase": "early_start",
+        }
+
+    # --- run + runtime expansion -------------------------------------------
+    expansions = 0
+    while True:
+        cfg = config.model_copy(update={"session_id": f"mcp-adaptive-{uuid.uuid4().hex}"})
+        yield {
+            "event": "session_start",
+            "session_index": len(sessions) + 1,
+            "session_id": cfg.session_id,
+            "panel": [a.id for a in cfg.agents],
+        }
+
+        result_dict: Optional[Dict[str, Any]] = None
+        artifact: Optional[Artifact] = None
+        for ev in stream_one(cfg):
+            kind = ev.get("event")
+            if kind == "result":
+                result_dict = ev["result"]
+            elif kind == "__artifact":  # internal — never surfaced to the client
+                artifact = ev["artifact"]
+            elif kind == "error":
+                yield ev
+                return
+            else:
+                yield ev  # forward message + any other events
+
+        if result_dict is None or artifact is None:
+            yield {"event": "error", "error": "RuntimeError: adaptive session produced no artifact"}
+            return
+
+        sessions.append(result_dict)
+        yield {
+            "event": "session_end",
+            "session_index": len(sessions),
+            "session_id": cfg.session_id,
+            "outcome": result_dict.get("outcome"),
+        }
+
+        if artifact.outcome.kind == "synthesis":
+            break
+        need = _pending_need(artifact)
+        if need is None or expansions >= max_expansions:
+            break
+        try:
+            persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+        except Exception as exc:  # noqa: BLE001
+            yield {"event": "error", "error": _error(exc)["error"]}
+            return
+        config = _add_persona(config, persona, provider=add_provider, model=add_model)
+        existing.add(persona.id)
+        generated.append({"id": persona.id, "need": need, "phase": "runtime"})
+        yield {
+            "event": "agent_generated",
+            "id": persona.id, "need": need, "phase": "runtime",
+        }
+        config = _augment_problem(config, prior=result_dict, need=need)
+        expansions += 1
+
+    yield {
+        "event": "result",
+        "result": {
+            "final": sessions[-1],
+            "sessions": sessions,
+            "generated_agents": generated,
+            "expansions": expansions,
+            "panel_final": [a.id for a in config.agents],
+        },
+    }
+
+
+def _default_adaptive_stream_one(cfg: Config, provider: str, output_dir: str) -> Iterator[Dict[str, Any]]:
+    """Run one adaptive session as a streaming generator (yields message events
+    + a final `result` + an internal `__artifact` so the adaptive loop can
+    inspect the outcome).
+    """
+    if provider == "cli-auto":
+        from symposium.integrations.cli_routing import route_cli_providers
+
+        rc, providers = route_cli_providers(cfg)
+    else:
+        rc = cfg
+        providers = default_registry().build_session_providers(cfg)
+
+    journal = Path(output_dir) / cfg.session_id / "transcript.jsonl"
+    result_box: Dict[str, Artifact] = {}
+    error_box: Dict[str, Exception] = {}
+
+    def _worker() -> None:
+        try:
+            result_box["artifact"] = run_session(rc, providers, runs_root=output_dir)
+        except Exception as exc:  # noqa: BLE001 — surfaced as an error event below
+            error_box["exc"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    tail = _JournalTail(journal)
+    index = 0
+    while worker.is_alive():
+        for msg in tail.drain():
+            index += 1
+            yield _message_event(index, msg)
+        time.sleep(0.05)
+    for msg in tail.drain():
+        index += 1
+        yield _message_event(index, msg)
+    worker.join()
+
+    if "exc" in error_box:
+        yield {"event": "error", "error": _error(error_box["exc"])["error"]}
+        return
+    artifact = result_box.get("artifact")
+    if artifact is None:  # pragma: no cover — worker always sets one of the boxes
+        yield {"event": "error", "error": "RuntimeError: run_session produced no artifact"}
+        return
+    result = _build_result(artifact, Path(output_dir) / cfg.session_id, [a.id for a in rc.agents])
+    yield {"event": "__artifact", "artifact": artifact}
+    yield {"event": "result", "result": result}
 
 
 def _add_persona(config: Config, persona: Persona, *, provider: str, model: str) -> Config:

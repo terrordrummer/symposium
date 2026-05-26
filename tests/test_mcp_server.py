@@ -20,6 +20,7 @@ from symposium.integrations.mcp_server import (  # noqa: E402
     deliberate_streaming,
     get_run_summary,
     list_personas,
+    stream_adaptive,
     stream_deliberation,
 )
 
@@ -274,6 +275,58 @@ def test_deliberate_streaming_forwards_each_turn_to_context(tmp_path, script_pat
     assert ctx.logs[-1].startswith("[r2")
     assert len(ctx.progress) == 14
     assert ctx.progress == sorted(ctx.progress)  # monotonic
+
+
+def test_stream_adaptive_no_expansion_one_session(tmp_path):
+    """stream_adaptive without experts and a synthesis on the first session
+    yields: session_start → N message events → session_end → result.
+
+    Injects `stream_one` so no real provider / CLI is involved.
+    """
+    from unittest.mock import MagicMock
+
+    fake_artifact = MagicMock()
+    fake_artifact.outcome.kind = "synthesis"
+
+    fake_session_result = {
+        "outcome": "synthesis",
+        "synthesis_answer": "agreed.",
+        "selected_agents": ["a", "b"],
+        "transcript_digest": "deadbeef",
+        "cumulative_usage": {"total_tokens": 0, "cost_usd": 0.0},
+        "run_dir": str(tmp_path / "fake-run"),
+        "rounds": 1,
+    }
+
+    def fake_stream_one(_cfg):
+        yield {"event": "message", "index": 1, "line": "msg 1", "message": {"type": "primary_turn"}}
+        yield {"event": "message", "index": 2, "line": "msg 2", "message": {"type": "coordination_turn"}}
+        yield {"event": "message", "index": 3, "line": "msg 3", "message": {"type": "synthesis"}}
+        yield {"event": "__artifact", "artifact": fake_artifact}
+        yield {"event": "result", "result": fake_session_result}
+
+    events = list(
+        stream_adaptive(
+            "Why?",
+            output_dir=str(tmp_path),
+            persona_caller=lambda *_a, **_k: {},  # never invoked in this scenario
+            stream_one=fake_stream_one,
+        )
+    )
+
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "session_start"
+    assert kinds.count("message") == 3
+    assert "session_end" in kinds
+    assert kinds[-1] == "result"
+    # Internal __artifact must NOT leak to the client.
+    assert "__artifact" not in kinds
+
+    result = events[-1]["result"]
+    assert result["sessions"] == [fake_session_result]
+    assert result["final"] is fake_session_result
+    assert result["expansions"] == 0
+    assert result["generated_agents"] == []
 
 
 def test_put_sentinel_breaks_through_a_full_queue():
