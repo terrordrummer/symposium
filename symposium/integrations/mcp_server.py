@@ -89,6 +89,53 @@ _FALLBACK_ANTHROPIC_MODEL = "claude-sonnet-4-5"
 _FALLBACK_OPENAI_MODEL = "gpt-4o"
 _DEFAULT_PANEL_IDS = [p.id for p in DEFAULT_PANEL]
 
+# Streaming caps: bound producer/consumer queue and producer-side join window
+# so a slow / disappeared MCP client cannot blow up server memory or hang the
+# tool indefinitely.
+_STREAM_QUEUE_MAXSIZE = 64
+_STREAM_PUT_TIMEOUT_SECONDS = 30.0
+_STREAM_JOIN_TIMEOUT_SECONDS = 10.0
+# Consumer-side liveness check: how long to wait before noticing a dead
+# producer that never delivered the sentinel.
+_STREAM_GET_TIMEOUT_SECONDS = 30.0
+
+# Dynamic-agent generation caps. `max_expansions` already bounds runtime
+# expansions; `_MAX_EARLY_START_EXPERTS` bounds the early-start path (and the
+# implicit cost of N persona-generation CLI calls before the first session).
+# `_MAX_NEED_LENGTH_CHARS` bounds each free-text need passed to the persona
+# generator — protects against pathological prompts coming over MCP.
+_MAX_EARLY_START_EXPERTS = 8
+_MAX_NEED_LENGTH_CHARS = 4096
+# Server-side ceiling on runtime expansions, regardless of the caller's
+# `max_expansions` value. Protects the MCP host from a misbehaving client
+# requesting hundreds of cascading sessions.
+_MAX_RUNTIME_EXPANSIONS = 5
+
+
+def _put_sentinel(q: "queue.Queue[Dict[str, Any]]", sentinel: Dict[str, Any]) -> None:
+    """Ensure a sentinel reaches the consumer even if the queue is saturated.
+
+    A short drain-and-retry loop with a hard upper bound: if a slow client
+    has filled the queue with un-consumed messages, drop the oldest entries
+    to make room for the sentinel rather than wedge the producer forever.
+    """
+    for _ in range(_STREAM_QUEUE_MAXSIZE + 4):
+        try:
+            q.put_nowait(sentinel)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()  # drop one stale event to make room
+            except queue.Empty:
+                pass
+    # Last resort: blocking put with a finite timeout. If the consumer is
+    # truly dead, the consumer-side timeout (`_STREAM_GET_TIMEOUT_SECONDS`)
+    # will notice the dead worker independently.
+    try:
+        q.put(sentinel, timeout=_STREAM_PUT_TIMEOUT_SECONDS)
+    except queue.Full:
+        pass
+
 mcp = FastMCP("symposium")
 
 
@@ -222,8 +269,12 @@ async def deliberate_streaming(
     return value is the structured `{"error": ...}` (the transport
     never crashes).
     """
-    events_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    # Bounded queue: producers may be faster than the MCP transport;
+    # an unbounded queue is a memory growth vector against slow clients.
+    # 64 events buffer ≫ peak per-round message count under realistic caps.
+    events_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
     _DONE = {"event": "__done__"}
+    stop_event = threading.Event()
 
     def _producer() -> None:
         try:
@@ -242,35 +293,83 @@ async def deliberate_streaming(
                 selector_fake_script_path=selector_fake_script_path,
                 output_dir=output_dir,
             ):
-                events_q.put(ev)
+                if stop_event.is_set():
+                    # Client cancelled; stop publishing. The deliberation may
+                    # still be running in the scheduler — it will bound itself
+                    # via its own caps (max_wallclock_seconds, etc.).
+                    return
+                try:
+                    events_q.put(ev, timeout=_STREAM_PUT_TIMEOUT_SECONDS)
+                except queue.Full:
+                    # Consumer (this async tool) has stalled; treat as cancel.
+                    stop_event.set()
+                    return
         except Exception as exc:  # noqa: BLE001 — defensive; generator already wraps
-            events_q.put({"event": "error", "error": _error(exc)["error"]})
+            try:
+                events_q.put(
+                    {"event": "error", "error": _error(exc)["error"]},
+                    timeout=_STREAM_PUT_TIMEOUT_SECONDS,
+                )
+            except queue.Full:
+                pass
         finally:
-            events_q.put(_DONE)
+            # The sentinel MUST reach the consumer; otherwise the consumer
+            # blocks on `events_q.get` forever. We use an unbounded retry
+            # loop (with short drains if the queue is full) so a slow client
+            # cannot wedge the tool. The producer is wrapping up anyway.
+            _put_sentinel(events_q, _DONE)
 
     worker = threading.Thread(target=_producer, daemon=True)
     worker.start()
 
-    loop = asyncio.get_running_loop()
     final: Optional[Dict[str, Any]] = None
-    while True:
-        # Block off the event loop on the thread-safe queue without busy-waiting.
-        ev = await loop.run_in_executor(None, events_q.get)
-        if ev is _DONE:
-            break
-        kind = ev.get("event")
-        if kind == "message":
-            await ctx.info(ev["line"])
-            try:
-                await ctx.report_progress(progress=float(ev["index"]), total=None)
-            except Exception:  # noqa: BLE001 — progress is best-effort
-                pass
-        elif kind == "result":
-            final = ev["result"]
-        elif kind == "error":
-            final = {"error": ev["error"]}
+    _SENTINEL_EMPTY = object()
 
-    worker.join(timeout=5)
+    def _blocking_get_with_timeout():
+        # The timeout MUST be inside the blocking call. Wrapping
+        # `events_q.get` in `asyncio.wait_for` would cancel the awaiting
+        # coroutine but leave the underlying blocking getter alive in the
+        # executor thread, where it could later consume a real event or
+        # the `_DONE` sentinel out of band — orphaned getters accumulate
+        # and ordering is lost.
+        try:
+            return events_q.get(timeout=_STREAM_GET_TIMEOUT_SECONDS)
+        except queue.Empty:
+            return _SENTINEL_EMPTY
+
+    try:
+        while True:
+            ev = await asyncio.to_thread(_blocking_get_with_timeout)
+            if ev is _SENTINEL_EMPTY:
+                if not worker.is_alive():
+                    # Producer thread died without delivering `_DONE`.
+                    final = final or {"error": "RuntimeError: streaming worker exited without sentinel"}
+                    break
+                continue
+            if ev is _DONE:
+                break
+            kind = ev.get("event")
+            if kind == "message":
+                await ctx.info(ev["line"])
+                try:
+                    await ctx.report_progress(progress=float(ev["index"]), total=None)
+                except Exception:  # noqa: BLE001 — progress is best-effort
+                    pass
+            elif kind == "result":
+                final = ev["result"]
+            elif kind == "error":
+                final = {"error": ev["error"]}
+    except asyncio.CancelledError:
+        # Client cancelled the streaming tool invocation. Signal the producer
+        # to stop publishing and wait briefly for it to wind down. The
+        # underlying scheduler is not currently cancellable mid-call; it will
+        # complete or hit its own wallclock cap. This is a documented gap.
+        stop_event.set()
+        raise
+    finally:
+        stop_event.set()
+        worker.join(timeout=_STREAM_JOIN_TIMEOUT_SECONDS)
+
     return final if final is not None else {
         "error": "RuntimeError: streaming deliberation produced no result"
     }
@@ -389,16 +488,51 @@ def deliberate_adaptive(
     failure returns ``{"error": ...}``.
     """
     try:
+        _validate_experts_input(experts)
+        # Clamp `max_expansions` to a server-side ceiling. Without this, a
+        # client could request hundreds of cascading sessions, each
+        # provider-call and persona-generation-call heavy. We apply a hard
+        # cap; the caller's value is honored when smaller.
+        effective_expansions = min(int(max_expansions), _MAX_RUNTIME_EXPANSIONS)
+        if effective_expansions < 0:
+            effective_expansions = 0
         caller = make_cli_persona_caller()
         return _run_adaptive(
             problem=problem, panel=panel, coordinator=coordinator, provider=provider,
-            experts=experts, max_expansions=max_expansions, max_rounds=max_rounds,
+            experts=experts, max_expansions=effective_expansions, max_rounds=max_rounds,
             max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
             max_wallclock_seconds=max_wallclock_seconds, output_dir=output_dir,
             persona_caller=caller,
         )
     except Exception as exc:  # noqa: BLE001 — structured result, never crash
         return _error(exc)
+
+
+def _validate_experts_input(experts: Optional[List[str]]) -> None:
+    """Bound the early-start `experts` array (count + per-need length).
+
+    Without this, an MCP client could request N expert generations before
+    the first session: each generation is a CLI invocation with cost and
+    latency. Cap both the number of generations and the per-need free-text
+    size to make the surface DoS-resistant.
+    """
+    if experts is None:
+        return
+    if not isinstance(experts, list):
+        raise ValueError("experts must be a list of strings")
+    if len(experts) > _MAX_EARLY_START_EXPERTS:
+        raise ValueError(
+            f"experts: requested {len(experts)} early-start agents, "
+            f"max is {_MAX_EARLY_START_EXPERTS}"
+        )
+    for i, need in enumerate(experts):
+        if not isinstance(need, str) or not need.strip():
+            raise ValueError(f"experts[{i}] must be a non-empty string")
+        if len(need) > _MAX_NEED_LENGTH_CHARS:
+            raise ValueError(
+                f"experts[{i}] exceeds {_MAX_NEED_LENGTH_CHARS} chars "
+                f"(got {len(need)})"
+            )
 
 
 # ---------------------------------------------------------------------------

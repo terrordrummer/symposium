@@ -11,9 +11,14 @@ point per §5.15).
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Non-empty string item, used inside arrays whose JSON-Schema items declare
+# `minLength: 1` (e.g. Persona.behavioral_constraints, output_requirements,
+# domain_scope, forbidden_domains).
+_NonEmptyStr = Annotated[str, Field(min_length=1)]
 
 # ---------------------------------------------------------------------------
 # Closed enums (§4.13, §6.6, §4.7, §4.9, §6.10)
@@ -68,12 +73,15 @@ OnAgentFailure = Literal["terminate", "continue_without"]
 OnBudgetExceeded = Literal["stop"]
 ObservabilityLevel = Literal["mvp", "verbose"]
 PersonaStatus = Literal["experimental", "stable", "deprecated", "archived"]
-ExpectedOutputSchema = Literal[
+# §6.2: `expected_output_schema` is a closed enum of canonical schema names
+# OR JSON null (the free-text path). The Python representation uses Optional
+# with `None == JSON null`; the prior "null" *string* form drifted from the
+# JSON Schema enum (which expects the literal `null`).
+ExpectedOutputSchema = Optional[Literal[
     "turn_structured_output",
     "verdict",
     "synthesis_content",
-    "null",
-]
+]]
 ManifestStatus = Literal["in_progress", "complete", "terminated", "crashed"]
 
 SCHEMA_VERSION = "1.0.0"
@@ -99,11 +107,13 @@ class Persona(BaseModel):
     id: str = Field(min_length=1)
     reasoning_scope: str = Field(min_length=1)
     reasoning_style: str = Field(min_length=1)
-    behavioral_constraints: List[str] = Field(min_length=1)
-    failure_modes: List[str] = Field(min_length=1)
-    output_requirements: Optional[List[str]] = None
-    domain_scope: Optional[List[str]] = None
-    forbidden_domains: Optional[List[str]] = None
+    behavioral_constraints: List[_NonEmptyStr] = Field(min_length=1)
+    failure_modes: List[_NonEmptyStr] = Field(min_length=1)
+    output_requirements: Optional[List[_NonEmptyStr]] = None
+    # domain_scope / forbidden_domains: schema requires minItems=1 when present
+    # (the model_validator below enforces presence for domain personas).
+    domain_scope: Optional[List[_NonEmptyStr]] = Field(default=None, min_length=1)
+    forbidden_domains: Optional[List[_NonEmptyStr]] = Field(default=None, min_length=1)
     must_delegate: Optional[Dict[str, str]] = None
     status: Optional[PersonaStatus] = None
 
@@ -319,6 +329,14 @@ class DirectRequest(BaseModel):
     type: str = Field(min_length=1)
     content: Union[str, Dict[str, Any]]
 
+    @field_validator("content")
+    @classmethod
+    def _content_nonempty_string(cls, v):
+        # direct_request.schema.json: content oneOf [{string, minLength:1}, {object}].
+        if isinstance(v, str) and len(v) == 0:
+            raise ValueError("DirectRequest.content string form must be non-empty")
+        return v
+
 
 class TurnStructuredOutput(BaseModel):
     model_config = _strict()
@@ -368,7 +386,10 @@ class ToolEvent(BaseModel):
     arguments: Dict[str, Any]
     result: Optional[Union[Dict[str, Any], str]] = None
     latency_ms: Optional[int] = Field(default=None, ge=0)
-    error: Optional[ProviderError] = None
+    # provider_result.schema.json marks `error` as REQUIRED (nullable):
+    # the field must be present on every tool_event, even when null.
+    # No default → constructors MUST pass `error=` explicitly.
+    error: Optional[ProviderError]
 
 
 class ProviderRawMessage(BaseModel):
@@ -394,10 +415,36 @@ class ProviderResult(BaseModel):
 
 
 class ProviderRequestMessage(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    role: str = Field(min_length=1)
-    content: Any
-    tool_call_id: Optional[str] = None
+    # `additionalProperties: false` per provider_request.schema.json §6.2.
+    model_config = _strict()
+    role: Literal["system", "user", "assistant", "tool"]
+    # Schema: `content` is `oneOf [{string, minLength: 1}, {object}]`.
+    content: Union[str, Dict[str, Any]]
+    name: Optional[str] = Field(default=None, min_length=1)
+    tool_call_id: Optional[str] = Field(default=None, min_length=1)
+
+    @field_validator("content")
+    @classmethod
+    def _content_nonempty_string(cls, v):
+        if isinstance(v, str) and len(v) == 0:
+            raise ValueError("ProviderRequestMessage.content string form must be non-empty")
+        return v
+
+    @model_validator(mode="after")
+    def _tool_role_requires_tool_call_id(self) -> "ProviderRequestMessage":
+        # Schema invariant: role=tool → tool_call_id required.
+        if self.role == "tool" and self.tool_call_id is None:
+            raise ValueError("ProviderRequestMessage with role='tool' requires tool_call_id")
+        return self
+
+
+class ProviderTool(BaseModel):
+    """Tool descriptor per provider_request.schema.json `$defs.tool` (§6.4)."""
+    model_config = _strict()
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    input_schema: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ProviderRequest(BaseModel):
@@ -405,11 +452,51 @@ class ProviderRequest(BaseModel):
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     agent_id: str = Field(min_length=1)
+    # `reasoning_effort` is an OPEN string forwarded to the provider (§6.2);
+    # adapters ignoring it MUST do so silently.
+    reasoning_effort: Optional[str] = None
     messages: List[ProviderRequestMessage] = Field(min_length=1)
     sampling: Optional[Dict[str, Any]] = None
-    tools: Optional[List[Dict[str, Any]]] = None
+    # `tools` is REQUIRED by the JSON Schema; empty list means "no tools".
+    # Loose dict typing kept for back-compat with adapter-built requests that
+    # pass vendor-shaped descriptors. The `ProviderTool` model is the
+    # canonical shape; runtime-built requests SHOULD validate items against
+    # it before constructing the ProviderRequest.
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
     expected_output_schema: ExpectedOutputSchema
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _coerce_none_tools(cls, v):
+        # Back-compat: callers passing `tools=None` historically meant
+        # "no tools exposed". Coerce to the schema-required empty list.
+        return [] if v is None else v
+
+    @field_validator("tools", mode="after")
+    @classmethod
+    def _validate_tool_shape(cls, v):
+        # Each tool dict MUST conform to provider_request.schema.json $defs.tool
+        # (closed: name, description, input_schema, optional metadata).
+        # Validate via ProviderTool so an out-of-shape entry is rejected at
+        # construction rather than slipping through to the provider call.
+        for i, t in enumerate(v):
+            try:
+                ProviderTool.model_validate(t)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"tools[{i}] does not match the $defs.tool shape "
+                    f"(name, description, input_schema): {exc}"
+                ) from exc
+        return v
+
+    @field_validator("expected_output_schema", mode="before")
+    @classmethod
+    def _coerce_null_string(cls, v):
+        # Back-compat: prior API used the string "null" to mean the §6.2
+        # free-text path. The JSON Schema enum is `null` (literal). Accept
+        # both at the input boundary; normalize to `None`.
+        return None if v == "null" else v
 
 
 # ---------------------------------------------------------------------------

@@ -157,10 +157,14 @@ def _codex_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
         schema_path = f"{tmp}/schema.json"
         with open(schema_path, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(schema))
+        # Pass the persona-generation prompt via stdin (positional "-")
+        # rather than as argv, to avoid leaking the architect system block
+        # and the user "need" to other users via `ps`.
         proc = run(
             ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only",
-             "-C", tmp, "--output-schema", schema_path, f"{_ARCHITECT_SYSTEM}\n\n{prompt}"],
-            input="", capture_output=True, text=True, timeout=timeout,
+             "-C", tmp, "--output-schema", schema_path, "-"],
+            input=f"{_ARCHITECT_SYSTEM}\n\n{prompt}",
+            capture_output=True, text=True, timeout=timeout,
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -169,17 +169,24 @@ class ClaudeCliProvider(ProviderAdapter):
 
         model = request.model or self._default_model
         argv: List[str] = [self._binary, "-p", "--output-format", "json", "--model", model]
-        if system_prompt:
-            argv += ["--system-prompt", system_prompt]
+        # The system block — which carries persona material and may contain
+        # confidential prompt fragments — is ALWAYS folded into the stdin
+        # payload with a `[SYSTEM]` sentinel; we never put it on the argv
+        # (visible to `ps` to any user on the host). This mirrors the
+        # codex-cli pattern.
         schema_json = _schema_for(request.expected_output_schema)
         if schema_json is not None:
             argv += ["--json-schema", schema_json]
         argv += self._extra_args
 
+        stdin_payload = user_prompt
+        if system_prompt:
+            stdin_payload = f"[SYSTEM]\n{system_prompt}\n\n{user_prompt}"
+
         try:
             proc = self._run(
                 argv,
-                input=user_prompt,
+                input=stdin_payload,
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
@@ -307,14 +314,24 @@ def _split_prompt(request: ProviderRequest) -> tuple[str, str]:
     return system_prompt, "\n\n".join(body) if body else (system_prompt or "")
 
 
+def _safe_int(v: Any) -> int:
+    """Coerce a CLI-reported usage value to int; malformed → 0 (never raises)."""
+    if v is None:
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _usage_from_cli(data: Dict[str, Any]) -> Usage:
     u = data.get("usage") or {}
     prompt = (
-        int(u.get("input_tokens", 0) or 0)
-        + int(u.get("cache_read_input_tokens", 0) or 0)
-        + int(u.get("cache_creation_input_tokens", 0) or 0)
+        _safe_int(u.get("input_tokens"))
+        + _safe_int(u.get("cache_read_input_tokens"))
+        + _safe_int(u.get("cache_creation_input_tokens"))
     )
-    completion = int(u.get("output_tokens", 0) or 0)
+    completion = _safe_int(u.get("output_tokens"))
     cost = data.get("total_cost_usd")
     # `total_cost_usd` is the API-EQUIVALENT cost (what the tokens would cost
     # at API rates). Under a subscription login it is not a metered charge, so

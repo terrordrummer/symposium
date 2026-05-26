@@ -154,12 +154,43 @@ def test_nonempty_tools_raises_tool_env(tmp_path, example_config, example_script
 def test_live_provider_without_fixed_clock_raises_wallclock(tmp_path, example_config, example_script):
     """A non-Fake provider with no fixed_clock aborts at wallclock — before any HTTP call."""
     run_dir = _make_original_run(tmp_path, example_config, example_script)
+    # Re-declare provider=openai on every agent so the §7.6 provider-identity
+    # check passes; this test targets the wallclock condition specifically,
+    # which fires only after provider identity has matched.
+    config_path = run_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    for ac in config["agents"]:
+        ac["provider"] = "openai"
+    config["coordinator"]["provider"] = "openai"
+    config_path.write_text(json.dumps(config))
     # Construct an OpenAIProvider offline (explicit key, no network call at init).
     live = OpenAIProvider(api_key="test-key-not-used", base_url="http://127.0.0.1:0/v1")
     with pytest.raises(PinningViolation) as exc:
         execution_replay(run_dir, providers={"default": live}, fixed_clock=None)
     assert exc.value.condition == "wallclock"
     assert not (tmp_path / f"{example_config.session_id}-replay").exists()
+
+
+def test_provider_identity_mismatch_raises_provider(tmp_path, example_config, example_script):
+    """An artifact declaring provider=openai cannot be replayed against FakeProvider.
+
+    Regression for the §7.6 pinning hole where the caller's provider map
+    silently bypassed provider-name verification: a FakeProvider snapshot
+    would be accepted in place of the original openai adapter.
+    """
+    run_dir = _make_original_run(tmp_path, example_config, example_script)
+    config_path = run_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    for ac in config["agents"]:
+        ac["provider"] = "openai"
+    config["coordinator"]["provider"] = "openai"
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(PinningViolation) as exc:
+        execution_replay(
+            run_dir,
+            providers={"default": FakeProvider(script=example_script)},
+        )
+    assert exc.value.condition == "provider"
 
 
 def test_persona_hash_mismatch_raises_persona(tmp_path, example_config, example_script):

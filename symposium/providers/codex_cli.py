@@ -148,11 +148,15 @@ class CodexCliProvider(ProviderAdapter):
                     fh.write(schema_json)
                 argv += ["--output-schema", schema_path]
             argv += self._extra_args
-            argv.append(prompt)
+            # Pass the prompt via stdin (positional "-" tells codex exec to
+            # read it from stdin). Avoids leaking the prompt — which may
+            # contain the full transcript, problem statement, or persona
+            # material — to other users via `ps` / process inspection.
+            argv.append("-")
 
             try:
                 proc = self._run(
-                    argv, input="", capture_output=True, text=True, timeout=self._timeout
+                    argv, input=prompt, capture_output=True, text=True, timeout=self._timeout
                 )
             except subprocess.TimeoutExpired as exc:
                 return _error_result(
@@ -167,10 +171,11 @@ class CodexCliProvider(ProviderAdapter):
 
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
+            kind, retriable = _classify_cli_exit(stderr)
             return _error_result(
-                "internal",
+                kind,
                 f"codex CLI exited {proc.returncode}: {stderr[:500] or '<no stderr>'}",
-                retriable=False,
+                retriable=retriable,
             )
 
         agent_text, usage_event, error_event = _parse_jsonl(proc.stdout or "")
@@ -285,11 +290,44 @@ def _parse_jsonl(stdout: str):
     return agent_text, usage_event, error_event
 
 
+def _safe_int(v: Any) -> int:
+    """Coerce a CLI-reported usage value to int; malformed → 0 (never raises)."""
+    if v is None:
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _classify_cli_exit(stderr: str) -> tuple[str, bool]:
+    """Map a non-zero codex CLI exit to (error.kind, retriable).
+
+    Looks for well-known phrases in stderr / stdout-tail. Falls back to
+    `internal` non-retriable for unknown exits. Keeps the runtime in line
+    with the closed §6.6 ErrorKind enum.
+    """
+    s = (stderr or "").lower()
+    if "rate" in s and "limit" in s:
+        return ("rate_limit", True)
+    if "quota" in s or "exceeded" in s:
+        return ("quota_exhausted", False)
+    if "auth" in s or "unauthor" in s or "forbidden" in s or "login" in s:
+        return ("auth_failure", False)
+    if "context" in s and "length" in s:
+        return ("context_length_exceeded", False)
+    if "timeout" in s or "timed out" in s:
+        return ("timeout", True)
+    if "network" in s or "connection" in s or "dns" in s:
+        return ("network", True)
+    return ("internal", False)
+
+
 def _usage_from_event(usage_event: Optional[Dict[str, Any]]) -> Usage:
     u = usage_event or {}
-    prompt = int(u.get("input_tokens", 0) or 0) + int(u.get("cached_input_tokens", 0) or 0)
+    prompt = _safe_int(u.get("input_tokens")) + _safe_int(u.get("cached_input_tokens"))
     completion = (
-        int(u.get("output_tokens", 0) or 0) + int(u.get("reasoning_output_tokens", 0) or 0)
+        _safe_int(u.get("output_tokens")) + _safe_int(u.get("reasoning_output_tokens"))
     )
     # Codex exec reports no cost; under a subscription login there is no
     # metered charge anyway → cost 0.0 + estimated so the metrics flag it.

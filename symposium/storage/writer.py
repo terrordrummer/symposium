@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 from pathlib import Path
@@ -17,6 +18,45 @@ from symposium.models import (
 )
 from symposium.storage.digest import serialize_pretty
 from symposium.storage.paths import RunDirectory
+
+
+_LOCKFILE_NAME = ".lock"
+
+
+class RunDirectoryLocked(RuntimeError):
+    """Raised when a second RunWriter tries to start() against an in-use run dir."""
+
+
+def _is_stale_lock(lock_path: Path) -> bool:
+    """Return True iff `lock_path` exists and names a non-running pid.
+
+    Best-effort: reads the pid token from the lockfile (first whitespace-
+    separated field) and signals 0 to test liveness. If we cannot determine
+    aliveness (parse failure, ESRCH on a foreign pid we cannot signal), we
+    treat the lock as live (safe-by-default — false positives on stale
+    detection are worse than slow recovery).
+    """
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            token = f.read().strip().split()
+        if not token:
+            return False
+        pid = int(token[0])
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True  # confirmed dead
+    except PermissionError:
+        return False  # pid exists but in another user's session
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ESRCH:
+            return True
+        return False
+    return False
 
 PRODUCER_NAME = "symposium-py"
 # The §7.6 condition-#1 "runtime" reproduction-surface identity, NOT the
@@ -45,6 +85,7 @@ class RunWriter:
     def __init__(self, run_dir: RunDirectory) -> None:
         self.run_dir = run_dir
         self._journal_fp = None
+        self._lock_path: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,8 +93,32 @@ class RunWriter:
 
     def start(self, config: Config, started_at: str) -> None:
         self.run_dir.ensure()
-        config_dump = config.model_dump(mode="json", exclude_none=True)
-        _atomic_write_text(self.run_dir.config_path, serialize_pretty(config_dump))
+        # Acquire an exclusive lock on the run dir so two writers cannot
+        # race on the same `session_id`. O_EXCL + O_CREAT is atomic on
+        # POSIX and on Windows for the same volume; we hold the lock for
+        # the lifetime of this writer. If a previous run crashed and left
+        # a stale lockfile (pid no longer alive), we break it and proceed —
+        # otherwise crashed runs would block the same session_id forever.
+        self._lock_path = Path(self.run_dir.base) / _LOCKFILE_NAME
+        try:
+            self._acquire_lock(started_at)
+        except RunDirectoryLocked:
+            if _is_stale_lock(self._lock_path):
+                try:
+                    os.unlink(self._lock_path)
+                except FileNotFoundError:
+                    pass
+                self._acquire_lock(started_at)
+            else:
+                raise
+
+        try:
+            config_dump = config.model_dump(mode="json", exclude_none=True)
+            _atomic_write_text(self.run_dir.config_path, serialize_pretty(config_dump))
+        except Exception:
+            # Pre-journal failure: release the lock so the dir is not stuck.
+            self._release_lock()
+            raise
 
         in_progress = RunManifest(
             session_id=config.session_id,
@@ -132,6 +197,39 @@ class RunWriter:
         )
         self._write_manifest(final_manifest)
 
+        # Release the exclusive lock now that the run has been fully persisted.
+        self._release_lock()
+
+    def _acquire_lock(self, started_at: str) -> None:
+        try:
+            fd = os.open(
+                str(self._lock_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o644,
+            )
+        except FileExistsError as exc:
+            raise RunDirectoryLocked(
+                f"run directory {self.run_dir.base!s} is already held by another writer "
+                f"(lockfile present); refusing to start a second writer"
+            ) from exc
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()} {started_at}\n")
+
+    def _release_lock(self) -> None:
+        if self._lock_path is None:
+            return
+        try:
+            os.unlink(self._lock_path)
+        except FileNotFoundError:
+            pass
+        self._lock_path = None
+
+    def __del__(self) -> None:  # best-effort lock release on GC
+        try:
+            self._release_lock()
+        except Exception:  # noqa: BLE001
+            pass
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -144,15 +242,33 @@ class RunWriter:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write text atomically by writing to a sibling tempfile then renaming.
 
-    `os.replace` is atomic on POSIX and on Windows for same-volume
-    renames; this is enough to satisfy §7.4 for the MVP.
+    Order of operations: write → flush → fsync → rename → fsync(dir). The
+    extra fsync of the parent directory makes the rename durable across a
+    crash on POSIX file systems (without it, a post-crash recovery may see
+    the file under its old name or not at all). `os.replace` is atomic on
+    POSIX and on Windows for same-volume renames; the fsyncs make the
+    durability promise survive power loss.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # fsync not supported (e.g. some Windows / shared FS)
         os.replace(tmp_path, path)
+        # Fsync the parent directory so the rename is durable.
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, AttributeError):
+            pass  # not supported on Windows or some filesystems
     except Exception:
         try:
             os.unlink(tmp_path)

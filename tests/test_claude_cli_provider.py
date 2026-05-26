@@ -103,15 +103,17 @@ def test_argv_and_stdin_translation():
     argv = runner.calls[0]["argv"]
     assert argv[:4] == ["claude", "-p", "--output-format", "json"]
     assert "--model" in argv and argv[argv.index("--model") + 1] == "opus"
-    # system message → --system-prompt; it is NOT in the stdin body
-    assert "--system-prompt" in argv
-    assert argv[argv.index("--system-prompt") + 1] == "You are the logician."
+    # The system block is folded into stdin behind a `[SYSTEM]` sentinel —
+    # never on argv (visible to `ps`).
+    assert "--system-prompt" not in argv
     # the expected schema is passed via --json-schema
     assert "--json-schema" in argv
     schema = json.loads(argv[argv.index("--json-schema") + 1])
     assert "text" in schema["properties"]
-    # the user content is fed on stdin, not the system content
-    assert runner.calls[0]["input"] == "Should we adopt the protocol?"
+    stdin_payload = runner.calls[0]["input"]
+    assert "[SYSTEM]" in stdin_payload
+    assert "You are the logician." in stdin_payload
+    assert "Should we adopt the protocol?" in stdin_payload
 
 
 def test_verdict_schema_is_passed():

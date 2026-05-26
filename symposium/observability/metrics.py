@@ -303,6 +303,7 @@ def compute_metrics(artifact: Artifact) -> ObservabilityMetrics:
         primary_meta=primary_meta,
         same_round_branches=same_round_branches,
         cross_round_drains_by_round=cross_round_drains_by_round,
+        max_drains_per_round=artifact.config.runtime.max_deferred_drains_per_round,
     )
 
     # ---- Build typed output models ---------------------------------------
@@ -389,6 +390,7 @@ def _derive_deferred_queue_max(
     primary_meta: Dict[str, Dict[str, int]],
     same_round_branches: Dict[str, int],
     cross_round_drains_by_round: Dict[int, int],
+    max_drains_per_round: int = 1,
 ) -> int:
     """Heuristic derivation of `deferred_queue_length_max` from a transcript.
 
@@ -441,12 +443,15 @@ def _derive_deferred_queue_max(
     sorted_rounds = sorted(rounds_seen)
     for idx, r in enumerate(sorted_rounds):
         # Drain at round open (skip the first deliberation round — the
-        # queue is empty before any primary_turn fires).
-        if idx > 0 and queue > 0:
+        # queue is empty before any primary_turn fires). The runtime cap
+        # `max_deferred_drains_per_round` is authoritative — when it is
+        # 0 no drain occurs, when it is N up to N items leave the queue.
+        # Observed cross-round drains in the transcript serve as a cross-
+        # check: never over-drain beyond the runtime cap or the queue size.
+        if idx > 0 and queue > 0 and max_drains_per_round > 0:
             drains_observed = cross_round_drains_by_round.get(r, 0)
-            # Honour observed drains up to current queue (defaults to 1
-            # when the transcript ratifies a single drain).
-            drains = min(queue, max(1, drains_observed)) if drains_observed else min(queue, 1)
+            target = drains_observed if drains_observed else max_drains_per_round
+            drains = min(queue, max_drains_per_round, target)
             queue -= drains
         for primary_id in primaries_per_round[r]:
             meta = primary_meta[primary_id]
