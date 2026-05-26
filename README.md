@@ -315,12 +315,17 @@ it for fake-driven, deterministic runs:
 }
 ```
 
-The server exposes three tools:
+The server exposes four tools:
 
 - **`deliberate(problem, …)`** — build a `Config` from arguments (panel
   persona ids resolved into inline personas exactly as the CLI does), run a
   session, and return `{outcome, synthesis_answer | termination_reason,
   selected_agents, transcript_digest, cumulative_usage, run_dir, rounds}`.
+- **`deliberate_streaming(problem, …)`** — same arguments and same final
+  result as `deliberate`, but streams each turn **live as the panel
+  produces it** (every agent turn, each coordinator verdict, the final
+  synthesis) via MCP progress + log notifications, so you can follow the
+  discussion as it evolves instead of waiting for the whole session.
 - **`get_run_summary(run_dir)`** — load a persisted run, recompute the §7.9
   metrics, verify the §7.5 transcript replay, and return a compact summary.
 - **`list_personas()`** — the six built-in personas (R3 default panel +
