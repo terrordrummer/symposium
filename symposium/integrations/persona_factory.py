@@ -1,0 +1,181 @@
+"""Generate new Symposium personas from a capability need (host layer).
+
+This is the "create an agent" half of dynamic panels. A capability gap —
+surfaced by the §4.1 selector's `missing_capabilities`, by a coordinator
+that asks for a domain expert, or by an up-front problem analysis — is
+turned into a valid `Persona` by asking a terminal CLI (`claude` / `codex`)
+to design one, with the model's output constrained to the **`Persona`
+JSON Schema** and then validated against the frozen `Persona` model.
+
+It changes nothing in the runtime, spec, or schemas: a generated persona
+is an ordinary inline `Persona` object, identical in kind to the built-in
+panel. The CLI `caller` is injectable, so tests never spawn a real CLI.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import tempfile
+from typing import Any, Callable, Dict, Iterable, Optional
+
+from symposium.models import Persona
+
+# A caller turns (prompt, json_schema) into a parsed JSON object (the
+# candidate persona). Injectable so tests pass a canned object.
+PersonaCaller = Callable[[str, Dict[str, Any]], Dict[str, Any]]
+
+_ARCHITECT_SYSTEM = (
+    "You are a persona architect for a structured, adversarial deliberation panel. "
+    "Given a capability need, design exactly ONE expert persona as a strict JSON "
+    "object that conforms to the provided JSON Schema. Rules: "
+    "(1) persona_class MUST be 'domain' for a subject-matter expert; "
+    "(2) a 'domain' persona MUST include non-empty domain_scope, forbidden_domains, "
+    "and must_delegate (a map of out-of-scope topic -> which kind of agent handles it); "
+    "(3) id is a short lowercase slug (e.g. 'cryptographer'); "
+    "(4) behavioral_constraints and failure_modes each have at least one concrete item; "
+    "(5) output ONLY the JSON object, no prose."
+)
+
+
+class PersonaGenerationError(RuntimeError):
+    """The CLI did not return a schema-valid persona."""
+
+
+def generate_persona(
+    need: str,
+    *,
+    caller: PersonaCaller,
+    persona_class: str = "domain",
+    existing_ids: Iterable[str] = (),
+) -> Persona:
+    """Design one `Persona` for `need` and return it validated.
+
+    Args:
+        need: the capability/expertise the panel is missing (free text).
+        caller: `(prompt, json_schema) -> dict` — the CLI call. Use
+            :func:`make_cli_persona_caller` for the default terminal-CLI
+            implementation, or inject a canned one in tests.
+        persona_class: "domain" (default, a subject expert) or "horizontal".
+        existing_ids: ids already on the panel — the result is renamed to
+            avoid a collision.
+
+    Raises:
+        PersonaGenerationError: the CLI output is missing or fails
+            `Persona` validation.
+    """
+    schema = Persona.model_json_schema()
+    existing = set(existing_ids)
+    prompt = (
+        f"Capability the panel is missing:\n{need}\n\n"
+        f"Design a persona_class='{persona_class}' persona to cover it. "
+        f"Do not reuse these ids: {sorted(existing) or 'none'}."
+    )
+    try:
+        obj = caller(prompt, schema)
+    except Exception as exc:  # noqa: BLE001 — surface any caller failure uniformly
+        raise PersonaGenerationError(f"persona caller failed: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise PersonaGenerationError("persona caller did not return a JSON object")
+    obj.setdefault("persona_class", persona_class)
+    try:
+        persona = Persona.model_validate(obj)
+    except Exception as exc:  # noqa: BLE001 — invalid persona is a generation failure
+        raise PersonaGenerationError(f"generated persona failed validation: {exc}") from exc
+    if persona.id in existing:
+        persona = persona.model_copy(update={"id": _dedupe_id(persona.id, existing)})
+    return persona
+
+
+def _dedupe_id(base: str, existing: set) -> str:
+    n = 2
+    while f"{base}-{n}" in existing:
+        n += 1
+    return f"{base}-{n}"
+
+
+# ---------------------------------------------------------------------------
+# Default terminal-CLI caller (claude preferred, codex fallback)
+# ---------------------------------------------------------------------------
+
+
+def make_cli_persona_caller(
+    *,
+    prefer: str = "claude",
+    timeout: float = 120.0,
+    runner: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+) -> PersonaCaller:
+    """Build a `PersonaCaller` that asks an installed CLI to design a persona.
+
+    Prefers `claude` (strong at strict JSON) and falls back to `codex`;
+    raises if neither is installed. `runner` is injectable for tests.
+    """
+    run = runner or subprocess.run
+    claude_ok = runner is not None or shutil.which("claude") is not None
+    codex_ok = runner is not None or shutil.which("codex") is not None
+
+    order = ["claude", "codex"] if prefer == "claude" else ["codex", "claude"]
+    order = [c for c in order if (claude_ok if c == "claude" else codex_ok)]
+    if not order:
+        raise PersonaGenerationError(
+            "no CLI available to generate a persona (need `claude` or `codex`)"
+        )
+
+    def _caller(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        last_err = None
+        for cli in order:
+            try:
+                if cli == "claude":
+                    return _claude_call(prompt, schema, run=run, timeout=timeout)
+                return _codex_call(prompt, schema, run=run, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 — try the next CLI
+                last_err = exc
+        raise PersonaGenerationError(f"all CLIs failed to generate a persona: {last_err}")
+
+    return _caller
+
+
+def _claude_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
+    proc = run(
+        ["claude", "-p", "--output-format", "json", "--model", "sonnet",
+         "--system-prompt", _ARCHITECT_SYSTEM, "--json-schema", json.dumps(schema)],
+        input=prompt, capture_output=True, text=True, timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise PersonaGenerationError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
+    data = json.loads(proc.stdout)
+    obj = data.get("structured_output")
+    if not isinstance(obj, dict):
+        raise PersonaGenerationError("claude returned no structured_output")
+    return obj
+
+
+def _codex_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
+    tmp = tempfile.mkdtemp(prefix="symposium-persona-")
+    try:
+        schema_path = f"{tmp}/schema.json"
+        with open(schema_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(schema))
+        proc = run(
+            ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only",
+             "-C", tmp, "--output-schema", schema_path, f"{_ARCHITECT_SYSTEM}\n\n{prompt}"],
+            input="", capture_output=True, text=True, timeout=timeout,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if proc.returncode != 0:
+        raise PersonaGenerationError(f"codex exited {proc.returncode}: {proc.stderr[:300]}")
+    text = None
+    for line in (proc.stdout or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "item.completed":
+            item = ev.get("item") or {}
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                text = item["text"]
+    if not text:
+        raise PersonaGenerationError("codex returned no agent_message")
+    return json.loads(text)

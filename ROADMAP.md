@@ -74,3 +74,14 @@ runtime. These are downstream of the protocol, not part of it.
   personas → claude) with installed-CLI fallback, and is the default for
   the MCP `deliberate` tools. Pure registry / host extensions — no spec /
   schema / runtime changes.
+- ✅ **Dynamic agent generation (v1.8.0)** — `generate_persona` designs a
+  new domain-expert `Persona` from a capability need (CLI output
+  constrained to the `Persona` schema, then validated), and
+  `deliberate_adaptive` grows the panel two ways: *early-start* (generate
+  experts before the first session) and *runtime* (on a
+  `user_input_required` / `external_research_required` termination,
+  generate the needed expert and continue in a linked session with the
+  augmented panel). Host-orchestrated over the frozen runtime — it
+  realizes the §12 "dynamic participant introduction" / persona-creation
+  intent **without** in-loop panel mutation or any spec / schema change
+  (true in-loop mutation remains a v1+/Roadmap runtime concern).
