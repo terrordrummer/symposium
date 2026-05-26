@@ -334,8 +334,12 @@ The server exposes four tools:
 A typical `deliberate` call from a Claude client:
 
 ```jsonc
-// real Anthropic providers (reads ANTHROPIC_API_KEY from the env)
+// default: drives the local `claude` CLI in your terminal — NO API key,
+// it reuses Claude Code's existing login (provider="claude-cli")
 deliberate(problem="Should we adopt a structured deliberation protocol?")
+
+// real HTTP API instead (reads ANTHROPIC_API_KEY from the env)
+deliberate(problem="…", provider="anthropic")
 
 // deterministic, network-free (used by the tests and demos)
 deliberate(
@@ -344,6 +348,15 @@ deliberate(
   fake_script_path="examples/scripts/walking-skeleton.json"
 )
 ```
+
+**No API key needed.** The default `provider="claude-cli"` runs each
+panel turn through the locally-installed `claude` command
+(`claude -p --output-format json --json-schema …`), reusing the CLI's
+OAuth/keychain login. Each turn is a real, billed `claude` invocation, so
+a full panel run costs accordingly; use `provider="fake"` for free,
+deterministic demos. The HTTP adapters (`anthropic`, `openai`) remain
+available when you prefer an API key. The `claude-cli` provider also
+works from the plain CLI: `provider: claude-cli` in a config's agents.
 
 The `mcp` dependency is optional: `import symposium` and the `symposium`
 CLI work without it. See `symposium/integrations/mcp_server.py`.
@@ -361,7 +374,7 @@ CLI work without it. See `symposium/integrations/mcp_server.py`.
 │       └── examples/             # 28 positive + 36 negative fixtures + validators
 ├── symposium/                    # Reference Python runtime
 │   ├── models.py                 # Pydantic models mirroring the JSON Schemas
-│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic adapters
+│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic/Claude-CLI adapters
 │   ├── selector/                 # §4.1 selector: fixed / rules / llm strategies
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest

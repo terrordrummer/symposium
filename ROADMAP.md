@@ -19,7 +19,8 @@ v1.0.0; the reference Python runtime implements the Core MVP MUST-set
 - ✅ MVP default panel (R3): logician / visionary / researcher / critic /
   engineer + coordinator
 - ✅ Provider adapters: deterministic `FakeProvider`, OpenAI-shaped (§6.12),
-  Anthropic-shaped (§6.13), in-process registry (§6.11)
+  Anthropic-shaped (§6.13), terminal `ClaudeCliProvider` (drives the local
+  `claude` CLI, no API key — v1.7.0), in-process registry (§6.11)
 - ✅ `transcript_replay` (§7.5) + `execution_replay` under the ten §7.6
   pinning conditions
 - ✅ §7.9 MVP observability metric set (offline, derived from the Artifact)
@@ -63,3 +64,9 @@ runtime. These are downstream of the protocol, not part of it.
   `[mcp]` extra; the core install and CLI are unchanged. See the README
   "Use in Claude Code" section. This realizes the §12 "HTTP / RPC service
   host pattern" / IDE-integration line as a pure consumer of the public API.
+- ✅ **Claude-CLI provider (`claude-cli`, v1.7.0)** — a `ProviderAdapter`
+  that drives deliberation turns through the locally-installed `claude`
+  command (`claude -p --output-format json --json-schema …`) instead of
+  the HTTP API, reusing the CLI's existing login so **no API key** is
+  needed. Default provider for the MCP `deliberate` tools. A pure registry
+  extension — no spec / schema / runtime changes.

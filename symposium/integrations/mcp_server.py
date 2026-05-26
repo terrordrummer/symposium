@@ -98,7 +98,7 @@ def deliberate(
     *,
     panel: Optional[List[str]] = None,
     coordinator: str = "coordinator",
-    provider: str = "anthropic",
+    provider: str = "claude-cli",
     model: Optional[str] = None,
     selector_strategy: str = "fixed",
     max_rounds: int = 4,
@@ -122,12 +122,13 @@ def deliberate(
             the R3 default panel (logician, visionary, researcher, critic,
             engineer).
         coordinator: built-in coordinator persona id (default "coordinator").
-        provider: adapter id every agent uses — "anthropic" (default),
-            "openai", or "fake". Real providers read their API key from the
-            environment; "fake" requires `fake_script_path`.
-        model: provider model string. Defaults per provider (Anthropic:
-            the example-config model; OpenAI: a sane default; fake:
-            "fake-deterministic").
+        provider: adapter id every agent uses — "claude-cli" (default;
+            drives the local `claude` CLI in your terminal, no API key),
+            "anthropic" / "openai" (HTTP API, read their key from the env),
+            or "fake" (requires `fake_script_path`).
+        model: provider model string. Defaults per provider (claude-cli:
+            the "sonnet" alias; Anthropic: the example-config model;
+            OpenAI: a sane default; fake: "fake-deterministic").
         selector_strategy: §4.1 selector — "fixed" (default), "rules"
             (deterministic persona-metadata match, no provider call), or
             "llm" (one bounded provider call; needs `selector_fake_script_path`
@@ -182,7 +183,7 @@ async def deliberate_streaming(
     *,
     panel: Optional[List[str]] = None,
     coordinator: str = "coordinator",
-    provider: str = "anthropic",
+    provider: str = "claude-cli",
     model: Optional[str] = None,
     selector_strategy: str = "fixed",
     max_rounds: int = 4,
@@ -333,7 +334,7 @@ def stream_deliberation(
     *,
     panel: Optional[List[str]] = None,
     coordinator: str = "coordinator",
-    provider: str = "anthropic",
+    provider: str = "claude-cli",
     model: Optional[str] = None,
     selector_strategy: str = "fixed",
     max_rounds: int = 4,
@@ -689,6 +690,9 @@ def _resolve_persona(persona_id: str) -> Persona:
 def _default_model(provider: str) -> str:
     if provider == "fake":
         return "fake-deterministic"
+    if provider == "claude-cli":
+        # Model alias understood by the `claude` CLI (no API key needed).
+        return "sonnet"
     if provider == "anthropic":
         return _anthropic_example_model()
     if provider == "openai":
