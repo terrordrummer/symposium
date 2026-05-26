@@ -300,16 +300,23 @@ The reference implementation's near-term work is biased toward
   repository structure, roadmap, and core philosophy. The work
   product to date — `docs/specification.md`, the v1.0.0 JSON
   schemas, this companion file — is the Phase 1 deliverable.
-- **Implementation milestones (Phase 1 build-out)** — when
-  building the reference runtime: transcript system,
-  `orchestrator_runtime` loop, the MVP default panel
-  (logician / visionary / researcher / critic / engineer), a
-  minimal ProviderAdapter pair (OpenAI-shaped, Anthropic-shaped),
-  and the CLI (§11.2 of the spec).
+- **Implementation milestones (Phase 1 build-out)** — **complete
+  (released as `v1.5.0`).** The reference runtime ships the
+  transcript system + RFC-8785 digest, the `orchestrator_runtime`
+  loop (§4.11), the MVP default panel (logician / visionary /
+  researcher / critic / engineer + coordinator), the ProviderAdapter
+  pair (OpenAI-shaped §6.12, Anthropic-shaped §6.13) plus the
+  deterministic FakeProvider, the §7.9 MVP observability metric set,
+  `transcript_replay` (§7.5) + `execution_replay` (§7.6), the §4.1
+  selector across all three strategies (`fixed` / `rules` / `llm`,
+  §5.11), and the CLI (§11.2: `run` / `replay` / `validate` /
+  `metrics` / `execution-replay`). Delivered over milestones M1–M6.
 - **Beyond Phase 1** — all subsequent feature work is governed
   by spec §12 (Roadmap) and §13 (Vision), not by this file.
   See spec §12.1 for the Roadmap principles and §12.2 for the
-  aggregation table.
+  aggregation table. The near-term Phase-1+ targets are the §7.10
+  v1 observability set and the §12.2 items the maintainer
+  prioritises.
 
 The deliberate emphasis is to invite community feedback,
 architectural refinement, and contributor discussion **before**
