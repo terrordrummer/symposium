@@ -80,10 +80,15 @@ and an Anthropic-shaped HTTP adapter (for real-model sessions against
 `api.anthropic.com` or any Anthropic-Messages-compatible endpoint).
 Every flow produces a persisted, byte-identically replayable artifact.
 
+The distribution name is `symposium-protocol`; the import package is
+`symposium` (cf. scikit-learn → sklearn).
+
 ```bash
-# Stable install (PyPI). Distribution name is `symposium-protocol`;
-# the import package is `symposium` (cf. scikit-learn → sklearn).
+# Stable install (PyPI)
 pip install symposium-protocol      # then: import symposium
+
+# Released tag, straight from GitHub (works without PyPI)
+pip install "git+https://github.com/terrordrummer/symposium@v1.5.0"
 
 # Development install (editable, from a clone)
 git clone https://github.com/terrordrummer/symposium
