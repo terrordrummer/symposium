@@ -1,0 +1,75 @@
+# LLM-selector session config. Exercises the §4.1 `llm` strategy: one
+# bounded provider invocation (the §6.2 `null` free-text path, driven by
+# the coordinator agent's provider/model) chooses the panel. The selector
+# call is scripted separately from the deliberation:
+#
+#   symposium run --config examples/configs/llm-selector.yaml \
+#                 --selector-script examples/scripts/llm-selector.json \
+#                 --script examples/scripts/walking-skeleton.json
+#
+# `selector_budget` is REQUIRED for strategy = llm (§5.2); the selector's
+# usage is budgeted against it and never enters Artifact.cumulative_usage.
+
+schema_version: "1.0.0"
+session_id: "demo-llm-selector-001"
+originator: "user"
+problem_statement: |
+  Should we adopt a structured deliberation protocol for AI agent
+  collaboration, or continue with ad-hoc group-chat orchestration?
+
+selector:
+  strategy: "llm"
+  default_deliberation_panel:
+    - logician
+    - visionary
+    - researcher
+    - critic
+    - engineer
+  coordinator_agent: "coordinator"
+  selector_budget:
+    max_tokens: 5000
+    max_cost_usd: 0.50
+
+agents:
+  - id: logician
+    persona_ref: logician
+    provider: fake
+    model: fake-deterministic
+  - id: visionary
+    persona_ref: visionary
+    provider: fake
+    model: fake-deterministic
+  - id: researcher
+    persona_ref: researcher
+    provider: fake
+    model: fake-deterministic
+  - id: critic
+    persona_ref: critic
+    provider: fake
+    model: fake-deterministic
+  - id: engineer
+    persona_ref: engineer
+    provider: fake
+    model: fake-deterministic
+
+coordinator:
+  id: coordinator
+  persona_ref: coordinator
+  provider: fake
+  model: fake-deterministic
+
+budget:
+  max_total_tokens: 100000
+  max_total_cost_usd: 5.0
+  max_rounds: 4
+  max_wallclock_seconds: 60
+
+runtime:
+  max_branch_depth: 1
+  max_deferred_queue_length: 8
+  max_deferred_drains_per_round: 1
+  on_agent_failure: "terminate"
+  per_agent_retry_budget: 2
+  on_budget_exceeded: "stop"
+  observability_level: "mvp"
+  max_tool_iterations: 8

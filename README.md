@@ -129,6 +129,50 @@ symposium run \
   examples/problem.md
 ```
 
+### Selecting the panel
+
+Before round 1 the §4.1 **selector** chooses the active deliberation
+panel and binds the coordinator. `Config.selector.strategy` picks one of
+three strategies, each emitting a schema-valid `SelectorOutput`
+(§5.11) written to `<run_dir>/selector_output.json` on every run:
+
+- **`fixed`** (default, MVP/R3) — degenerate: the panel is the declared
+  `default_deliberation_panel` and the coordinator is the declared
+  `coordinator_agent`. Makes **no** provider call.
+- **`rules`** — pure, deterministic. Matches each agent's persona
+  metadata (`reasoning_scope` / `domain_scope`) against the
+  `problem_statement` via a transparent keyword table; records dropped
+  agents in `excluded_agents`. No provider call, so the same `(config)`
+  yields a byte-identical decision (and stays replayable under §7.6).
+- **`llm`** — one bounded provider invocation (the §6.2
+  `expected_output_schema = null` free-text path, driven by the
+  coordinator agent's `provider`/`model`) parsed into a `SelectorOutput`.
+  Requires a `selector_budget` (§5.2); its usage is budgeted separately
+  and never enters `Artifact.cumulative_usage` or the `transcript_digest`.
+  For fake sessions, script the single selector call with
+  `--selector-script` (mirrors `--script`).
+
+```bash
+# rules: deterministic, no model call
+symposium run \
+  --config examples/configs/rules-selector.yaml \
+  --script examples/scripts/walking-skeleton.json \
+  --output runs/
+
+# llm: one bounded selector call (separate fake script) + deliberation
+symposium run \
+  --config examples/configs/llm-selector.yaml \
+  --selector-script examples/scripts/llm-selector.json \
+  --script examples/scripts/walking-skeleton.json \
+  --output runs/
+# → stdout: selector_strategy=… / selected_agents=…
+# → <run_dir>/selector_output.json
+```
+
+The selector is a distinct ADR-005 role: it chooses *who* deliberates,
+emits no `canonical_transcript` message, and an empty/malformed selection
+terminates the session with `reason = schema_error` before round 1.
+
 ### Inspecting metrics
 
 Every persisted run directory can be analysed offline with `symposium
@@ -240,13 +284,14 @@ except PinningViolation as exc:
 ├── symposium/                    # Reference Python runtime
 │   ├── models.py                 # Pydantic models mirroring the JSON Schemas
 │   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic adapters
+│   ├── selector/                 # §4.1 selector: fixed / rules / llm strategies
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest
 │   ├── replay/                   # transcript_replay (§7.5) + execution_replay (§7.6)
 │   ├── observability/            # §7.9 MVP metric set (offline)
 │   ├── personas/                 # MVP default panel (R3)
 │   └── cli/                      # `symposium` command
-├── examples/                     # Walking-skeleton config + script
+├── examples/                     # Walking-skeleton + rules/llm selector configs + scripts
 ├── tests/                        # pytest suite (FakeProvider determinism,
 │                                 #   scheduler invariants, e2e schema
 │                                 #   validation, replay byte-identity)

@@ -24,6 +24,7 @@ from symposium.models import (
     ProviderRequest,
     ProviderResult,
     RunManifest,
+    SelectorOutput,
     SynthesisContent,
     TerminationArtifact,
     TurnStructuredOutput,
@@ -41,6 +42,7 @@ __all__ = [
     "ProviderRequest",
     "ProviderResult",
     "RunManifest",
+    "SelectorOutput",
     "SynthesisContent",
     "TerminationArtifact",
     "TurnStructuredOutput",
@@ -58,4 +60,8 @@ def __getattr__(name: str):
         from symposium.scheduler import Session, run_session  # type: ignore
 
         return {"Session": Session, "run_session": run_session}[name]
+    if name == "run_selector":
+        from symposium.selector import run_selector  # type: ignore
+
+        return run_selector
     raise AttributeError(f"module 'symposium' has no attribute {name!r}")

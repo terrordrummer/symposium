@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Single §4.1 llm-selector invocation. The model returns the panel decision as a JSON object in its free-text assistant message (the §6.2 expected_output_schema=null path); the selector component parses it into a SelectorOutput. Selects the full default panel so examples/scripts/walking-skeleton.json can drive the deliberation unchanged. usage is well within examples/configs/llm-selector.yaml's selector_budget.",
+  "on_exhaustion": "error",
+  "entries": [
+    {
+      "comment": "selector decision (free-text JSON)",
+      "result": {
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "{\"selected_agents\": [\"logician\", \"visionary\", \"researcher\", \"critic\", \"engineer\"], \"coordinator_agent\": \"coordinator\", \"reasoning\": \"The protocol-vs-ad-hoc question needs formal structure (logician), reframing (visionary), prior-art evidence (researcher), failure analysis (critic), and implementation cost (engineer) — the full default panel.\"}"
+          }
+        ],
+        "tool_events": [],
+        "usage": { "prompt_tokens": 180, "completion_tokens": 120, "total_tokens": 300, "cost_usd": 0.0018 },
+        "finish_reason": "stop",
+        "structured_output": null,
+        "raw": null,
+        "error": null
+      }
+    }
+  ]
+}

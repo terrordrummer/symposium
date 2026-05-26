@@ -1,0 +1,74 @@
+# Rules-selector session config. Exercises the §4.1 `rules` strategy: the
+# selector matches each agent's persona `reasoning_scope` against the
+# problem_statement via the transparent keyword table in
+# `symposium/selector/rules.py`. The problem below carries a trigger for
+# every default-panel scope (formal-structural, lateral-creative,
+# evidence-based, adversarial-scrutiny, implementation-feasibility), so all
+# five agents are selected and the walking-skeleton FakeProvider script
+# (`examples/scripts/walking-skeleton.json`) drives the deliberation
+# unchanged. Run:
+#
+#   symposium run --config examples/configs/rules-selector.yaml \
+#                 --script examples/scripts/walking-skeleton.json
+
+schema_version: "1.0.0"
+session_id: "demo-rules-selector-001"
+originator: "user"
+problem_statement: |
+  Design a novel deliberation system: prove it is logically consistent,
+  research the supporting evidence, weigh the security risk of each
+  failure mode, and estimate the cost to build and deploy it.
+
+selector:
+  strategy: "rules"
+  default_deliberation_panel:
+    - logician
+    - visionary
+    - researcher
+    - critic
+    - engineer
+  coordinator_agent: "coordinator"
+
+agents:
+  - id: logician
+    persona_ref: logician
+    provider: fake
+    model: fake-deterministic
+  - id: visionary
+    persona_ref: visionary
+    provider: fake
+    model: fake-deterministic
+  - id: researcher
+    persona_ref: researcher
+    provider: fake
+    model: fake-deterministic
+  - id: critic
+    persona_ref: critic
+    provider: fake
+    model: fake-deterministic
+  - id: engineer
+    persona_ref: engineer
+    provider: fake
+    model: fake-deterministic
+
+coordinator:
+  id: coordinator
+  persona_ref: coordinator
+  provider: fake
+  model: fake-deterministic
+
+budget:
+  max_total_tokens: 100000
+  max_total_cost_usd: 5.0
+  max_rounds: 4
+  max_wallclock_seconds: 60
+
+runtime:
+  max_branch_depth: 1
+  max_deferred_queue_length: 8
+  max_deferred_drains_per_round: 1
+  on_agent_failure: "terminate"
+  per_agent_retry_budget: 2
+  on_budget_exceeded: "stop"
+  observability_level: "mvp"
+  max_tool_iterations: 8

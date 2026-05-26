@@ -2,11 +2,15 @@
 
 MVP subcommands:
 
-  symposium run --config CONFIG.yaml [--script SCRIPT.json] [--output runs/] [problem.md]
+  symposium run --config CONFIG.yaml [--script SCRIPT.json]
+                [--selector-script SCRIPT.json] [--output runs/] [problem.md]
       Runs a session. The runtime resolves `provider` strings on every
       agent (and on the coordinator) through the adapter registry
       (§6.11). The built-in registry ships `openai`; the `fake` adapter
-      is registered ad-hoc when `--script` is given.
+      is registered ad-hoc when `--script` is given. The §4.1 selector
+      runs first: `fixed` / `rules` make no provider call; `llm` makes one
+      bounded call driven by `--selector-script` (a separate FakeProvider).
+      Every run writes `<run_dir>/selector_output.json` (§5.11).
 
   symposium replay RUN_DIR
       Re-renders the stored canonical_transcript and verifies the
@@ -80,6 +84,16 @@ def main() -> None:
     help="FakeProvider script (JSON). Required when any agent declares `provider: fake`.",
 )
 @click.option(
+    "--selector-script", "selector_script_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help=(
+        "FakeProvider script (JSON) driving the §4.1 `llm` selector invocation "
+        "(mirrors --script). Used only when selector.strategy = llm; ignored "
+        "for fixed / rules."
+    ),
+)
+@click.option(
     "--output", "runs_root",
     type=click.Path(file_okay=False, path_type=Path),
     default=Path("runs"),
@@ -94,6 +108,7 @@ def main() -> None:
 def run_cmd(
     config_path: Path,
     script_path: Optional[Path],
+    selector_script_path: Optional[Path],
     runs_root: Path,
     problem_path: Optional[Path],
 ) -> None:
@@ -117,9 +132,26 @@ def run_cmd(
         click.echo(f"ERROR: {exc}", err=True)
         sys.exit(2)
 
-    artifact = run_session(config, providers, runs_root=str(runs_root))
+    # §4.1 `llm` selector: a distinct FakeProvider drives the single selector
+    # invocation so it never consumes deliberation-script entries.
+    selector_providers = None
+    if config.selector.strategy == "llm" and selector_script_path is not None:
+        sel_fp = FakeProvider(script=_load_script(selector_script_path))
+        selector_providers = {"default": sel_fp}
+
+    artifact = run_session(
+        config,
+        providers,
+        runs_root=str(runs_root),
+        selector_providers=selector_providers,
+    )
     run_dir = runs_root / config.session_id
     click.echo(f"session_id={config.session_id}")
+    click.echo(f"selector_strategy={config.selector.strategy}")
+    sel_path = run_dir / "selector_output.json"
+    if sel_path.exists():
+        selection = json.loads(sel_path.read_text())
+        click.echo(f"selected_agents={selection['selected_agents']}")
     click.echo(f"outcome.kind={artifact.outcome.kind}")
     click.echo(f"transcript_digest={artifact.transcript_digest}")
     click.echo(f"persisted_to={run_dir}/")
