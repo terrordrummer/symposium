@@ -19,6 +19,13 @@ from symposium.storage.digest import serialize_pretty
 from symposium.storage.paths import RunDirectory
 
 PRODUCER_NAME = "symposium-py"
+# The §7.6 condition-#1 "runtime" reproduction-surface identity, NOT the
+# package version (`symposium.__version__`). It pins the digest-bearing
+# runtime logic (canonicalization, id minting, packet derivation). M2–M6
+# added features without changing that surface for an unchanged Config (the
+# M6 `fixed` digest is byte-identical to M1), so it stays 1.0.0: runs
+# recorded by any 1.x build remain mutually execution-replayable. Bump it
+# only when the reproduction surface itself changes.
 PRODUCER_VERSION = "1.0.0"
 
 

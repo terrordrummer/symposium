@@ -81,10 +81,13 @@ and an Anthropic-shaped HTTP adapter (for real-model sessions against
 Every flow produces a persisted, byte-identically replayable artifact.
 
 ```bash
-# Install (editable, while the package is pre-PyPI)
+# Stable install (PyPI)
+pip install symposium
+
+# Development install (editable, from a clone)
 git clone https://github.com/terrordrummer/symposium
 cd symposium
-pip install -e .
+pip install -e ".[test]"
 ```
 
 ### Fake-driven session (no API key, no network)
@@ -296,7 +299,9 @@ except PinningViolation as exc:
 │                                 #   scheduler invariants, e2e schema
 │                                 #   validation, replay byte-identity)
 ├── pyproject.toml
-├── .github/workflows/validate.yml
+├── .github/workflows/             # validate (CI) + release (publish on tag)
+├── CONTRIBUTING.md
+├── ROADMAP.md                    # thin pointer to spec §12 (normative roadmap)
 ├── LICENSE                       # Apache 2.0
 └── README.md
 ```
