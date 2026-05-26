@@ -65,7 +65,7 @@ from symposium.scheduler import run_session
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
-@click.version_option(package_name="symposium")
+@click.version_option(package_name="symposium-protocol")
 def main() -> None:
     """Reference runtime for the Symposium 1.0 protocol."""
 
