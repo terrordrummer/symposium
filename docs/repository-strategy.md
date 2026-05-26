@@ -314,11 +314,13 @@ The reference implementation's near-term work is biased toward
 - **Host integrations (Phase B)** — **MCP server delivered
   (released as `v1.6.0`).** `symposium/integrations/mcp_server.py`
   wraps the runtime as a Model-Context-Protocol server
-  (`symposium-mcp`) exposing `deliberate` / `get_run_summary` /
-  `list_personas`, so a Claude client (Claude Code / Desktop /
-  claude.ai) can drive a deliberation over the stable
-  `run_session(...)` API. It is a pure consumer of the public API —
-  no spec / schema / runtime changes — gated behind the optional
+  (`symposium-mcp`) exposing `deliberate` / `deliberate_streaming` /
+  `get_run_summary` / `list_personas`, so a Claude client (Claude
+  Code / Desktop / claude.ai) can drive a deliberation over the stable
+  `run_session(...)` API — and, with `deliberate_streaming`, follow
+  each turn live as it is appended to the run journal. It is a pure
+  consumer of the public API — no spec / schema / runtime changes,
+  read-only over the persisted transcript — gated behind the optional
   `[mcp]` extra (spec §11.4 / §11.5; §12 "HTTP / RPC service host").
 - **Beyond Phase 1** — all subsequent feature work is governed
   by spec §12 (Roadmap) and §13 (Vision), not by this file.

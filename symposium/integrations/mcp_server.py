@@ -39,12 +39,16 @@ network-free path used by tests and demos is ``provider="fake"`` with a
 
 from __future__ import annotations
 
+import asyncio
 import json
+import queue
+import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from symposium.models import (
     AgentConfig,
@@ -144,73 +148,121 @@ def deliberate(
         ``{"error": "<kind>: <message>"}`` — the transport never crashes.
     """
     try:
-        panel_ids = list(panel) if panel else list(_DEFAULT_PANEL_IDS)
-        resolved_model = model or _default_model(provider)
-        session_id = f"mcp-{uuid.uuid4().hex}"
-
-        config = _build_config(
+        config, providers, selector_providers, run_dir, panel_ids = _prepare(
             problem=problem,
-            session_id=session_id,
-            panel_ids=panel_ids,
-            coordinator_id=coordinator,
+            panel=panel,
+            coordinator=coordinator,
             provider=provider,
-            model=resolved_model,
+            model=model,
             selector_strategy=selector_strategy,
             max_rounds=max_rounds,
             max_total_tokens=max_total_tokens,
             max_total_cost_usd=max_total_cost_usd,
             max_wallclock_seconds=max_wallclock_seconds,
+            fake_script_path=fake_script_path,
+            selector_fake_script_path=selector_fake_script_path,
+            output_dir=output_dir,
         )
-
-        registry = default_registry()
-        if provider == "fake":
-            if not fake_script_path:
-                raise ValueError(
-                    'provider="fake" requires fake_script_path (a FakeProviderScript JSON)'
-                )
-            fp = FakeProvider(script=_load_script(fake_script_path))
-            registry.register("fake", make_fake_factory(fp))
-
-        providers = registry.build_session_providers(config)
-
-        # §4.1 `llm` selector: a distinct provider drives the single selector
-        # invocation so it never consumes deliberation-script entries (mirrors
-        # the CLI's --selector-script). `fixed` / `rules` make no provider call.
-        selector_providers = None
-        if selector_strategy == "llm" and provider == "fake":
-            if not selector_fake_script_path:
-                raise ValueError(
-                    'selector_strategy="llm" with provider="fake" requires '
-                    "selector_fake_script_path"
-                )
-            sel_fp = FakeProvider(script=_load_script(selector_fake_script_path))
-            selector_providers = {"default": sel_fp}
-
         artifact = run_session(
             config,
             providers,
             runs_root=output_dir,
             selector_providers=selector_providers,
         )
-
-        run_dir = Path(output_dir) / session_id
-        result: Dict[str, Any] = {
-            "outcome": artifact.outcome.kind,
-            "selected_agents": _read_selected_agents(run_dir, fallback=panel_ids),
-            "transcript_digest": artifact.transcript_digest,
-            "cumulative_usage": artifact.cumulative_usage.model_dump(mode="json"),
-            "run_dir": str(run_dir),
-            "rounds": _max_round(artifact),
-        }
-        if artifact.outcome.kind == "synthesis":
-            result["synthesis_answer"] = _synthesis_answer(artifact)
-        else:
-            result["termination_reason"] = artifact.outcome.termination_artifact.reason
-        return result
+        return _build_result(artifact, run_dir, panel_ids)
     except (UnknownProviderError, MissingCredentialsError) as exc:
         return _error(exc)
     except Exception as exc:  # noqa: BLE001 — every failure is a structured result
         return _error(exc)
+
+
+@mcp.tool()
+async def deliberate_streaming(
+    problem: str,
+    *,
+    panel: Optional[List[str]] = None,
+    coordinator: str = "coordinator",
+    provider: str = "anthropic",
+    model: Optional[str] = None,
+    selector_strategy: str = "fixed",
+    max_rounds: int = 4,
+    max_total_tokens: int = 100000,
+    max_total_cost_usd: float = 5.0,
+    max_wallclock_seconds: int = 300,
+    fake_script_path: Optional[str] = None,
+    selector_fake_script_path: Optional[str] = None,
+    output_dir: str = "runs",
+    ctx: Context,
+) -> Dict[str, Any]:
+    """Like `deliberate`, but stream each turn live as the panel produces it.
+
+    Same arguments and same final return value as `deliberate`. The
+    difference is that while the deliberation runs, every transcript
+    message (each agent turn, each coordinator verdict, the final
+    synthesis) is pushed to the MCP client *as it is appended to the
+    run journal* — as a log notification (`ctx.info`, carrying the
+    speaker / type / a text preview) plus a numeric progress tick
+    (`ctx.report_progress`). This lets a Claude client follow the
+    discussion as it evolves instead of waiting for the whole session.
+
+    The streaming is read-only over the persisted journal: it changes
+    nothing about the deliberation, `transcript_digest`, replay, or
+    metrics. On any failure the streamed events stop and the final
+    return value is the structured `{"error": ...}` (the transport
+    never crashes).
+    """
+    events_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    _DONE = {"event": "__done__"}
+
+    def _producer() -> None:
+        try:
+            for ev in stream_deliberation(
+                problem,
+                panel=panel,
+                coordinator=coordinator,
+                provider=provider,
+                model=model,
+                selector_strategy=selector_strategy,
+                max_rounds=max_rounds,
+                max_total_tokens=max_total_tokens,
+                max_total_cost_usd=max_total_cost_usd,
+                max_wallclock_seconds=max_wallclock_seconds,
+                fake_script_path=fake_script_path,
+                selector_fake_script_path=selector_fake_script_path,
+                output_dir=output_dir,
+            ):
+                events_q.put(ev)
+        except Exception as exc:  # noqa: BLE001 — defensive; generator already wraps
+            events_q.put({"event": "error", "error": _error(exc)["error"]})
+        finally:
+            events_q.put(_DONE)
+
+    worker = threading.Thread(target=_producer, daemon=True)
+    worker.start()
+
+    loop = asyncio.get_running_loop()
+    final: Optional[Dict[str, Any]] = None
+    while True:
+        # Block off the event loop on the thread-safe queue without busy-waiting.
+        ev = await loop.run_in_executor(None, events_q.get)
+        if ev is _DONE:
+            break
+        kind = ev.get("event")
+        if kind == "message":
+            await ctx.info(ev["line"])
+            try:
+                await ctx.report_progress(progress=float(ev["index"]), total=None)
+            except Exception:  # noqa: BLE001 — progress is best-effort
+                pass
+        elif kind == "result":
+            final = ev["result"]
+        elif kind == "error":
+            final = {"error": ev["error"]}
+
+    worker.join(timeout=5)
+    return final if final is not None else {
+        "error": "RuntimeError: streaming deliberation produced no result"
+    }
 
 
 @mcp.tool()
@@ -272,8 +324,291 @@ def list_personas() -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Streaming core (sync generator; the async MCP tool bridges it to a Context)
+# ---------------------------------------------------------------------------
+
+
+def stream_deliberation(
+    problem: str,
+    *,
+    panel: Optional[List[str]] = None,
+    coordinator: str = "coordinator",
+    provider: str = "anthropic",
+    model: Optional[str] = None,
+    selector_strategy: str = "fixed",
+    max_rounds: int = 4,
+    max_total_tokens: int = 100000,
+    max_total_cost_usd: float = 5.0,
+    max_wallclock_seconds: int = 300,
+    fake_script_path: Optional[str] = None,
+    selector_fake_script_path: Optional[str] = None,
+    output_dir: str = "runs",
+    poll_interval: float = 0.05,
+) -> Iterator[Dict[str, Any]]:
+    """Run a deliberation and yield live events as turns are produced.
+
+    Synchronous generator (the testable core behind `deliberate_streaming`).
+    Runs `run_session(...)` in a worker thread and tails the run's
+    append-only `transcript.jsonl` (the runtime writes it line-buffered,
+    one JSON message per line), yielding:
+
+      * ``{"event": "message", "index": int, "message": <compact dict>,
+        "line": <human preview str>}`` — once per transcript message, in
+        order, as it is appended;
+      * ``{"event": "result", "result": <same dict deliberate returns>}``
+        — once, at the end of a successful run;
+      * ``{"event": "error", "error": "<kind>: <message>"}`` — on any
+        failure (build error, provider failure). A budget / selector
+        *termination* is NOT an error: it surfaces in the final
+        ``result`` with a ``termination_reason``.
+
+    Reads only the persisted journal; it never touches the deliberation
+    semantics, the digest, replay, or metrics.
+    """
+    try:
+        config, providers, selector_providers, run_dir, panel_ids = _prepare(
+            problem=problem,
+            panel=panel,
+            coordinator=coordinator,
+            provider=provider,
+            model=model,
+            selector_strategy=selector_strategy,
+            max_rounds=max_rounds,
+            max_total_tokens=max_total_tokens,
+            max_total_cost_usd=max_total_cost_usd,
+            max_wallclock_seconds=max_wallclock_seconds,
+            fake_script_path=fake_script_path,
+            selector_fake_script_path=selector_fake_script_path,
+            output_dir=output_dir,
+        )
+    except (UnknownProviderError, MissingCredentialsError) as exc:
+        yield {"event": "error", "error": _error(exc)["error"]}
+        return
+    except Exception as exc:  # noqa: BLE001 — structured error event, no crash
+        yield {"event": "error", "error": _error(exc)["error"]}
+        return
+
+    journal = run_dir / "transcript.jsonl"
+    result_box: Dict[str, Artifact] = {}
+    error_box: Dict[str, Exception] = {}
+
+    def _worker() -> None:
+        try:
+            result_box["artifact"] = run_session(
+                config,
+                providers,
+                runs_root=output_dir,
+                selector_providers=selector_providers,
+            )
+        except Exception as exc:  # noqa: BLE001 — surfaced as an error event below
+            error_box["exc"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    tail = _JournalTail(journal)
+    index = 0
+    while worker.is_alive():
+        for msg in tail.drain():
+            index += 1
+            yield _message_event(index, msg)
+        time.sleep(poll_interval)
+    # Final drain: the thread has finished, so the journal is complete.
+    for msg in tail.drain():
+        index += 1
+        yield _message_event(index, msg)
+    worker.join()
+
+    if "exc" in error_box:
+        yield {"event": "error", "error": _error(error_box["exc"])["error"]}
+        return
+    artifact = result_box.get("artifact")
+    if artifact is None:  # pragma: no cover — worker always sets one of the boxes
+        yield {"event": "error", "error": "RuntimeError: run_session produced no artifact"}
+        return
+    yield {"event": "result", "result": _build_result(artifact, run_dir, panel_ids)}
+
+
+class _JournalTail:
+    """Incremental reader for a line-delimited `transcript.jsonl`.
+
+    Tracks a seek cookie and a partial trailing line so each `drain()`
+    returns only the message dicts appended since the last call.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._offset = 0
+        self._pending = ""
+
+    def drain(self) -> List[Dict[str, Any]]:
+        if not self._path.exists():
+            return []
+        with open(self._path, "r", encoding="utf-8") as fp:
+            fp.seek(self._offset)
+            chunk = fp.read()
+            self._offset = fp.tell()
+        if not chunk:
+            return []
+        self._pending += chunk
+        lines = self._pending.split("\n")
+        self._pending = lines.pop()  # trailing partial (or "") survives to next drain
+        out: List[Dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:  # pragma: no cover — line-buffered writes are atomic
+                continue
+        return out
+
+
+def _message_event(index: int, msg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "event": "message",
+        "index": index,
+        "message": _compact_message(msg),
+        "line": _preview_line(msg),
+    }
+
+
+def _compact_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "round": msg.get("round"),
+        "turn_index": msg.get("turn_index"),
+        "speaker": msg.get("speaker"),
+        "type": msg.get("type"),
+        "preview": _message_preview(msg),
+    }
+
+
+def _preview_line(msg: Dict[str, Any]) -> str:
+    return (
+        f"[r{msg.get('round')}/t{msg.get('turn_index')}] "
+        f"{msg.get('speaker')} · {msg.get('type')}: {_message_preview(msg)}"
+    )
+
+
+_PREVIEW_MAX = 280
+
+
+def _message_preview(msg: Dict[str, Any]) -> str:
+    """A short, human-readable preview of a transcript message's content."""
+    mtype = msg.get("type")
+    content = msg.get("content")
+    text: str
+    if mtype == "problem_statement":
+        text = content if isinstance(content, str) else str(content)
+    elif mtype in ("primary_turn", "branch_turn"):
+        text = content.get("text", "") if isinstance(content, dict) else str(content)
+    elif mtype == "coordination_turn":
+        if isinstance(content, dict):
+            text = f"next_action={content.get('next_action')} — {content.get('rationale', '')}"
+        else:
+            text = str(content)
+    elif mtype == "synthesis":
+        text = content.get("integrated_answer", "") if isinstance(content, dict) else str(content)
+    elif mtype == "panel_contraction":
+        if isinstance(content, dict):
+            text = f"{content.get('agent_id')} dropped ({content.get('reason')})"
+        else:
+            text = str(content)
+    else:  # pragma: no cover — MessageType is a closed enum
+        text = str(content)
+    text = " ".join(text.split())  # collapse whitespace/newlines for a clean one-liner
+    if len(text) > _PREVIEW_MAX:
+        text = text[: _PREVIEW_MAX - 1].rstrip() + "…"
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Helpers (mirror the CLI's _load_config flow; no runtime changes)
 # ---------------------------------------------------------------------------
+
+
+def _prepare(
+    *,
+    problem: str,
+    panel: Optional[List[str]],
+    coordinator: str,
+    provider: str,
+    model: Optional[str],
+    selector_strategy: str,
+    max_rounds: int,
+    max_total_tokens: int,
+    max_total_cost_usd: float,
+    max_wallclock_seconds: int,
+    fake_script_path: Optional[str],
+    selector_fake_script_path: Optional[str],
+    output_dir: str,
+) -> Tuple[Config, Dict[str, Any], Optional[Dict[str, Any]], Path, List[str]]:
+    """Build the Config, providers, optional selector providers, run dir, panel.
+
+    Shared by `deliberate` and `stream_deliberation` so both produce a
+    byte-identical run. Mirrors the CLI's args→Config→providers flow.
+    """
+    panel_ids = list(panel) if panel else list(_DEFAULT_PANEL_IDS)
+    resolved_model = model or _default_model(provider)
+    session_id = f"mcp-{uuid.uuid4().hex}"
+
+    config = _build_config(
+        problem=problem,
+        session_id=session_id,
+        panel_ids=panel_ids,
+        coordinator_id=coordinator,
+        provider=provider,
+        model=resolved_model,
+        selector_strategy=selector_strategy,
+        max_rounds=max_rounds,
+        max_total_tokens=max_total_tokens,
+        max_total_cost_usd=max_total_cost_usd,
+        max_wallclock_seconds=max_wallclock_seconds,
+    )
+
+    registry = default_registry()
+    if provider == "fake":
+        if not fake_script_path:
+            raise ValueError(
+                'provider="fake" requires fake_script_path (a FakeProviderScript JSON)'
+            )
+        fp = FakeProvider(script=_load_script(fake_script_path))
+        registry.register("fake", make_fake_factory(fp))
+
+    providers = registry.build_session_providers(config)
+
+    # §4.1 `llm` selector: a distinct provider drives the single selector
+    # invocation so it never consumes deliberation-script entries (mirrors
+    # the CLI's --selector-script). `fixed` / `rules` make no provider call.
+    selector_providers: Optional[Dict[str, Any]] = None
+    if selector_strategy == "llm" and provider == "fake":
+        if not selector_fake_script_path:
+            raise ValueError(
+                'selector_strategy="llm" with provider="fake" requires '
+                "selector_fake_script_path"
+            )
+        sel_fp = FakeProvider(script=_load_script(selector_fake_script_path))
+        selector_providers = {"default": sel_fp}
+
+    run_dir = Path(output_dir) / session_id
+    return config, providers, selector_providers, run_dir, panel_ids
+
+
+def _build_result(artifact: Artifact, run_dir: Path, panel_ids: List[str]) -> Dict[str, Any]:
+    """The `deliberate` / streaming final result dict (§1 done-criteria shape)."""
+    result: Dict[str, Any] = {
+        "outcome": artifact.outcome.kind,
+        "selected_agents": _read_selected_agents(run_dir, fallback=panel_ids),
+        "transcript_digest": artifact.transcript_digest,
+        "cumulative_usage": artifact.cumulative_usage.model_dump(mode="json"),
+        "run_dir": str(run_dir),
+        "rounds": _max_round(artifact),
+    }
+    if artifact.outcome.kind == "synthesis":
+        result["synthesis_answer"] = _synthesis_answer(artifact)
+    else:
+        result["termination_reason"] = artifact.outcome.termination_artifact.reason
+    return result
 
 
 def _build_config(
