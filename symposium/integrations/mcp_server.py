@@ -98,7 +98,7 @@ def deliberate(
     *,
     panel: Optional[List[str]] = None,
     coordinator: str = "coordinator",
-    provider: str = "claude-cli",
+    provider: str = "cli-auto",
     model: Optional[str] = None,
     selector_strategy: str = "fixed",
     max_rounds: int = 4,
@@ -122,13 +122,18 @@ def deliberate(
             the R3 default panel (logician, visionary, researcher, critic,
             engineer).
         coordinator: built-in coordinator persona id (default "coordinator").
-        provider: adapter id every agent uses — "claude-cli" (default;
-            drives the local `claude` CLI in your terminal, no API key),
-            "anthropic" / "openai" (HTTP API, read their key from the env),
-            or "fake" (requires `fake_script_path`).
+        provider: who answers each turn —
+            "cli-auto" (default): route per persona across the installed
+            terminal CLIs — visionary → `codex-cli`, the rest → `claude-cli`
+            — falling back to whichever CLI is installed. No API key.
+            "claude-cli" / "codex-cli": force one terminal CLI for all agents.
+            "anthropic" / "openai": HTTP API (read their key from the env).
+            "fake": deterministic, requires `fake_script_path`.
         model: provider model string. Defaults per provider (claude-cli:
-            the "sonnet" alias; Anthropic: the example-config model;
-            OpenAI: a sane default; fake: "fake-deterministic").
+            "sonnet"; codex-cli: the CLI's own default; Anthropic: the
+            example-config model; OpenAI: a sane default; fake:
+            "fake-deterministic"). Ignored under "cli-auto" (the router
+            stamps a model per chosen CLI).
         selector_strategy: §4.1 selector — "fixed" (default), "rules"
             (deterministic persona-metadata match, no provider call), or
             "llm" (one bounded provider call; needs `selector_fake_script_path`
@@ -183,7 +188,7 @@ async def deliberate_streaming(
     *,
     panel: Optional[List[str]] = None,
     coordinator: str = "coordinator",
-    provider: str = "claude-cli",
+    provider: str = "cli-auto",
     model: Optional[str] = None,
     selector_strategy: str = "fixed",
     max_rounds: int = 4,
@@ -334,7 +339,7 @@ def stream_deliberation(
     *,
     panel: Optional[List[str]] = None,
     coordinator: str = "coordinator",
-    provider: str = "claude-cli",
+    provider: str = "cli-auto",
     model: Optional[str] = None,
     selector_strategy: str = "fixed",
     max_rounds: int = 4,
@@ -558,14 +563,27 @@ def _prepare(
         session_id=session_id,
         panel_ids=panel_ids,
         coordinator_id=coordinator,
-        provider=provider,
-        model=resolved_model,
+        # "cli-auto" is a host-side routing sentinel, not a registered
+        # provider id — build with a concrete placeholder the router then
+        # rewrites per agent. Any other value is the real provider id.
+        provider="claude-cli" if provider == "cli-auto" else provider,
+        model=("sonnet" if provider == "cli-auto" else resolved_model),
         selector_strategy=selector_strategy,
         max_rounds=max_rounds,
         max_total_tokens=max_total_tokens,
         max_total_cost_usd=max_total_cost_usd,
         max_wallclock_seconds=max_wallclock_seconds,
     )
+
+    # cli-auto: route each agent to claude-cli / codex-cli per persona, with
+    # installed-CLI fallback (§ per-persona routing). Rewrites the Config so
+    # the persisted run + metrics reflect the CLI that actually answered.
+    if provider == "cli-auto":
+        from symposium.integrations.cli_routing import route_cli_providers
+
+        routed_config, providers = route_cli_providers(config)
+        run_dir = Path(output_dir) / session_id
+        return routed_config, providers, None, run_dir, panel_ids
 
     registry = default_registry()
     if provider == "fake":
@@ -688,11 +706,14 @@ def _resolve_persona(persona_id: str) -> Persona:
 
 
 def _default_model(provider: str) -> str:
-    if provider == "fake":
+    if provider in ("fake",):
         return "fake-deterministic"
-    if provider == "claude-cli":
+    if provider in ("claude-cli", "cli-auto"):
         # Model alias understood by the `claude` CLI (no API key needed).
         return "sonnet"
+    if provider == "codex-cli":
+        # Sentinel → CodexCliProvider omits -m and uses the CLI's default model.
+        return "auto"
     if provider == "anthropic":
         return _anthropic_example_model()
     if provider == "openai":
