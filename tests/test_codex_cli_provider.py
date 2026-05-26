@@ -42,8 +42,8 @@ class _RecordingRunner:
         self._outputs = list(outputs)
         self.calls = []
 
-    def __call__(self, argv, *, input=None, capture_output=None, text=None, timeout=None):
-        self.calls.append({"argv": argv, "input": input})
+    def __call__(self, argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        self.calls.append({"argv": argv, "input": input, "env": env})
         out = self._outputs.pop(0)
         if isinstance(out, Exception):
             raise out
@@ -149,12 +149,87 @@ def test_missing_binary_raises_at_construction():
         CodexCliProvider(binary="codex-does-not-exist-xyz")
 
 
+def test_isolated_flags_added_by_default():
+    """`--ignore-user-config` + `--ignore-rules` keep the child off the
+    operator's interactive customizations.
+    """
+    runner = _RecordingRunner([_completed(_codex_stdout(structured={"text": "t"}))])
+    CodexCliProvider(runner=runner).invoke(_req())
+    argv = runner.calls[0]["argv"]
+    assert "--ignore-user-config" in argv
+    assert "--ignore-rules" in argv
+
+
+def test_isolated_flags_can_be_disabled():
+    runner = _RecordingRunner([_completed(_codex_stdout(structured={"text": "t"}))])
+    CodexCliProvider(runner=runner, isolated=False).invoke(_req())
+    argv = runner.calls[0]["argv"]
+    assert "--ignore-user-config" not in argv
+    assert "--ignore-rules" not in argv
+
+
+def test_env_scrubs_inherited_claude_code_state(monkeypatch):
+    """Same shared blocklist as the claude-cli provider — see
+    `symposium.providers._cli_env` for rationale. Matters even for codex
+    because the runtime may be hosted inside a Claude Code session, and
+    inherited `CLAUDE_*` state has been observed to slow / break
+    descendant CLI processes.
+    """
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "xhigh")
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+    monkeypatch.setenv("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1")
+    monkeypatch.setenv("AI_AGENT", "claude-code_agent")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("CODEX_HOME", "/x")  # codex auth, must survive
+
+    runner = _RecordingRunner([_completed(_codex_stdout(structured={"text": "t"}))])
+    CodexCliProvider(runner=runner).invoke(_req())
+
+    env = runner.calls[0]["env"]
+    assert env is not None
+    for blocked in (
+        "CLAUDECODE",
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "CLAUDE_EFFORT",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+        "AI_AGENT",
+    ):
+        assert blocked not in env
+    assert env.get("PATH") == "/usr/bin:/bin"
+    assert env.get("CODEX_HOME") == "/x"
+
+
+def test_env_override_replaces_scrubbed_default(monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    runner = _RecordingRunner([_completed(_codex_stdout(structured={"text": "t"}))])
+    custom = {"PATH": "/custom/bin", "CODEX_HOME": "/x"}
+    CodexCliProvider(runner=runner, env=custom).invoke(_req())
+    assert runner.calls[0]["env"] == custom
+
+
+def test_corrective_retry_passes_env_and_does_not_duplicate_flags(monkeypatch):
+    """§6.7 corrective retry: scrub applies to BOTH calls, and isolation
+    flags must not double-up across the retry."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    runner = _RecordingRunner([
+        _completed(_codex_stdout(text="not json at all")),
+        _completed(_codex_stdout(structured={"text": "fixed"})),
+    ])
+    CodexCliProvider(runner=runner).invoke(_req())
+    assert len(runner.calls) == 2
+    for call in runner.calls:
+        assert "CLAUDECODE" not in (call["env"] or {})
+        assert call["argv"].count("--ignore-user-config") == 1
+        assert call["argv"].count("--ignore-rules") == 1
+
+
 def test_end_to_end_run_session_with_codex_cli(tmp_path):
     from symposium.models import AgentConfig, BudgetConfig, Config, SelectorConfig
     from symposium.personas import COORDINATOR, persona_by_id
     from symposium.scheduler import run_session
 
-    def _runner(argv, *, input="", capture_output=None, text=None, timeout=None):
+    def _runner(argv, *, input="", capture_output=None, text=None, timeout=None, env=None):
         schema = json.loads(open(argv[argv.index("--output-schema") + 1]).read())
         props = schema.get("properties", {})
         if "integrated_answer" in props:

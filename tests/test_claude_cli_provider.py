@@ -53,8 +53,8 @@ class _RecordingRunner:
         self._outputs = list(outputs)
         self.calls = []
 
-    def __call__(self, argv, *, input=None, capture_output=None, text=None, timeout=None):
-        self.calls.append({"argv": argv, "input": input, "timeout": timeout})
+    def __call__(self, argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        self.calls.append({"argv": argv, "input": input, "timeout": timeout, "env": env})
         out = self._outputs.pop(0)
         if isinstance(out, Exception):
             raise out
@@ -193,6 +193,93 @@ def test_missing_binary_raises_at_construction():
         ClaudeCliProvider(binary="claude-does-not-exist-xyz")
 
 
+def test_bare_flag_off_by_default():
+    """`--bare` is OFF by default — it would disable OAuth/keychain auth and
+    break the "no API key needed, reuses CLI login" promise for Claude
+    Pro/Max subscription users. Opt in only when authenticating with
+    `ANTHROPIC_API_KEY`.
+    """
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    assert "--bare" not in runner.calls[0]["argv"]
+
+
+def test_bare_flag_opt_in():
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner, bare=True).invoke(_turn_request())
+    assert "--bare" in runner.calls[0]["argv"]
+
+
+def test_env_scrubs_inherited_claude_code_state(monkeypatch):
+    """When hosted inside Claude Code, parent env vars that would force the
+    child into nested-Claude-Code mode (heavy bootstrap), high effort
+    (timeout-blowing), or host-managed provider routing MUST be stripped
+    before spawn.
+    """
+    # Simulate the MCP-inside-Claude-Code parent environment.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc123")
+    monkeypatch.setenv("CLAUDE_CODE_EXECPATH", "/path/to/claude")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "xhigh")
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")  # legacy alias
+    monkeypatch.setenv("CLAUDE_CODE_SIMPLE", "1")  # set by --bare
+    monkeypatch.setenv("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1")
+    monkeypatch.setenv("AI_AGENT", "claude-code_2-1-150_agent")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # benign, must survive
+    # An ANTHROPIC_* var must survive — the child needs it for auth /
+    # endpoint routing.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner).invoke(_turn_request())
+
+    env = runner.calls[0]["env"]
+    assert env is not None, "subprocess.run must receive an explicit env dict"
+    for blocked in (
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "CLAUDE_EFFORT",
+        "CLAUDE_CODE_SIMPLE",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+        "AI_AGENT",
+    ):
+        assert blocked not in env, f"{blocked} leaked into child env"
+    # Benign vars (PATH, locale, etc.) and ANTHROPIC_* (auth) must propagate.
+    assert env.get("PATH") == "/usr/bin:/bin"
+    assert env.get("ANTHROPIC_API_KEY") == "sk-test"
+
+
+def test_env_override_replaces_scrubbed_default(monkeypatch):
+    """`env=` constructor arg overrides the scrubbed default verbatim."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    custom = {"PATH": "/custom/bin", "CLAUDECODE": "1"}
+    ClaudeCliProvider(runner=runner, env=custom).invoke(_turn_request())
+    assert runner.calls[0]["env"] == custom
+
+
+def test_corrective_retry_passes_env_and_does_not_duplicate_bare(monkeypatch):
+    """The §6.7 corrective retry must (a) carry the scrubbed env to the
+    second call too, and (b) not double-append `--bare` when opted in.
+    """
+    monkeypatch.setenv("CLAUDECODE", "1")
+    runner = _RecordingRunner([
+        _completed(_cli_json(structured=None)),                 # first → malformed
+        _completed(_cli_json(structured={"text": "fixed"})),    # corrective retry ok
+    ])
+    ClaudeCliProvider(runner=runner, bare=True).invoke(_turn_request())
+    assert len(runner.calls) == 2
+    for call in runner.calls:
+        # env scrub applies to BOTH invocations
+        assert "CLAUDECODE" not in (call["env"] or {})
+        # `--bare` appears exactly once per call
+        assert call["argv"].count("--bare") == 1
+
+
 def test_end_to_end_run_session_with_claude_cli(tmp_path):
     """A full deliberation loop driven by a mocked claude CLI → synthesis."""
     from symposium.models import (
@@ -201,7 +288,7 @@ def test_end_to_end_run_session_with_claude_cli(tmp_path):
     from symposium.personas import COORDINATOR, persona_by_id
     from symposium.scheduler import run_session
 
-    def _runner(argv, *, input=None, capture_output=None, text=None, timeout=None):
+    def _runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
         # Decide the canned structured_output from the requested schema.
         schema = json.loads(argv[argv.index("--json-schema") + 1])
         props = schema.get("properties", {})

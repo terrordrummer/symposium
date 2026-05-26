@@ -376,6 +376,23 @@ whichever CLI is actually installed (only `claude` installed → the whole
 panel runs on claude, and vice-versa). Force one CLI with
 `provider="claude-cli"` / `"codex-cli"`.
 
+**Hosted-inside-Claude-Code safety.** When the Symposium runtime is itself
+hosted inside a Claude Code session (eg. via the `symposium-mcp` server
+launched as an MCP child), the CLI adapters spawn each turn with a
+**scrubbed environment**: nested-Claude-Code markers (`CLAUDECODE`,
+`CLAUDE_CODE_ENTRYPOINT`/`EXECPATH`/`SESSION_ID`/
+`PROVIDER_MANAGED_BY_HOST`), effort overrides (`CLAUDE_CODE_EFFORT_LEVEL`
+/ `CLAUDE_EFFORT`), and bare-mode markers (`CLAUDE_CODE_SIMPLE`) are
+stripped before each spawn, so the child CLI takes
+its normal headless `-p` / `exec --json` path and does not inherit the
+parent's session state or extended-thinking effort. `ANTHROPIC_*`,
+`CODEX_HOME`, `PATH`, locale, and proxy / cert vars are preserved. The
+codex adapter also passes `--ignore-user-config --ignore-rules` by default
+(opt-out via `isolated=False`; requires codex CLI ≥ 0.122.0). The claude
+adapter offers an opt-in `bare=True` for full headless mode — off by
+default, because `--bare` disables OAuth/keychain and requires an
+`ANTHROPIC_API_KEY`.
+
 **Billing.** When a CLI is logged in with a **subscription** (Claude
 Pro/Max for `claude`, a ChatGPT plan for `codex`), turns run against that
 subscription's usage and **rate limits — not metered, per-token API

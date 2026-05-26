@@ -21,6 +21,7 @@ import tempfile
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from symposium.models import Persona
+from symposium.providers._cli_env import scrubbed_env
 
 # A caller turns (prompt, json_schema) into a parsed JSON object (the
 # candidate persona). Injectable so tests pass a canned object.
@@ -141,6 +142,11 @@ def _claude_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
         ["claude", "-p", "--output-format", "json", "--model", "sonnet",
          "--system-prompt", _ARCHITECT_SYSTEM, "--json-schema", json.dumps(schema)],
         input=prompt, capture_output=True, text=True, timeout=timeout,
+        # Mirror the ClaudeCliProvider scrub: when the runtime is hosted
+        # inside a Claude Code session, inheriting the parent's
+        # CLAUDECODE / CLAUDE_CODE_* / CLAUDE_EFFORT vars turns this
+        # single persona-design call into a multi-minute hang.
+        env=scrubbed_env(),
     )
     if proc.returncode != 0:
         raise PersonaGenerationError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
@@ -165,6 +171,7 @@ def _codex_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
              "-C", tmp, "--output-schema", schema_path, "-"],
             input=f"{_ARCHITECT_SYSTEM}\n\n{prompt}",
             capture_output=True, text=True, timeout=timeout,
+            env=scrubbed_env(),
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

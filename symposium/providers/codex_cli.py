@@ -53,6 +53,7 @@ from symposium.models import (
     Usage,
     Verdict,
 )
+from symposium.providers._cli_env import scrubbed_env
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -75,8 +76,29 @@ class CodexCliProvider(ProviderAdapter):
 
     Constructor parameters mirror `ClaudeCliProvider`: `binary`,
     `default_model` (None / a sentinel → omit `-m`), `timeout`,
-    `extra_args`, and a `runner` injection seam for tests. `check_binary`
-    fail-fasts at construction when the CLI is absent.
+    `extra_args`, `isolated`, `env`, and a `runner` injection seam for
+    tests. `check_binary` fail-fasts at construction when the CLI is
+    absent.
+
+    `isolated` (default ``True``) adds ``--ignore-user-config`` and
+    ``--ignore-rules`` to every invocation: those flags skip
+    ``~/.codex/config.toml`` and any user/project execpolicy
+    ``.rules`` file, so a programmatic non-interactive turn does not
+    inherit the operator's interactive customizations. Auth still
+    resolves via ``CODEX_HOME``. Note that with ``isolated=True``,
+    ``model="auto"`` no longer reads any default model from
+    ``~/.codex/config.toml`` — the codex CLI uses its built-in
+    default. Requires codex >= 0.122.0 (older versions reject the
+    flags); set ``isolated=False`` for older CLIs or to restore
+    legacy behavior.
+
+    `env` defaults to ``None``, which means
+    :func:`~symposium.providers._cli_env.scrubbed_env` — ``os.environ``
+    minus the inherited-state blocklist (nested-Claude-Code markers,
+    effort overrides). See that module's docstring for what's
+    stripped and why. Pass an explicit dict to override entirely (must
+    include ``PATH`` and Windows ``SystemRoot`` for the spawn to
+    succeed).
     """
 
     name = "codex-cli"
@@ -88,6 +110,8 @@ class CodexCliProvider(ProviderAdapter):
         default_model: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         extra_args: Optional[List[str]] = None,
+        isolated: bool = True,
+        env: Optional[Dict[str, str]] = None,
         runner: Optional[Runner] = None,
         check_binary: bool = True,
     ) -> None:
@@ -95,6 +119,8 @@ class CodexCliProvider(ProviderAdapter):
         self._default_model = default_model
         self._timeout = timeout
         self._extra_args = list(extra_args or [])
+        self._isolated = isolated
+        self._env_override = env
         self._run: Runner = runner or subprocess.run
         if check_binary and runner is None and shutil.which(binary) is None:
             raise FileNotFoundError(
@@ -139,6 +165,12 @@ class CodexCliProvider(ProviderAdapter):
                 self._binary, "exec", "--json",
                 "--skip-git-repo-check", "-s", "read-only", "-C", tmpdir,
             ]
+            if self._isolated:
+                # Don't pull in the operator's interactive customizations
+                # for a programmatic non-interactive turn. Auth still
+                # resolves via CODEX_HOME — these flags only skip config /
+                # rules loading.
+                argv += ["--ignore-user-config", "--ignore-rules"]
             model = request.model or self._default_model
             if model and model not in _AUTO_MODELS:
                 argv += ["-m", model]
@@ -156,7 +188,12 @@ class CodexCliProvider(ProviderAdapter):
 
             try:
                 proc = self._run(
-                    argv, input=prompt, capture_output=True, text=True, timeout=self._timeout
+                    argv,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                    env=self._env_override if self._env_override is not None else scrubbed_env(),
                 )
             except subprocess.TimeoutExpired as exc:
                 return _error_result(

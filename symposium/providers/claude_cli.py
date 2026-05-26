@@ -70,6 +70,7 @@ from symposium.models import (
     Usage,
     Verdict,
 )
+from symposium.providers._cli_env import scrubbed_env
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -108,6 +109,33 @@ class ClaudeCliProvider(ProviderAdapter):
     extra_args:
         Additional CLI flags appended to every invocation (advanced;
         e.g. ``["--add-dir", "/path"]``). Defaults to none.
+    bare:
+        When True, append ``--bare`` (Claude Code's headless / minimal
+        mode: no hooks, no LSP, no plugin sync, no auto-memory, no
+        CLAUDE.md auto-discovery, no keychain reads) to every CLI
+        invocation. **Default is False**, on purpose: ``--bare``
+        disables OAuth/keychain auth and requires ``ANTHROPIC_API_KEY``
+        (or ``apiKeyHelper``), which would break the "no API key
+        needed — reuses the CLI's existing login" promise of this
+        adapter for users on a Claude Pro/Max subscription. Set
+        ``bare=True`` if you authenticate with an API key AND want the
+        absolute minimum-bootstrap path. The :data:`scrubbed_env`
+        env-var scrub (always on, see ``env`` below) already addresses
+        the most common slow-spawn cause (inherited Claude Code state /
+        effort overrides), so ``bare=False`` is safe for the failure
+        mode this flag was added for. Requires Claude Code >= 2.1.81
+        when enabled.
+    env:
+        Environment passed to the subprocess. ``None`` (the default)
+        means ``scrubbed_env()`` — ``os.environ`` with
+        :data:`~symposium.providers._cli_env.INHERITED_ENV_BLOCKLIST`
+        stripped, so the child does not inherit the parent's nested-
+        Claude-Code state or effort overrides. Pass an explicit dict
+        to override entirely (NOTE: a verbatim dict that omits
+        ``PATH`` / Windows ``SystemRoot`` will prevent the child from
+        starting; if you need a narrow override, layer it over
+        ``scrubbed_env()`` yourself). Pass ``os.environ`` to opt back
+        into raw inheritance.
     runner:
         Injection seam for tests: a ``subprocess.run``-shaped callable.
         Defaults to :func:`subprocess.run`. Production never overrides it.
@@ -122,6 +150,8 @@ class ClaudeCliProvider(ProviderAdapter):
         default_model: str = DEFAULT_MODEL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         extra_args: Optional[List[str]] = None,
+        bare: bool = False,
+        env: Optional[Dict[str, str]] = None,
         runner: Optional[Runner] = None,
         check_binary: bool = True,
     ) -> None:
@@ -129,6 +159,8 @@ class ClaudeCliProvider(ProviderAdapter):
         self._default_model = default_model
         self._timeout = timeout
         self._extra_args = list(extra_args or [])
+        self._bare = bare
+        self._env_override = env
         self._run: Runner = runner or subprocess.run
         if check_binary and runner is None and shutil.which(binary) is None:
             raise FileNotFoundError(
@@ -169,6 +201,11 @@ class ClaudeCliProvider(ProviderAdapter):
 
         model = request.model or self._default_model
         argv: List[str] = [self._binary, "-p", "--output-format", "json", "--model", model]
+        if self._bare:
+            # `--bare`: headless / minimal mode (no hooks, no LSP, no plugin
+            # sync, no auto-memory, no CLAUDE.md auto-discovery, no keychain
+            # reads). See the class docstring for the rationale.
+            argv.append("--bare")
         # The system block — which carries persona material and may contain
         # confidential prompt fragments — is ALWAYS folded into the stdin
         # payload with a `[SYSTEM]` sentinel; we never put it on the argv
@@ -190,6 +227,7 @@ class ClaudeCliProvider(ProviderAdapter):
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
+                env=self._env_override if self._env_override is not None else scrubbed_env(),
             )
         except subprocess.TimeoutExpired as exc:
             return _error_result(

@@ -79,8 +79,11 @@ def test_id_deduped_against_existing():
 
 
 def test_make_cli_caller_claude_path_with_injected_runner():
-    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None):
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
         assert "--json-schema" in argv  # schema enforced
+        # The factory must scrub the inherited Claude Code state (mirror
+        # of the provider adapters); see symposium.providers._cli_env.
+        assert env is not None and "CLAUDECODE" not in env
         return subprocess.CompletedProcess(
             argv, 0, stdout=json.dumps({"structured_output": _valid_domain("dba")}), stderr=""
         )
@@ -91,3 +94,27 @@ def test_make_cli_caller_claude_path_with_injected_runner():
     # end-to-end through generate_persona
     persona = generate_persona("db tuning", caller=caller)
     assert persona.id == "dba"
+
+
+def test_make_cli_caller_codex_path_scrubs_env(monkeypatch):
+    """The codex fallback path must also pass a scrubbed env to subprocess
+    (mirror of the claude path). Forces the codex branch by claiming
+    claude is unavailable.
+    """
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        assert argv[0] == "codex"
+        assert env is not None
+        assert "CLAUDECODE" not in env
+        assert "CLAUDE_EFFORT" not in env
+        # Emit a valid codex JSONL stream with the persona as agent_message.
+        stdout = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps(_valid_domain("dba"))
+        }}) + "\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    caller = make_cli_persona_caller(prefer="codex", runner=runner)
+    obj = caller("design a dba", {"type": "object"})
+    assert obj["id"] == "dba"

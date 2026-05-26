@@ -49,13 +49,12 @@ __all__ = [
     "Verdict",
 ]
 
-# Package / runtime release version. Distinct from SCHEMA_VERSION (the
-# frozen v1.0.0 protocol + JSON Schemas, which MUST NOT move here) and from
-# storage.writer.PRODUCER_VERSION (the §7.6-condition-#1 reproduction-surface
-# identity). The MVP build-out (M1–M6: orchestrator loop, Fake/OpenAI/
-# Anthropic adapters, §7.9 metrics, §7.5/§7.6 replay, fixed/rules/llm
-# selector) ships as 1.5.0.
-__version__ = "1.5.0"
+# Package / runtime release version — kept in sync with pyproject.toml
+# at every release. Distinct from SCHEMA_VERSION (the frozen v1.0.0
+# protocol + JSON Schemas, which MUST NOT move here) and from
+# storage.writer.PRODUCER_VERSION (the §7.6-condition-#1
+# reproduction-surface identity).
+__version__ = "1.10.1"
 SCHEMA_VERSION = "1.0.0"
 
 
