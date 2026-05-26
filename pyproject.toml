@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # unrelated project, so the distribution is `symposium-protocol`; the
 # import package stays `symposium` (cf. scikit-learn → sklearn).
 name = "symposium-protocol"
-version = "1.5.0"
+version = "1.6.0"
 description = "Reference implementation of the Symposium protocol — structured, sequential, adversarial multi-agent deliberation."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -45,10 +45,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# MCP host integration (spec §11.4 / §11.5). Optional: the core install
+# stays HTTP-only; `import symposium` and the CLI work without `mcp`.
+mcp = ["mcp>=1.2"]
 test = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
   "respx>=0.21",
+  # CI imports the MCP server to exercise its tools (no network).
+  "mcp>=1.2",
 ]
 
 [project.urls]
@@ -58,6 +63,7 @@ Repository = "https://github.com/terrordrummer/symposium"
 
 [project.scripts]
 symposium = "symposium.cli:main"
+symposium-mcp = "symposium.integrations.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["symposium"]
