@@ -101,6 +101,7 @@ def default_registry() -> AdapterRegistry:
     r = AdapterRegistry()
     r.register("openai", _openai_factory)
     r.register("anthropic", _anthropic_factory)
+    r.register("claude-cli", _claude_cli_factory)
     return r
 
 
@@ -130,6 +131,15 @@ def _anthropic_factory(provider_id: str, config: Config) -> ProviderAdapter:
         base_url=os.environ.get("ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL),
         max_tool_iterations=config.runtime.max_tool_iterations,
     )
+
+
+def _claude_cli_factory(provider_id: str, config: Config) -> ProviderAdapter:
+    # Late import: keeps the `claude` CLI optional for callers that only
+    # use the HTTP adapters or the FakeProvider. Needs NO API key — the
+    # adapter reuses the locally-installed CLI's existing auth.
+    from symposium.providers.claude_cli import ClaudeCliProvider
+
+    return ClaudeCliProvider()
 
 
 def make_fake_factory(provider: "ProviderAdapter") -> AdapterFactory:
