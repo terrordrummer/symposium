@@ -156,7 +156,7 @@ def deliberate(
     max_rounds: int = 4,
     max_total_tokens: int = 100000,
     max_total_cost_usd: float = 5.0,
-    max_wallclock_seconds: int = 300,
+    max_wallclock_seconds: int = 1800,
     fake_script_path: Optional[str] = None,
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
@@ -182,7 +182,7 @@ def deliberate(
             "anthropic" / "openai": HTTP API (read their key from the env).
             "fake": deterministic, requires `fake_script_path`.
         model: provider model string. Defaults per provider (claude-cli:
-            "sonnet"; codex-cli: the CLI's own default; Anthropic: the
+            "opus"; codex-cli: the CLI's own default; Anthropic: the
             example-config model; OpenAI: a sane default; fake:
             "fake-deterministic"). Ignored under "cli-auto" (the router
             stamps a model per chosen CLI).
@@ -246,7 +246,7 @@ async def deliberate_streaming(
     max_rounds: int = 4,
     max_total_tokens: int = 100000,
     max_total_cost_usd: float = 5.0,
-    max_wallclock_seconds: int = 300,
+    max_wallclock_seconds: int = 1800,
     fake_script_path: Optional[str] = None,
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
@@ -465,7 +465,7 @@ def deliberate_adaptive(
     max_rounds: int = 4,
     max_total_tokens: int = 100000,
     max_total_cost_usd: float = 5.0,
-    max_wallclock_seconds: int = 300,
+    max_wallclock_seconds: int = 1800,
     output_dir: str = "runs",
 ) -> Dict[str, Any]:
     """Deliberate with dynamic agent generation — early-start AND runtime.
@@ -520,7 +520,7 @@ async def deliberate_adaptive_streaming(
     max_rounds: int = 4,
     max_total_tokens: int = 100000,
     max_total_cost_usd: float = 5.0,
-    max_wallclock_seconds: int = 300,
+    max_wallclock_seconds: int = 1800,
     output_dir: str = "runs",
     ctx: Context,
 ) -> Dict[str, Any]:
@@ -698,13 +698,13 @@ def _run_adaptive(
     runner = run_one or (lambda cfg: _default_adaptive_run_one(cfg, provider, output_dir))
     panel_ids = list(panel) if panel else list(_DEFAULT_PANEL_IDS)
     add_provider = "claude-cli" if provider == "cli-auto" else provider
-    add_model = "sonnet" if provider in ("cli-auto", "claude-cli") else _default_model(provider)
+    add_model = "opus" if provider in ("cli-auto", "claude-cli") else _default_model(provider)
 
     config = _build_config(
         problem=problem, session_id="adaptive-seed", panel_ids=panel_ids,
         coordinator_id=coordinator,
         provider="claude-cli" if provider == "cli-auto" else provider,
-        model="sonnet" if provider == "cli-auto" else _default_model(provider),
+        model="opus" if provider == "cli-auto" else _default_model(provider),
         selector_strategy="fixed", max_rounds=max_rounds,
         max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
         max_wallclock_seconds=max_wallclock_seconds,
@@ -758,7 +758,7 @@ def stream_adaptive(
     max_rounds: int = 4,
     max_total_tokens: int = 100000,
     max_total_cost_usd: float = 5.0,
-    max_wallclock_seconds: int = 300,
+    max_wallclock_seconds: int = 1800,
     output_dir: str = "runs",
     persona_caller=None,
     stream_one=None,
@@ -798,14 +798,14 @@ def stream_adaptive(
 
     panel_ids = list(panel) if panel else list(_DEFAULT_PANEL_IDS)
     add_provider = "claude-cli" if provider == "cli-auto" else provider
-    add_model = "sonnet" if provider in ("cli-auto", "claude-cli") else _default_model(provider)
+    add_model = "opus" if provider in ("cli-auto", "claude-cli") else _default_model(provider)
 
     try:
         config = _build_config(
             problem=problem, session_id="adaptive-seed", panel_ids=panel_ids,
             coordinator_id=coordinator,
             provider="claude-cli" if provider == "cli-auto" else provider,
-            model="sonnet" if provider == "cli-auto" else _default_model(provider),
+            model="opus" if provider == "cli-auto" else _default_model(provider),
             selector_strategy="fixed", max_rounds=max_rounds,
             max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
             max_wallclock_seconds=max_wallclock_seconds,
@@ -1017,7 +1017,7 @@ def stream_deliberation(
     max_rounds: int = 4,
     max_total_tokens: int = 100000,
     max_total_cost_usd: float = 5.0,
-    max_wallclock_seconds: int = 300,
+    max_wallclock_seconds: int = 1800,
     fake_script_path: Optional[str] = None,
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
@@ -1239,7 +1239,7 @@ def _prepare(
         # provider id — build with a concrete placeholder the router then
         # rewrites per agent. Any other value is the real provider id.
         provider="claude-cli" if provider == "cli-auto" else provider,
-        model=("sonnet" if provider == "cli-auto" else resolved_model),
+        model=("opus" if provider == "cli-auto" else resolved_model),
         selector_strategy=selector_strategy,
         max_rounds=max_rounds,
         max_total_tokens=max_total_tokens,
@@ -1381,11 +1381,17 @@ def _default_model(provider: str) -> str:
     if provider in ("fake",):
         return "fake-deterministic"
     if provider in ("claude-cli", "cli-auto"):
-        # Model alias understood by the `claude` CLI (no API key needed).
-        return "sonnet"
+        # `opus` alias resolves to the latest opus version on the local CLI
+        # (currently opus 4.7). Faster than sonnet on long technical prompts
+        # in practice — fewer internal iterations to convergence — and the
+        # operator's stated preference for deliberation work.
+        return "opus"
     if provider == "codex-cli":
-        # Sentinel → CodexCliProvider omits -m and uses the CLI's default model.
-        return "auto"
+        # Matches the operator's documented preference (`~/.codex/config.toml`
+        # default model). Explicit because `--ignore-user-config` skips
+        # that config; without -m the CLI would fall back to its built-in
+        # default rather than `gpt-5.5`.
+        return "gpt-5.5"
     if provider == "anthropic":
         return _anthropic_example_model()
     if provider == "openai":

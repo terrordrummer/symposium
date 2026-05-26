@@ -369,12 +369,18 @@ deliberate(
 turn through a locally-installed terminal CLI, reusing its existing login
 (OAuth/keychain) — no `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`. It routes by
 persona — the lateral/creative **visionary** to `codex-cli`
-(`codex exec --output-schema …`), the technical/systematic personas
-(logician, engineer, researcher, critic, coordinator) to `claude-cli`
-(`claude -p --output-format json --json-schema …`) — and **falls back** to
-whichever CLI is actually installed (only `claude` installed → the whole
-panel runs on claude, and vice-versa). Force one CLI with
-`provider="claude-cli"` / `"codex-cli"`.
+(`codex exec --output-schema …`, model **`gpt-5.5`** with reasoning effort
+`max`), the technical/systematic personas (logician, engineer, researcher,
+critic, coordinator) to `claude-cli` (`claude -p --output-format json
+--json-schema …`, model **`opus`** — alias for the latest Opus on the
+local CLI, currently 4.7) — and **falls back** to whichever CLI is
+actually installed (only `claude` installed → the whole panel runs on
+claude, and vice-versa). Force one CLI with `provider="claude-cli"` /
+`"codex-cli"`. Per-call timeout is **600s** (was 180s through v1.10.2,
+which empirically timed out mid-turn on multi-paragraph technical prompts
+that produce 10+ internal iterations); session wallclock defaults to
+**1800s** (30 min) for a full 5-agent × 4-round panel to have room to
+complete.
 
 **Hosted-inside-Claude-Code safety.** When the Symposium runtime is itself
 hosted inside a Claude Code session (eg. via the `symposium-mcp` server

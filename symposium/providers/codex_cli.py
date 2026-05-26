@@ -58,7 +58,10 @@ from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
 DEFAULT_CODEX_BINARY = "codex"
-DEFAULT_TIMEOUT_SECONDS = 240.0
+# See claude_cli.DEFAULT_TIMEOUT_SECONDS for the rationale (multi-min
+# per-turn inference on heavy technical prompts). Codex is empirically
+# in the same range as sonnet on similar prompt sizes.
+DEFAULT_TIMEOUT_SECONDS = 600.0
 # Model strings that mean "let the CLI choose its default" → omit -m.
 _AUTO_MODELS = {"", "auto", "default", "codex-default"}
 

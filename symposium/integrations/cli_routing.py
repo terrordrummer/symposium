@@ -59,8 +59,8 @@ def route_cli_providers(
     *,
     routing: Optional[Dict[str, str]] = None,
     default_cli: str = DEFAULT_CLI,
-    claude_model: str = "sonnet",
-    codex_model: str = "auto",
+    claude_model: str = "opus",
+    codex_model: str = "gpt-5.5",
     installed: Optional[set] = None,
     adapters: Optional[Dict[str, ProviderAdapter]] = None,
 ) -> Tuple[Config, Dict[str, ProviderAdapter]]:
@@ -151,5 +151,11 @@ def _build_adapter(cli: str) -> ProviderAdapter:
     if cli == "codex-cli":
         from symposium.providers.codex_cli import CodexCliProvider
 
-        return CodexCliProvider()
+        # `-c model_reasoning_effort=max` matches the operator's
+        # documented preference for codex (their `~/.codex/config.toml`
+        # uses `xhigh` by default and we pass `--ignore-user-config` to
+        # avoid inheriting an interactive setup — so the effort knob
+        # has to be reasserted on the argv). `max` is the highest
+        # reasoning level supported by the codex CLI.
+        return CodexCliProvider(extra_args=["-c", "model_reasoning_effort=max"])
     raise ValueError(f"unknown CLI provider id: {cli!r}")

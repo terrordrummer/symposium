@@ -76,7 +76,19 @@ from symposium.providers.base import ProviderAdapter
 
 DEFAULT_CLAUDE_BINARY = "claude"
 DEFAULT_MODEL = "sonnet"
-DEFAULT_TIMEOUT_SECONDS = 180.0
+# Per-invocation timeout. Calibrated against real-world deliberation
+# turns: a multi-paragraph technical problem statement (~3KB) on the
+# sonnet alias takes ~6 minutes per turn at "low" effort because the
+# CLI does an internal agentic loop (observed `num_turns` in the
+# double-digits for a single structured-output response). 180s — the
+# v1.10.2-and-earlier default — timed out mid-turn on prompts of that
+# size, exhausted the retry budget, and surfaced as
+# `provider_unrecoverable` with zero token usage even with v1.10.2's
+# env scrub in place. 600s gives a single turn enough room to finish
+# on sonnet; operators expecting a panel of 5+ personas should pre-
+# trim the problem statement or route the panel to ``haiku`` (~3.5×
+# faster on the same prompt) to keep total panel wallclock sane.
+DEFAULT_TIMEOUT_SECONDS = 600.0
 
 # expected_output_schema → Pydantic model whose JSON Schema we hand to
 # `--json-schema`. `null` / None take the free-text path (no schema).
