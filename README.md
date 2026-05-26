@@ -157,6 +157,39 @@ registry (§6.11). Built-in registrations: `openai`, `anthropic`, and
 — when `--script` is given — `fake`. Plug your own adapter in by
 registering a factory before the run.
 
+### Re-running a session
+
+`symposium replay` (above) is the §7.5 **`transcript_replay`** — it
+re-renders the *stored* `canonical_transcript` and is byte-identical
+unconditionally (no model call). `symposium execution-replay` is the
+§7.6 **`execution_replay`** — it *re-runs the orchestrator* against the
+original `problem_statement` / `Config` to regenerate a fresh transcript,
+and is reproducible only when every non-deterministic source is pinned
+(the ten **pinning conditions** of §7.6: runtime, adapter, provider,
+model, sampling, cache, tool_env, wallclock, persona, transcript_prefix).
+
+```bash
+symposium execution-replay runs/demo-walking-skeleton-001 \
+  --script examples/scripts/walking-skeleton.json \
+  --output runs/
+# → runs/demo-walking-skeleton-001-replay/  (fresh run, distinct session id)
+# → digest=match | digest=MISMATCH (first_divergence=…)
+```
+
+Before touching the runtime it checks every pinning condition decidable
+offline and **aborts** with a `pinning_violation` diagnostic (naming the
+exact condition) on the first one that cannot be satisfied — §7.6
+forbids silent best-effort replay. Exit codes: `0` digest match, `3`
+pinning violation, `4` digest mismatch, `1` any other error.
+
+Reproducibility is conditional, not free (§7.8: *replayable ≠
+reproducible*). A vanilla `symposium run` mints message ids with
+`uuid4` and stamps wall-clock timestamps, so its `execution-replay`
+reports a mismatch — that is the honest result, not a bug. To produce a
+*reproducible* original run, wrap `run_session` in `pinned_runtime`
+(deterministic ids + a fixed clock) and pass the same `fixed_clock` to
+`execution_replay`; see the library example below.
+
 ### Library use
 
 ```python
@@ -174,6 +207,20 @@ artifact = run_session(config, providers, runs_root="runs/")
 
 print(artifact.transcript_digest)        # 64-hex JCS-SHA-256 digest
 print(artifact.outcome.kind)             # "synthesis" or "termination"
+
+# Reproducible original run + §7.6 execution_replay (digest-matching)
+from datetime import datetime, timezone
+from symposium.replay import execution_replay, pinned_runtime
+
+clock = lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
+with pinned_runtime(fixed_clock=clock):                       # deterministic ids + fixed clock
+    run_session(config, {"default": FakeProvider(script=script)}, runs_root="runs/")
+
+result = execution_replay("runs/" + config.session_id,
+                          providers={"default": FakeProvider(script=script)},
+                          fixed_clock=clock)
+print(result.digest_matches)             # True — every pinning condition satisfied
+print(result.conditions_checked, result.conditions_assumed)
 ```
 
 ---
@@ -192,7 +239,7 @@ print(artifact.outcome.kind)             # "synthesis" or "termination"
 │   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic adapters
 │   ├── scheduler/                # §4.11 pseudocode → executable loop
 │   ├── storage/                  # Run directory layout + JCS digest
-│   ├── replay/                   # transcript_replay (§7.5)
+│   ├── replay/                   # transcript_replay (§7.5) + execution_replay (§7.6)
 │   ├── observability/            # §7.9 MVP metric set (offline)
 │   ├── personas/                 # MVP default panel (R3)
 │   └── cli/                      # `symposium` command

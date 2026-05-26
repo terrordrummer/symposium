@@ -19,6 +19,13 @@ MVP subcommands:
       Computes the §7.9 MVP observability metric set offline from
       `<RUN_DIR>/artifact.json` and writes `<RUN_DIR>/metrics.json`.
 
+  symposium execution-replay RUN_DIR [--script SCRIPT.json] [--output runs/]
+      Re-runs the orchestrator against the original problem_statement /
+      Config under the §7.6 ten pinning conditions (distinct from
+      `replay`, which is the §7.5 unconditional transcript re-render). On
+      an unsatisfiable pinning condition it aborts with exit code 3; on a
+      digest mismatch after a successful replay, exit code 4.
+
 Environment variables consumed by built-in adapters:
 
   OPENAI_API_KEY  — required when any agent declares `provider: openai`.
@@ -49,7 +56,7 @@ from symposium.providers import (
     default_registry,
     make_fake_factory,
 )
-from symposium.replay import replay_transcript
+from symposium.replay import PinningViolation, execution_replay, replay_transcript
 from symposium.scheduler import run_session
 
 
@@ -229,6 +236,95 @@ def _print_metrics_summary(metrics, out_path: Path) -> None:
     )
     click.echo(f"usage_estimated={metrics.usage_estimated}")
     click.echo(f"persisted_to={out_path}")
+
+
+@main.command("execution-replay")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--script", "script_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="FakeProvider script (JSON). Required when the persisted config uses `provider: fake`.",
+)
+@click.option(
+    "--output", "fresh_runs_root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Root for the fresh `<session_id>-replay/` run dir (default: the run's parent).",
+)
+@click.option("--quiet", is_flag=True, help="Suppress the human-readable summary on stdout.")
+@click.option(
+    "--assume-cache-cleared", is_flag=True,
+    help="Assert the §7.6 condition #6 prompt-cache assumption for live providers.",
+)
+def execution_replay_cmd(
+    run_dir: Path,
+    script_path: Optional[Path],
+    fresh_runs_root: Optional[Path],
+    quiet: bool,
+    assume_cache_cleared: bool,
+) -> None:
+    """Re-run a persisted session under the §7.6 pinning conditions.
+
+    The library API also accepts `fixed_clock` and `persona_hashes`; both
+    are caller-side knobs not exposed on the command line in M5. A
+    FakeProvider replay with no fixed clock proceeds on the system clock
+    (its `transcript_digest` may therefore diverge — surfaced as a
+    warning). Exit codes: 0 match, 3 pinning violation, 4 digest mismatch,
+    1 any other error.
+    """
+    config_path = run_dir / "config.json"
+    if not config_path.exists():
+        click.echo(f"ERROR: {config_path} not found", err=True)
+        sys.exit(1)
+
+    try:
+        config = Config.model_validate(json.loads(config_path.read_text()))
+    except Exception as exc:  # noqa: BLE001 — surface parse/validation failure as exit 1
+        click.echo(f"ERROR: failed to load config: {exc}", err=True)
+        sys.exit(1)
+
+    registry = default_registry()
+    if script_path is not None:
+        fp = FakeProvider(script=_load_script(script_path))
+        registry.register("fake", make_fake_factory(fp))
+    try:
+        providers = registry.build_session_providers(config)
+    except (UnknownProviderError, MissingCredentialsError) as exc:
+        click.echo(
+            f"ERROR: {exc} — pass --script for a fake session, or register/credential the adapter.",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        result = execution_replay(
+            run_dir,
+            providers=providers,
+            fresh_runs_root=fresh_runs_root,
+            assume_cache_cleared=assume_cache_cleared,
+        )
+    except PinningViolation as exc:
+        click.echo(f"ERROR: pinning_violation [{exc.condition}]: {exc}", err=True)
+        sys.exit(3)
+    except Exception as exc:  # noqa: BLE001 — missing/invalid persisted state → exit 1
+        click.echo(f"ERROR: execution_replay failed: {exc}", err=True)
+        sys.exit(1)
+
+    if not quiet:
+        for w in result.warnings:
+            click.echo(f"WARNING: {w}", err=True)
+        click.echo(f"conditions_checked={','.join(result.conditions_checked)}")
+        click.echo(f"conditions_assumed={','.join(result.conditions_assumed)}")
+        click.echo(f"original_digest={result.original_digest}")
+        click.echo(f"fresh_digest={result.fresh_digest}")
+        click.echo(f"fresh_run_dir={result.fresh_run_dir}/")
+
+    if not result.digest_matches:
+        diverge = result.first_diverging_message_id or "stored digest differs from recomputed (no message-level divergence)"
+        click.echo(f"digest=MISMATCH (first_divergence={diverge})")
+        sys.exit(4)
+    click.echo("digest=match")
 
 
 # ---------------------------------------------------------------------------
