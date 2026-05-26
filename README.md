@@ -379,11 +379,17 @@ panel runs on claude, and vice-versa). Force one CLI with
 **Hosted-inside-Claude-Code safety.** When the Symposium runtime is itself
 hosted inside a Claude Code session (eg. via the `symposium-mcp` server
 launched as an MCP child), the CLI adapters spawn each turn with a
-**scrubbed environment**: nested-Claude-Code markers (`CLAUDECODE`,
-`CLAUDE_CODE_ENTRYPOINT`/`EXECPATH`/`SESSION_ID`/
-`PROVIDER_MANAGED_BY_HOST`), effort overrides (`CLAUDE_CODE_EFFORT_LEVEL`
-/ `CLAUDE_EFFORT`), and bare-mode markers (`CLAUDE_CODE_SIMPLE`) are
-stripped before each spawn, so the child CLI takes
+**headless child environment**: (1) nested-Claude-Code markers
+(`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`/`EXECPATH`/`SESSION_ID`/
+`PROVIDER_MANAGED_BY_HOST`), effort overrides
+(`CLAUDE_CODE_EFFORT_LEVEL` / `CLAUDE_EFFORT`), and bare-mode markers
+(`CLAUDE_CODE_SIMPLE`) are stripped before each spawn; (2)
+`CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, and
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` are set to `1` to suppress the
+child's *own* auto-loads (the CLAUDE.md auto-discovery walk alone can
+turn a sub-second deliberation turn into a multi-minute hang against a
+populated `~/.claude/` and Workspace tree). The child CLI then takes
 its normal headless `-p` / `exec --json` path and does not inherit the
 parent's session state or extended-thinking effort. `ANTHROPIC_*`,
 `CODEX_HOME`, `PATH`, locale, and proxy / cert vars are preserved. The

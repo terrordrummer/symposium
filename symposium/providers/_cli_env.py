@@ -93,3 +93,62 @@ def scrubbed_env() -> Dict[str, str]:
     handing it to ``subprocess.run(env=...)``.
     """
     return {k: v for k, v in os.environ.items() if k not in INHERITED_ENV_BLOCKLIST}
+
+
+# Documented Claude Code env knobs that suppress auto-load behaviors the
+# child would otherwise perform during startup, none of which a
+# non-interactive deliberation turn needs:
+#
+#   * CLAUDE_CODE_DISABLE_CLAUDE_MDS — skip CLAUDE.md auto-discovery
+#     (the child would walk up from cwd and load every CLAUDE.md it
+#     finds, including the user's global ``~/.claude/CLAUDE.md`` which
+#     in practice is often hundreds of lines).
+#   * CLAUDE_CODE_DISABLE_AUTO_MEMORY — skip auto-memory load.
+#   * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC — collapses to
+#     DISABLE_AUTOUPDATER / DISABLE_FEEDBACK_COMMAND /
+#     DISABLE_ERROR_REPORTING / DISABLE_TELEMETRY.
+#   * CLAUDE_CODE_DISABLE_BACKGROUND_TASKS — skip background-task
+#     plumbing.
+#
+# Why this exists *in addition to* INHERITED_ENV_BLOCKLIST: stripping
+# the parent's nested-Claude-Code markers is necessary to take the
+# child off heavy parent-driven paths (effort overrides,
+# session-attached MCP servers), but does NOT prevent the child's own
+# default startup behavior. Without these DISABLE_* vars the child
+# still spends multi-minutes loading CLAUDE.md/auto-memory before
+# producing its first token — observed in the wild against a user's
+# Workspace tree with ~10+ CLAUDE.md files. ``--bare`` would also fix
+# it but disables OAuth/keychain (incompatible with the "no API key
+# needed" promise of the CLI adapters), so the env-knob approach is
+# the surgical middle ground: keep OAuth, skip the heavy loads.
+_CHILD_AUTO_LOAD_DISABLES: Dict[str, str] = {
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+}
+
+
+def headless_child_env() -> Dict[str, str]:
+    """``scrubbed_env()`` plus the auto-load-disable knobs the child needs
+    to skip its own heavy startup (CLAUDE.md walk, auto-memory, etc.).
+
+    This is what the CLI providers and ``persona_factory`` should pass
+    as ``env=`` to ``subprocess.run`` for a non-interactive turn. The
+    env-var-only approach (vs ``--bare``) preserves OAuth / keychain
+    auth so subscription users keep working without an
+    ``ANTHROPIC_API_KEY``.
+
+    The DISABLE_* values are an **unconditional override** — any
+    contrary value inherited from the parent env (eg. a stray
+    ``CLAUDE_CODE_DISABLE_CLAUDE_MDS=0``) is replaced, not preserved.
+    Parent-env inheritance is not how an operator opts back into the
+    heavy auto-loads; that's what the provider's ``env=`` constructor
+    arg is for. Letting a stray "0" sticky-pass through would reopen
+    exactly the path that caused the 9-minute hang this helper exists
+    to prevent.
+    """
+    env = scrubbed_env()
+    for k, v in _CHILD_AUTO_LOAD_DISABLES.items():
+        env[k] = v
+    return env

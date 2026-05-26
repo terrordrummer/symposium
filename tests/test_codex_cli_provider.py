@@ -198,6 +198,11 @@ def test_env_scrubs_inherited_claude_code_state(monkeypatch):
         assert blocked not in env
     assert env.get("PATH") == "/usr/bin:/bin"
     assert env.get("CODEX_HOME") == "/x"
+    # CLAUDE_CODE_DISABLE_* are set too: harmless for codex itself, but
+    # they matter for any descendant `claude` invocation the child might
+    # fork (same headless_child_env helper).
+    assert env.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
+    assert env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == "1"
 
 
 def test_env_override_replaces_scrubbed_default(monkeypatch):

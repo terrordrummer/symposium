@@ -70,7 +70,7 @@ from symposium.models import (
     Usage,
     Verdict,
 )
-from symposium.providers._cli_env import scrubbed_env
+from symposium.providers._cli_env import headless_child_env
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -127,15 +127,19 @@ class ClaudeCliProvider(ProviderAdapter):
         when enabled.
     env:
         Environment passed to the subprocess. ``None`` (the default)
-        means ``scrubbed_env()`` — ``os.environ`` with
+        means :func:`~symposium.providers._cli_env.headless_child_env`:
+        ``os.environ`` minus
         :data:`~symposium.providers._cli_env.INHERITED_ENV_BLOCKLIST`
-        stripped, so the child does not inherit the parent's nested-
-        Claude-Code state or effort overrides. Pass an explicit dict
-        to override entirely (NOTE: a verbatim dict that omits
-        ``PATH`` / Windows ``SystemRoot`` will prevent the child from
-        starting; if you need a narrow override, layer it over
-        ``scrubbed_env()`` yourself). Pass ``os.environ`` to opt back
-        into raw inheritance.
+        plus a handful of ``CLAUDE_CODE_DISABLE_*`` knobs that suppress
+        the child's own auto-loads (``CLAUDE.md`` walk, auto-memory,
+        background tasks, non-essential traffic) — needed in addition
+        to the inheritance scrub because the child still does a full
+        bootstrap on its own otherwise. Pass an explicit dict to
+        override entirely (NOTE: a verbatim dict that omits ``PATH`` /
+        Windows ``SystemRoot`` will prevent the child from starting; if
+        you need a narrow override, layer it over
+        ``headless_child_env()`` yourself). Pass ``os.environ`` to opt
+        back into raw inheritance.
     runner:
         Injection seam for tests: a ``subprocess.run``-shaped callable.
         Defaults to :func:`subprocess.run`. Production never overrides it.
@@ -227,7 +231,7 @@ class ClaudeCliProvider(ProviderAdapter):
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
-                env=self._env_override if self._env_override is not None else scrubbed_env(),
+                env=self._env_override if self._env_override is not None else headless_child_env(),
             )
         except subprocess.TimeoutExpired as exc:
             return _error_result(

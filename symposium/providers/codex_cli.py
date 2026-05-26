@@ -53,7 +53,7 @@ from symposium.models import (
     Usage,
     Verdict,
 )
-from symposium.providers._cli_env import scrubbed_env
+from symposium.providers._cli_env import headless_child_env
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -93,12 +93,15 @@ class CodexCliProvider(ProviderAdapter):
     legacy behavior.
 
     `env` defaults to ``None``, which means
-    :func:`~symposium.providers._cli_env.scrubbed_env` — ``os.environ``
-    minus the inherited-state blocklist (nested-Claude-Code markers,
-    effort overrides). See that module's docstring for what's
-    stripped and why. Pass an explicit dict to override entirely (must
-    include ``PATH`` and Windows ``SystemRoot`` for the spawn to
-    succeed).
+    :func:`~symposium.providers._cli_env.headless_child_env` —
+    ``os.environ`` minus the inherited-state blocklist
+    (nested-Claude-Code markers, effort overrides) plus the
+    ``CLAUDE_CODE_DISABLE_*`` auto-load knobs. The Claude-side
+    DISABLE knobs are harmless to ``codex exec`` but matter for any
+    descendant ``claude`` invocation the child might fork. See
+    :mod:`symposium.providers._cli_env`. Pass an explicit dict to
+    override entirely (must include ``PATH`` and Windows
+    ``SystemRoot`` for the spawn to succeed).
     """
 
     name = "codex-cli"
@@ -193,7 +196,7 @@ class CodexCliProvider(ProviderAdapter):
                     capture_output=True,
                     text=True,
                     timeout=self._timeout,
-                    env=self._env_override if self._env_override is not None else scrubbed_env(),
+                    env=self._env_override if self._env_override is not None else headless_child_env(),
                 )
             except subprocess.TimeoutExpired as exc:
                 return _error_result(

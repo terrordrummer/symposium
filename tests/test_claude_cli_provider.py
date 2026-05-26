@@ -251,6 +251,30 @@ def test_env_scrubs_inherited_claude_code_state(monkeypatch):
     # Benign vars (PATH, locale, etc.) and ANTHROPIC_* (auth) must propagate.
     assert env.get("PATH") == "/usr/bin:/bin"
     assert env.get("ANTHROPIC_API_KEY") == "sk-test"
+    # The headless env also sets DISABLE_* knobs so the child skips its
+    # own heavy auto-loads (CLAUDE.md walk, auto-memory). These are what
+    # actually keep a sub-second turn from turning into a 9-min hang
+    # when the runtime is hosted inside a Claude Code session.
+    assert env.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
+    assert env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == "1"
+    assert env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") == "1"
+    assert env.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS") == "1"
+
+
+def test_headless_default_overrides_parent_disable_zero(monkeypatch):
+    """A stray ``CLAUDE_CODE_DISABLE_CLAUDE_MDS=0`` inherited from the
+    parent env must NOT survive into the child — it's exactly the
+    sticky-inheritance path that would reopen the 9-minute-hang bug.
+    Parent-env inheritance is not the supported opt-back-in route;
+    explicit ``env=`` on the provider is.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "0")
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    env = runner.calls[0]["env"]
+    assert env.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
+    assert env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == "1"
 
 
 def test_env_override_replaces_scrubbed_default(monkeypatch):
