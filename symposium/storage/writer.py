@@ -12,6 +12,7 @@ from symposium.models import (
     Config,
     Message,
     RunManifest,
+    SelectorOutput,
     TerminationArtifact,
 )
 from symposium.storage.digest import serialize_pretty
@@ -73,6 +74,19 @@ class RunWriter:
         import json
         compact = json.dumps(msg.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
         self._journal_fp.write(compact + "\n")
+
+    def write_selector_output(self, selection: SelectorOutput) -> None:
+        """Persist the §5.11 SelectorOutput to `<run_dir>/selector_output.json`.
+
+        Additive sibling file: it is NOT part of the frozen Artifact /
+        manifest schema and does not enter the `canonical_transcript` or
+        the `transcript_digest`. Sorted-keys pretty JSON written through
+        the same atomic temp-file → rename helper as the other artifacts
+        (§7.4).
+        """
+        self.run_dir.ensure()
+        dump = selection.model_dump(mode="json", exclude_none=True)
+        _atomic_write_text(self.run_dir.selector_output_path, serialize_pretty(dump))
 
     def finalize(
         self,

@@ -198,6 +198,44 @@ class Config(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# SelectorOutput (§5.11) — mirrors selector_output.schema.json
+# ---------------------------------------------------------------------------
+
+
+class SelectorExclusion(BaseModel):
+    model_config = _strict()
+    id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class SelectorMissingCapability(BaseModel):
+    model_config = _strict()
+    capability: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    suggested_persona: Optional[str] = None
+
+
+class SelectorOutput(BaseModel):
+    """Structured selector decision (§5.11, Pass 1 row #119).
+
+    Required: `strategy`, `selected_agents`, `coordinator_agent`. The
+    `[v1]` optional fields (`excluded_agents`, `missing_capabilities`,
+    `reasoning`) are populated by the `rules` / `llm` strategies for
+    replay / audit. Persisted to `<run_dir>/selector_output.json`; it is
+    NOT part of the frozen Artifact and does not enter the
+    `canonical_transcript` or `transcript_digest`.
+    """
+
+    model_config = _strict()
+    strategy: SelectorStrategy
+    selected_agents: List[str] = Field(min_length=1)
+    coordinator_agent: str = Field(min_length=1)
+    excluded_agents: Optional[List[SelectorExclusion]] = None
+    missing_capabilities: Optional[List[SelectorMissingCapability]] = None
+    reasoning: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
 # Verdict (§5.6)
 # ---------------------------------------------------------------------------
 

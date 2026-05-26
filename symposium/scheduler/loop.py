@@ -45,6 +45,11 @@ from symposium.models import (
     now_utc_iso,
 )
 from symposium.providers.base import ProviderAdapter as _ProviderAdapter
+from symposium.selector import (
+    SelectorBudgetExceeded,
+    SelectorError,
+    run_selector,
+)
 from symposium.storage import RunDirectory, RunWriter, compute_transcript_digest
 
 
@@ -343,17 +348,23 @@ def run_session(
     providers: Dict[str, _ProviderAdapter],
     *,
     runs_root: Optional[str] = None,
+    selector_providers: Optional[Dict[str, _ProviderAdapter]] = None,
 ) -> Artifact:
     """Run a session to completion. Returns the persisted Artifact.
 
     `providers` is a mapping from agent_id (or "default") to a ProviderAdapter
     instance. For the FakeProvider walking skeleton, pass `{"default": fp}`.
 
+    `selector_providers` is an OPTIONAL distinct provider map used only for
+    the §4.1 `llm` selector invocation (it defaults to `providers`). Supply
+    it when the selector must be driven by a different FakeProvider script
+    than the deliberation — e.g. the CLI's `--selector-script`. `fixed` /
+    `rules` make no provider call, so the value is irrelevant for them.
+
     If `runs_root` is given, the session is persisted under
     `runs_root/<session_id>/`.
     """
     session = Session(config=config, providers=providers)
-    session.active_panel = list(config.selector.default_deliberation_panel)
 
     writer: Optional[RunWriter] = None
     if runs_root is not None:
@@ -363,7 +374,9 @@ def run_session(
         writer = RunWriter(rd)
         writer.start(config, session.started_at)
 
-    # 1) problem_statement message (round 0, turn_index 0)
+    # 1) problem_statement message (round 0, turn_index 0). §4.1 appends it
+    #    during **init**, BEFORE the **selector** phase — so even a selector
+    #    failure persists a valid 1-message canonical_transcript.
     problem_msg = Message(
         id=_new_id(),
         speaker=config.originator,
@@ -379,16 +392,46 @@ def run_session(
     if writer:
         writer.append_message(problem_msg)
 
-    # 2) round loop
-    artifact, term = _run_rounds(session, writer)
+    # 2) §4.1 selector phase — choose the active_deliberation_panel + coordinator.
+    #    `fixed` / `rules` make no provider call; `llm` makes one bounded call
+    #    whose usage is budgeted against selector_budget and never enters
+    #    Artifact.cumulative_usage or the transcript_digest. A selector failure
+    #    terminates BEFORE round 1 opens, with the seed (problem_statement-only)
+    #    transcript.
+    try:
+        selection = run_selector(config, providers=selector_providers or providers)
+    except SelectorError:
+        outcome, term = _terminate(session, writer, reason="schema_error")
+        return _emit_artifact(session, config, outcome, term, writer)
+    except SelectorBudgetExceeded:
+        outcome, term = _terminate(session, writer, reason="budget_exceeded")
+        return _emit_artifact(session, config, outcome, term, writer)
 
-    # 3) emit artifact
+    session.active_panel = list(selection.selected_agents)
+    # coordinator id is unchanged: run_selector enforces
+    # selection.coordinator_agent == config.coordinator.id.
+    if writer:
+        writer.write_selector_output(selection)
+
+    # 3) round loop
+    outcome, term = _run_rounds(session, writer)
+
+    # 4) emit artifact
+    return _emit_artifact(session, config, outcome, term, writer)
+
+
+def _emit_artifact(session, config, outcome, term, writer):
+    """Build, persist, and return the final Artifact (§5.10).
+
+    Shared by the normal round-loop exit and the §4.1 selector-failure path
+    so both produce a schema-valid Artifact over the same transcript.
+    """
     ended_at = now_utc_iso()
     final_artifact = Artifact(
         session_id=config.session_id,
         config=config,
         canonical_transcript=session.transcript,
-        outcome=artifact,  # SynthesisOutcome or TerminationOutcome
+        outcome=outcome,  # SynthesisOutcome or TerminationOutcome
         cumulative_usage=session.cumulative.to_usage(),
         cumulative_unresolved=session.cumulative_unresolved,
         transcript_digest=compute_transcript_digest(session.transcript),

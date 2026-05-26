@@ -6,7 +6,8 @@ runs/<session_id>/
 ├── config.json            # Config snapshot
 ├── artifact.json          # Artifact (authoritative output)
 ├── transcript.jsonl       # Append-only per-turn journal (in-progress / debug)
-└── termination.json       # TerminationArtifact (terminate paths only)
+├── termination.json       # TerminationArtifact (terminate paths only)
+└── selector_output.json   # SelectorOutput (§5.11; additive, not in the Artifact)
 ```
 
 The session_id charset is constrained to `^[A-Za-z0-9_-]{1,64}$` so the
@@ -61,6 +62,10 @@ class RunDirectory:
     @property
     def termination_path(self) -> Path:
         return self.base / "termination.json"
+
+    @property
+    def selector_output_path(self) -> Path:
+        return self.base / "selector_output.json"
 
     def ensure(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
