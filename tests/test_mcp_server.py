@@ -120,6 +120,37 @@ def test_get_run_summary_reports_replay_ok(tmp_path, script_path):
     assert summary["selected_agents"] == run["selected_agents"]
 
 
+def test_get_version_reports_runtime_state():
+    """`get_version` MUST report the live package version + key budget
+    defaults, derived from the actual signature of
+    `deliberate_adaptive_streaming` (so a future signature drift is
+    caught by an observable mismatch, not a silent diagnostic lie).
+    """
+    import inspect
+    import symposium
+
+    from symposium.integrations.mcp_server import (
+        deliberate_adaptive_streaming,
+        get_version,
+    )
+
+    info = get_version()
+    assert info["version"] == symposium.__version__
+    assert info["schema_version"] == symposium.SCHEMA_VERSION
+    assert isinstance(info["pid"], int) and info["pid"] > 0
+    assert info["package_path"].endswith("/symposium")
+    assert info["mcp_server_module"].endswith("/mcp_server.py")
+    assert info["mcp_server_mtime"]  # ISO timestamp, non-empty
+
+    # Budget defaults must match the canonical signature, not drift.
+    sig = inspect.signature(deliberate_adaptive_streaming)
+    bd = info["budget_defaults"]
+    assert bd["max_total_tokens"] == sig.parameters["max_total_tokens"].default
+    assert bd["max_total_cost_usd"] == sig.parameters["max_total_cost_usd"].default
+    assert bd["max_rounds"] == sig.parameters["max_rounds"].default
+    assert bd["max_wallclock_seconds"] == sig.parameters["max_wallclock_seconds"].default
+
+
 def test_list_personas_returns_six_builtins():
     personas = list_personas()
     assert isinstance(personas, list)

@@ -434,6 +434,77 @@ def list_personas() -> List[Dict[str, str]]:
 
 
 @mcp.tool()
+def get_version() -> Dict[str, Any]:
+    """Return the running MCP server's version + provenance + key defaults.
+
+    Diagnostic introspection so an operator (or LLM agent) can verify
+    *what code is actually executing right now*, not what `pip show`
+    claims is installed on disk. Useful when a respawn is needed to
+    pick up a new version, or when investigating why a tool's
+    behavior doesn't match the docs.
+
+    Returns::
+
+        {
+          "version": "<package __version__>",
+          "schema_version": "<protocol SCHEMA_VERSION>",
+          "pid": <int>,
+          "python": "<sys.executable>",
+          "package_path": "<dir containing symposium/__init__.py>",
+          "mcp_server_module": "<path to mcp_server.py>",
+          "mcp_server_mtime": "<ISO timestamp of mcp_server.py>",
+          "budget_defaults": {
+              "max_total_tokens": <int>,
+              "max_total_cost_usd": <float>,
+              "max_rounds": <int>,
+              "max_wallclock_seconds": <int>
+          }
+        }
+    """
+    import inspect
+    import os
+    import sys
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    import symposium as _symposium
+    from symposium import SCHEMA_VERSION as _SCHEMA_VERSION
+
+    pkg_init = Path(_symposium.__file__).resolve()
+    pkg_dir = pkg_init.parent
+    server_module = Path(__file__).resolve()
+    server_mtime = datetime.fromtimestamp(
+        server_module.stat().st_mtime, tz=timezone.utc
+    ).isoformat()
+
+    # Pull budget defaults straight from the canonical signature
+    # (`deliberate_adaptive_streaming`) — guarantees what we report
+    # here is exactly what every `deliberate*` tool will use when the
+    # caller omits a value.
+    sig = inspect.signature(deliberate_adaptive_streaming)
+    budget_defaults = {
+        name: sig.parameters[name].default
+        for name in (
+            "max_total_tokens",
+            "max_total_cost_usd",
+            "max_rounds",
+            "max_wallclock_seconds",
+        )
+    }
+
+    return {
+        "version": _symposium.__version__,
+        "schema_version": _SCHEMA_VERSION,
+        "pid": os.getpid(),
+        "python": sys.executable,
+        "package_path": str(pkg_dir),
+        "mcp_server_module": str(server_module),
+        "mcp_server_mtime": server_mtime,
+        "budget_defaults": budget_defaults,
+    }
+
+
+@mcp.tool()
 def generate_persona(
     need: str, *, persona_class: str = "domain", prefer_cli: str = "claude"
 ) -> Dict[str, Any]:
