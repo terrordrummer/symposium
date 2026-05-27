@@ -153,9 +153,17 @@ class CodexCliProvider(ProviderAdapter):
 
     Constructor parameters mirror `ClaudeCliProvider`: `binary`,
     `default_model` (None / a sentinel → omit `-m`), `timeout`,
-    `extra_args`, `isolated`, `env`, and a `runner` injection seam for
-    tests. `check_binary` fail-fasts at construction when the CLI is
-    absent.
+    `extra_args`, `isolated`, `workdir`, `env`, and a `runner`
+    injection seam for tests. `check_binary` fail-fasts at construction
+    when the CLI is absent.
+
+    `workdir` (default ``None`` → ``os.getcwd()`` at invocation time)
+    is the directory codex sees as its working tree (``-C`` argument).
+    The default — the MCP server's cwd, inherited from the parent
+    Claude Code session, typically the user's project root — matches
+    claude-cli's natural cwd inheritance. Set explicitly for an
+    isolated sandbox if needed. Sandbox stays ``-s read-only``, so
+    a project-rooted workdir cannot be mutated. (v1.10.9+)
 
     `isolated` (default ``True``) adds ``--ignore-user-config`` and
     ``--ignore-rules`` to every invocation: those flags skip
@@ -192,6 +200,7 @@ class CodexCliProvider(ProviderAdapter):
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         extra_args: Optional[List[str]] = None,
         isolated: bool = True,
+        workdir: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         runner: Optional[Runner] = None,
         check_binary: bool = True,
@@ -201,6 +210,17 @@ class CodexCliProvider(ProviderAdapter):
         self._timeout = timeout
         self._extra_args = list(extra_args or [])
         self._isolated = isolated
+        # `workdir` becomes the codex `-C` argument: the directory codex
+        # sees as its working tree for read-only file inspection. None
+        # (default, v1.10.9+) means `os.getcwd()` at invocation time —
+        # the MCP server's cwd, inherited from the parent Claude Code
+        # session, which is typically the user's project root. Same
+        # semantics as claude-cli (no `-C` flag, picks up cwd
+        # naturally). Set explicitly to a path for an isolated sandbox
+        # (the pre-v1.10.9 behavior was an empty tmpdir, which made
+        # personas blind to the codebase). Sandbox stays `read-only`,
+        # so a project-rooted workdir still cannot be mutated.
+        self._workdir = workdir
         self._env_override = env
         self._run: Runner = runner or subprocess.run
         if check_binary and runner is None and shutil.which(binary) is None:
@@ -239,12 +259,23 @@ class CodexCliProvider(ProviderAdapter):
             prompt = f"{prompt}{prompt_suffix}"
 
         schema_json = _schema_for(request.expected_output_schema)
-        tmpdir = tempfile.mkdtemp(prefix="symposium-codex-")
+        # `tmpdir` holds only the --output-schema file (codex's
+        # JSON-Schema output enforcement reads from a path, not stdin).
+        # The codex working dir (-C) is a SEPARATE concern: v1.10.9+
+        # defaults to `os.getcwd()` (= the MCP server's cwd, inherited
+        # from the parent Claude Code session, i.e. the user's project
+        # root) so personas can READ the project files just like
+        # claude-cli does. Sandbox stays `read-only`, so no writes —
+        # but visionary's "I can only see schema.json" failure mode
+        # from v1.10.8 is closed. Opt back into the old neutral-cwd
+        # behavior with `workdir="<isolated_tmp>"` on the constructor.
+        schema_dir = tempfile.mkdtemp(prefix="symposium-codex-")
+        workdir = self._workdir or os.getcwd()
         schema_path: Optional[str] = None
         try:
             argv: List[str] = [
                 self._binary, "exec", "--json",
-                "--skip-git-repo-check", "-s", "read-only", "-C", tmpdir,
+                "--skip-git-repo-check", "-s", "read-only", "-C", workdir,
             ]
             if self._isolated:
                 # Don't pull in the operator's interactive customizations
@@ -256,7 +287,7 @@ class CodexCliProvider(ProviderAdapter):
             if model and model not in _AUTO_MODELS:
                 argv += ["-m", model]
             if schema_json is not None:
-                schema_path = os.path.join(tmpdir, "schema.json")
+                schema_path = os.path.join(schema_dir, "schema.json")
                 with open(schema_path, "w", encoding="utf-8") as fh:
                     fh.write(schema_json)
                 argv += ["--output-schema", schema_path]
@@ -285,7 +316,7 @@ class CodexCliProvider(ProviderAdapter):
             except Exception as exc:  # noqa: BLE001
                 return _error_result("internal", f"failed to run codex CLI: {exc}", False)
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            shutil.rmtree(schema_dir, ignore_errors=True)
 
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()

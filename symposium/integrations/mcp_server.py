@@ -16,13 +16,25 @@ back the same way.
 
 Tools exposed:
 
-  * ``deliberate``       — build a Config from arguments, run a session,
-    return its outcome + synthesis answer (or termination reason) and a
-    compact run summary.
-  * ``get_run_summary``  — load a persisted run, recompute §7.9 metrics,
-    verify the §7.5 transcript replay, return the summary.
-  * ``list_personas``    — the six built-in personas (R3 default panel +
-    coordinator).
+  * ``deliberate``                    — build a Config from arguments, run
+    one session, return outcome + synthesis answer (or termination
+    reason) and a compact run summary.
+  * ``deliberate_streaming``          — same as ``deliberate`` but pushes
+    each transcript message live via ``ctx.info`` / ``ctx.report_progress``.
+  * ``deliberate_adaptive``           — adds dynamic agent generation
+    (early-start + runtime) over multiple linked sessions.
+  * ``deliberate_adaptive_streaming`` — adaptive + live streaming.
+  * ``get_run_summary``               — load a persisted run, recompute
+    §7.9 metrics, verify the §7.5 transcript replay, return the summary.
+  * ``get_run_status``                — read transcript progressively
+    while a run is still active (polling-friendly, v1.10.9+).
+  * ``get_version``                   — runtime introspection: package
+    version, package_path, CLI versions, cli_auto routing, budget
+    defaults (v1.10.5+).
+  * ``list_personas``                 — the six built-in personas (R3
+    default panel + coordinator).
+  * ``generate_persona``              — design ONE new domain expert
+    persona from a free-text capability need.
 
 The `mcp` SDK is an OPTIONAL dependency (the ``[mcp]`` extra). It is
 imported at *this module's* import time, NOT at `symposium` package
@@ -76,6 +88,7 @@ from symposium.providers import (
 )
 from symposium.replay import replay_transcript
 from symposium.scheduler import run_session
+from symposium.storage.writer import _is_stale_lock
 
 # ---------------------------------------------------------------------------
 # Defaults (read from the example config when present; constant fallback for
@@ -389,6 +402,148 @@ async def deliberate_streaming(
     return final if final is not None else {
         "error": "RuntimeError: streaming deliberation produced no result"
     }
+
+
+@mcp.tool()
+def get_run_status(
+    run_dir: str, *, since_index: int = 0, limit: int = 20,
+) -> Dict[str, Any]:
+    """Read transcript messages from a (possibly still-running) deliberation.
+
+    Designed for **polling during a long-running deliberation** so an
+    agent can show the panel's dialogue live in chat without depending
+    on MCP `notifications/message` rendering (which some clients hide
+    or render minimally). Typical loop::
+
+        s = get_run_status(run_dir)
+        # display s["messages"]
+        while s["run_active"]:
+            time.sleep(5)
+            s = get_run_status(run_dir, since_index=s["next_index"])
+            # display NEW s["messages"]
+
+    Args:
+        run_dir: path to the run directory (the `run_dir` field
+            returned by `deliberate*` MCP tools).
+        since_index: skip the first N transcript entries. Set to the
+            previous call's ``next_index`` to fetch only new turns.
+        limit: max messages to return in this call (default 20).
+            Larger requests are clamped silently to keep responses
+            bounded. The remaining-message count is returned so the
+            caller knows whether to drain more.
+
+    Returns:
+        On success::
+
+            {
+              "messages": [
+                {"index": int, "speaker": str, "type": str, "round": int,
+                 "turn_index": int, "text": str, "timestamp": str},
+                ...
+              ],
+              "next_index": int,        # pass as since_index next call
+              "remaining": int,         # entries beyond next_index NOT returned
+              "run_active": bool,       # .lock present AND PID still alive
+              "lock_stale": bool,       # .lock present but PID is dead
+              "total_so_far": int,      # transcript line count at read time
+            }
+
+        On any error: ``{"error": "<kind>: <message>"}``.
+
+    Read-only: never blocks the running deliberation, never mutates
+    the run directory. Safe to call from any client.
+    """
+    try:
+        rd = Path(run_dir)
+        transcript = rd / "transcript.jsonl"
+        if not transcript.exists():
+            raise FileNotFoundError(f"no transcript.jsonl under {rd}")
+
+        # Clamp limit defensively — clients (especially LLM-driven ones)
+        # occasionally pass nonsense like limit=10000. 100 is a generous
+        # ceiling that still fits in a typical MCP response budget.
+        effective_limit = max(1, min(int(limit), 100))
+        effective_since = max(0, int(since_index))
+
+        messages: List[Dict[str, Any]] = []
+        total = 0
+        with open(transcript, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                total = idx + 1
+                if idx < effective_since:
+                    continue
+                if len(messages) >= effective_limit:
+                    # Don't break — keep counting `total` so the caller
+                    # sees how many entries exist beyond what we returned.
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                c = d.get("content", {})
+                if isinstance(c, dict):
+                    # primary_turn / branch_turn carry `.text`; coordination_turn
+                    # (Verdict) doesn't have `.text` — its readable content is
+                    # `rationale` + `focus`; synthesis (SynthesisContent) carries
+                    # `integrated_answer`. Pre-T7 fallback to `c.get("text","")`
+                    # silently dropped coordinator + synthesis turns. (Codex
+                    # review T7 #6.)
+                    text = ""
+                    for key in ("text", "integrated_answer", "rationale", "focus"):
+                        v = c.get(key)
+                        if isinstance(v, str) and v:
+                            text = v
+                            break
+                    if not text:
+                        # last resort — render the whole content dict so the
+                        # caller sees SOMETHING instead of an empty turn
+                        text = json.dumps(c, ensure_ascii=False)[:2000]
+                elif isinstance(c, str):
+                    text = c
+                else:
+                    text = ""
+                messages.append({
+                    "index": idx,
+                    "speaker": d.get("speaker"),
+                    "type": d.get("type"),
+                    "round": d.get("round"),
+                    "turn_index": d.get("turn_index"),
+                    "text": text,
+                    "timestamp": d.get("timestamp"),
+                })
+
+        # `next_index` derived from the LAST returned message's index +1
+        # (Codex review T7 #4). Avoids the buggy `effective_since + len()`
+        # which over-advanced past skipped-malformed lines: if a partial
+        # write was skipped, the caller re-reading from that position
+        # would re-fetch already-seen lines that had been counted but
+        # not returned. Anchoring to the physical index of the last
+        # returned line is both correct and idempotent.
+        next_index = messages[-1]["index"] + 1 if messages else effective_since
+        remaining = max(0, total - next_index)
+        # `.lock` present is necessary but NOT sufficient for "still
+        # running": a crashed RunWriter leaves the lock orphan, and a
+        # polling agent would loop forever (Codex T7 #2). Use the
+        # writer's own staleness check — same logic the writer applies
+        # before reclaiming a lock (PID-alive probe).
+        lock_path = rd / ".lock"
+        lock_present = lock_path.exists()
+        lock_stale = lock_present and _is_stale_lock(lock_path)
+        run_active = lock_present and not lock_stale
+
+        return {
+            "messages": messages,
+            "next_index": next_index,
+            "remaining": remaining,
+            "run_active": run_active,
+            "lock_stale": lock_stale,
+            "total_so_far": total,
+        }
+    except Exception as exc:  # noqa: BLE001 — structured error, never crash
+        return _error(exc)
 
 
 @mcp.tool()

@@ -9,6 +9,7 @@ needs ANTHROPIC_API_KEY / OPENAI_API_KEY.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -580,3 +581,212 @@ def test_artifact_carries_last_provider_failure_end_to_end(tmp_path, repo_root):
     assert summary["termination_reason"] == "provider_unrecoverable"
     assert "last_provider_failure" in summary
     assert "unknown variant `max`" in summary["last_provider_failure"]["message"]
+
+
+def test_get_run_status_streams_transcript_progressively(tmp_path):
+    """`get_run_status` MUST read transcript entries from a since_index
+    and report whether the run is still active. Designed for polling
+    long-running deliberations: an agent calls it repeatedly with the
+    previous `next_index` to fetch only new turns and show them live.
+    """
+    from symposium.integrations.mcp_server import get_run_status
+
+    rd = tmp_path / "test-run"
+    rd.mkdir()
+    transcript = rd / "transcript.jsonl"
+    # Simulate a transcript with 3 entries.
+    entries = [
+        {"id": "m0", "speaker": "mcp", "type": "problem_statement",
+         "content": "Solve X", "round": 0, "turn_index": 0,
+         "timestamp": "2026-05-27T22:31:00Z"},
+        {"id": "m1", "speaker": "logician", "type": "primary_turn",
+         "content": {"text": "Logician says A."}, "round": 1, "turn_index": 1,
+         "timestamp": "2026-05-27T22:32:00Z"},
+        {"id": "m2", "speaker": "visionary", "type": "primary_turn",
+         "content": {"text": "Visionary says B."}, "round": 1, "turn_index": 2,
+         "timestamp": "2026-05-27T22:33:00Z"},
+    ]
+    transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    # Lock file → run_active=True
+    (rd / ".lock").write_text("pid 1234")
+
+    # First call: get all 3 from start.
+    s1 = get_run_status(str(rd))
+    assert "error" not in s1
+    assert len(s1["messages"]) == 3
+    assert s1["next_index"] == 3
+    assert s1["remaining"] == 0
+    assert s1["run_active"] is True
+    assert s1["total_so_far"] == 3
+    assert s1["messages"][0]["speaker"] == "mcp"
+    assert s1["messages"][1]["text"] == "Logician says A."
+    assert s1["messages"][2]["text"] == "Visionary says B."
+    assert s1["messages"][0]["text"] == "Solve X"  # plain-string content
+
+    # Second call: since_index=3, no new entries yet.
+    s2 = get_run_status(str(rd), since_index=3)
+    assert s2["messages"] == []
+    assert s2["next_index"] == 3
+
+    # Append a new entry → next poll sees it as delta.
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"id": "m3", "speaker": "researcher",
+                            "type": "primary_turn",
+                            "content": {"text": "Researcher says C."},
+                            "round": 1, "turn_index": 3,
+                            "timestamp": "2026-05-27T22:34:00Z"}) + "\n")
+    s3 = get_run_status(str(rd), since_index=s2["next_index"])
+    assert len(s3["messages"]) == 1
+    assert s3["messages"][0]["speaker"] == "researcher"
+    assert s3["messages"][0]["index"] == 3
+    assert s3["next_index"] == 4
+
+    # Once .lock disappears, run_active=False (writer finished).
+    (rd / ".lock").unlink()
+    s4 = get_run_status(str(rd))
+    assert s4["run_active"] is False
+
+
+def test_get_run_status_clamps_limit_and_reports_remaining(tmp_path):
+    """Defensive: huge `limit` requests get clamped. Caller still sees
+    a non-zero `remaining` so they know to drain more.
+    """
+    from symposium.integrations.mcp_server import get_run_status
+
+    rd = tmp_path / "big-run"
+    rd.mkdir()
+    transcript = rd / "transcript.jsonl"
+    # 5 entries
+    entries = [
+        {"id": f"m{i}", "speaker": "x", "type": "primary_turn",
+         "content": {"text": f"entry {i}"}, "round": 1, "turn_index": i,
+         "timestamp": "2026-05-27T00:00:00Z"}
+        for i in range(5)
+    ]
+    transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    # limit=2 → returns 2, reports 3 remaining
+    s = get_run_status(str(rd), limit=2)
+    assert len(s["messages"]) == 2
+    assert s["next_index"] == 2
+    assert s["remaining"] == 3
+    assert s["total_so_far"] == 5
+
+    # limit=10000 → clamped, all returned (since total is 5 < clamp)
+    s = get_run_status(str(rd), limit=10000)
+    assert len(s["messages"]) == 5
+
+
+def test_get_run_status_missing_run_returns_error(tmp_path):
+    from symposium.integrations.mcp_server import get_run_status
+    s = get_run_status(str(tmp_path / "no-such-run"))
+    assert "error" in s
+
+
+def test_get_run_status_treats_stale_lock_as_inactive(tmp_path, monkeypatch):
+    """A `.lock` file with a dead PID MUST NOT trick `get_run_status`
+    into reporting `run_active=True` — a polling agent would otherwise
+    loop forever after a crashed RunWriter. Codex review T7 #2.
+
+    Uses the same `_is_stale_lock` staleness check the storage writer
+    uses to reclaim orphan locks, so the two views agree. The PID-alive
+    probe is mocked deterministically (Codex T8 nit): a real PID like
+    999999 is "almost certainly dead" but not guaranteed, which would
+    leave the test theoretically flaky.
+    """
+    from symposium.integrations.mcp_server import get_run_status
+    from symposium.storage import writer as writer_module
+
+    rd = tmp_path / "crashed-run"
+    rd.mkdir()
+    (rd / "transcript.jsonl").write_text(
+        json.dumps({"id": "m0", "speaker": "mcp", "type": "problem_statement",
+                    "content": "x", "round": 0, "turn_index": 0,
+                    "timestamp": "2026-05-27T00:00:00Z"}) + "\n"
+    )
+    (rd / ".lock").write_text("12345")  # any int — we mock os.kill
+
+    # Force the writer's PID-alive probe to claim the process is gone.
+    def _dead(pid, sig):
+        raise ProcessLookupError(f"no such pid {pid}")
+    monkeypatch.setattr(writer_module.os, "kill", _dead)
+
+    s = get_run_status(str(rd))
+    assert "error" not in s, s
+    assert s["lock_stale"] is True, (
+        "lock with dead PID should be flagged stale"
+    )
+    assert s["run_active"] is False, (
+        "stale lock must NOT report run_active=True (Codex T7 #2)"
+    )
+
+
+def test_get_run_status_surfaces_coordinator_verdict_and_synthesis_content(tmp_path):
+    """`get_run_status` MUST surface readable text for `coordination_turn`
+    (Verdict — has `rationale` + `focus`, no `text`) AND `synthesis`
+    (SynthesisContent — has `integrated_answer`, no `text`). Pre-T7
+    fallback to `c.get("text", "")` silently dropped both, so the
+    "live dialogue" view hid exactly the coordinator's verdict and the
+    final synthesis — i.e., the two most important turns. Codex T7 #6.
+    """
+    from symposium.integrations.mcp_server import get_run_status
+
+    rd = tmp_path / "verdict-run"
+    rd.mkdir()
+    entries = [
+        # Verdict-shaped content (no `text` field)
+        {"id": "v1", "speaker": "coordinator", "type": "coordination_turn",
+         "content": {"next_action": "continue", "rationale": "the panel converges on X",
+                     "confidence": 0.7, "next_agents": ["logician"],
+                     "resolved_disagreements": [], "unresolved_disagreements": []},
+         "round": 1, "turn_index": 5, "timestamp": "2026-05-27T00:00:00Z"},
+        # Synthesis-shaped content (no `text`, has `integrated_answer`)
+        {"id": "s1", "speaker": "coordinator", "type": "synthesis",
+         "content": {"integrated_answer": "The final answer is 42.",
+                     "resolved_disagreements": [], "unresolved_disagreements": []},
+         "round": 2, "turn_index": 10, "timestamp": "2026-05-27T00:01:00Z"},
+    ]
+    (rd / "transcript.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in entries) + "\n"
+    )
+
+    s = get_run_status(str(rd))
+    assert len(s["messages"]) == 2
+    # coordination_turn → text falls back to `rationale`
+    assert s["messages"][0]["type"] == "coordination_turn"
+    assert s["messages"][0]["text"] == "the panel converges on X"
+    # synthesis → text falls back to `integrated_answer`
+    assert s["messages"][1]["type"] == "synthesis"
+    assert s["messages"][1]["text"] == "The final answer is 42."
+
+
+def test_get_run_status_next_index_anchors_to_last_returned(tmp_path):
+    """`next_index` MUST point to the index immediately after the LAST
+    returned message, NOT `since + len(messages)`. Codex review T7 #4:
+    the pre-fix arithmetic over-advanced when a malformed/empty line
+    was silently skipped, causing the next poll to miss valid entries
+    or re-fetch already-seen ones.
+    """
+    from symposium.integrations.mcp_server import get_run_status
+
+    rd = tmp_path / "partial-run"
+    rd.mkdir()
+    transcript = rd / "transcript.jsonl"
+    # 3 valid entries
+    valid = [
+        {"id": f"m{i}", "speaker": "x", "type": "primary_turn",
+         "content": {"text": f"turn {i}"}, "round": 1, "turn_index": i,
+         "timestamp": "2026-05-27T00:00:00Z"}
+        for i in range(3)
+    ]
+    transcript.write_text("\n".join(json.dumps(e) for e in valid) + "\n")
+
+    s = get_run_status(str(rd))
+    # All 3 valid → next_index = index of last (2) + 1 = 3
+    assert s["next_index"] == 3
+    assert s["messages"][-1]["index"] == 2
+
+    # Empty result → next_index stays at since_index (don't lie about progress)
+    s2 = get_run_status(str(rd), since_index=10)
+    assert s2["messages"] == []
+    assert s2["next_index"] == 10

@@ -8,6 +8,7 @@ or touches the network.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -538,3 +539,47 @@ def test_codex_exit_error_surfaces_upstream_code_when_present():
     assert "[invalid_json_schema]" in result.error.message, (
         f"missing upstream code in surfaced message: {result.error.message!r}"
     )
+
+
+def test_codex_workdir_defaults_to_os_getcwd(monkeypatch):
+    """`CodexCliProvider` (v1.10.9+) MUST default to `os.getcwd()` for
+    the codex `-C` working dir, so personas can READ the project files
+    just like claude-cli does (which inherits cwd naturally).
+
+    Pre-v1.10.9 the default was an empty `tempfile.mkdtemp()`, which
+    made codex personas blind to the codebase — observed as visionary
+    responding "I'm blocked from applying the implementation; the
+    directory contains only schema.json".
+    """
+    seen = {}
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout=_codex_stdout(structured={"text": "t"}), stderr="")
+
+    fake_cwd = "/Users/foo/my-project"
+    monkeypatch.setattr(os, "getcwd", lambda: fake_cwd)
+
+    CodexCliProvider(runner=runner).invoke(_req())
+
+    argv = seen["argv"]
+    idx = argv.index("-C")
+    assert argv[idx + 1] == fake_cwd, (
+        f"-C must default to os.getcwd(), got {argv[idx + 1]!r}"
+    )
+
+
+def test_codex_workdir_explicit_override():
+    """`CodexCliProvider(workdir="/custom/dir")` MUST override the
+    os.getcwd() default — opt-in to a sandboxed/isolated working dir
+    for operators who want the pre-v1.10.9 neutral behavior or a
+    different project root.
+    """
+    seen = {}
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout=_codex_stdout(structured={"text": "t"}), stderr="")
+
+    CodexCliProvider(runner=runner, workdir="/explicit/path").invoke(_req())
+    argv = seen["argv"]
+    idx = argv.index("-C")
+    assert argv[idx + 1] == "/explicit/path"
