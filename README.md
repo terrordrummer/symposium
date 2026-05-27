@@ -446,7 +446,7 @@ under subscription login; (3) the cap is checked *after* each invocation
 completes, so a single runaway claude-cli agentic loop (≈1M prompt
 tokens is normal for a substantive coding turn) can sail through any
 "reasonable" $-cap before any check fires. **The real hard caps under
-`cli-auto` are `max_wallclock_seconds` (default 1800s = 30min) and your
+`cli-auto` are `max_wallclock_seconds` (default 3600s = 60min, v1.10.10+; was 1800s through v1.10.9) and your
 subscription's rate-limit window.** For API providers (`anthropic` /
 `openai`), where every token IS a billable charge, lower the defaults
 explicitly per call (`max_total_tokens=200_000, max_total_cost_usd=5.0`

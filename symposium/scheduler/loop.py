@@ -279,6 +279,246 @@ def derive_context_packet(
 # ---------------------------------------------------------------------------
 
 
+def _build_persona_system_prompt(packet: ContextPacket, expected_output_schema: str) -> str:
+    """Render the persona's full charter + "deliberation mode" framing
+    into the system message for a turn (v1.10.10+).
+
+    The pre-v1.10.10 system message — `"persona={id}; round={N}"` —
+    left the live CLI personas with zero awareness of their role,
+    causing the codex `visionary` to misread the deliberation as an
+    implementation task ("I'm blocked, the sandbox is read-only").
+    """
+    p = packet.persona_material
+
+    def _bul(items):
+        return "\n".join(f"  - {it}" for it in items) if items else "  (none)"
+
+    role_block = (
+        f"## YOUR ROLE — {p.id} ({p.persona_class})\n"
+        f"Reasoning scope: {p.reasoning_scope}\n"
+        f"Reasoning style: {p.reasoning_style}\n"
+        f"\n## BEHAVIORAL CONSTRAINTS\n{_bul(p.behavioral_constraints)}\n"
+        f"\n## KNOWN FAILURE MODES TO AVOID\n{_bul(p.failure_modes)}\n"
+        f"\n## OUTPUT REQUIREMENTS\n{_bul(p.output_requirements)}\n"
+    )
+
+    # The "discussant, not implementor" framing is the most important
+    # bit for cli-auto runs: codex/claude under `-s read-only` will
+    # otherwise try to apply patches, get blocked, and waste their
+    # turn reporting the sandbox rejection instead of contributing
+    # analysis.
+    #
+    # Schema-aware output guidance (Codex review T9 #3): pre-fix the
+    # framing said "emit `text` + `direct_requests`" for EVERY call,
+    # which is wrong for the coordinator (`verdict`: emits
+    # next_action/rationale/focus/next_agents/disagreement fields) and
+    # the synthesis turn (`synthesis_content`: emits
+    # integrated_answer/disagreements/confidence/open_questions). The
+    # mismatch confused the very persona it tried to correct.
+    deliberation_intro = (
+        "\n## DELIBERATION MODE — IMPORTANT\n"
+        "You are participating in a STRUCTURED MULTI-AGENT DELIBERATION as the "
+        f"`{p.id}` panelist. Your job is to ANALYZE the problem statement from "
+        "your perspective and CONTRIBUTE your viewpoint to the panel. You are a "
+        "DISCUSSANT, not an IMPLEMENTOR.\n"
+        "\n"
+        "General behavior (same for every turn):\n"
+        "  - DO read project files (Read, Grep, Glob, Bash) to ground your analysis\n"
+        "    in the actual code.\n"
+        "  - DO NOT modify files, apply patches, write code, run tests, or attempt\n"
+        "    any side-effect on the project — the sandbox is read-only by design,\n"
+        "    AND that's not your job here.\n"
+        "  - DO NOT spend your turn reporting tool/sandbox limitations — focus on\n"
+        "    substantive analysis.\n"
+    )
+    if expected_output_schema == "turn_structured_output":
+        output_guidance = (
+            "\nOutput shape for this turn (`turn_structured_output`):\n"
+            "  - `text`: your reasoning, the substantive contribution. Required,\n"
+            "    non-empty.\n"
+            "  - `direct_requests`: list of `{target, type, content}` objects\n"
+            "    to address another panelist directly when you need their\n"
+            "    specific input. Use sparingly. **Emit `null` when you have\n"
+            "    nothing to request** (the strict-mode schema requires the\n"
+            "    field be present; the runtime treats `null` as 'no requests').\n"
+        )
+    elif expected_output_schema == "verdict":
+        output_guidance = (
+            "\nOutput shape for this turn (`verdict` — coordinator role):\n"
+            "  - `next_action`: one of `continue` / `finalize` /\n"
+            "    `request_user_input` / `request_external_research` — see\n"
+            "    NEXT_ACTION GUIDANCE below.\n"
+            "  - `rationale`: WHY you chose that next_action, grounded in the\n"
+            "    round's contributions. Required.\n"
+            "  - `focus`: what the panel should attend to next (free-text).\n"
+            "  - `next_agents`: subset of CURRENT PANEL ids to speak next round\n"
+            "    (only valid with `continue`).\n"
+            "  - `resolved_disagreements` / `unresolved_disagreements`: list of\n"
+            "    structured disagreement objects from this round.\n"
+            "  - `user_input_request` / `external_research_request`: payload for\n"
+            "    the matching next_action. **Emit `null` when next_action\n"
+            "    doesn't require it** (strict schemas keep these fields present;\n"
+            "    null = 'no payload').\n"
+            "  - DO NOT emit `text` or `direct_requests` — those belong to\n"
+            "    panel-member turns, not the verdict schema.\n"
+        )
+    elif expected_output_schema == "synthesis_content":
+        output_guidance = (
+            "\nOutput shape for this turn (`synthesis_content` — synthesis role):\n"
+            "  - `integrated_answer`: the final synthesized answer the panel\n"
+            "    converged on. Required, non-empty.\n"
+            "  - `resolved_disagreements` / `unresolved_disagreements`: structured\n"
+            "    summaries of where the panel landed.\n"
+            "  - `confidence`: float in [0,1].\n"
+            "  - `open_questions`: list of questions that remain after synthesis.\n"
+            "  - DO NOT emit `text` or `direct_requests` — those belong to\n"
+            "    panel-member turns, not the synthesis schema.\n"
+        )
+    else:
+        output_guidance = ""
+    deliberation_framing = deliberation_intro + output_guidance
+
+    context_block = (
+        f"\n## CONTEXT\nRound: {packet.round} of the deliberation. "
+        f"Output schema: `{expected_output_schema}`.\n"
+    )
+
+    # Coordinator-only addendum: pre-v1.10.10 the coordinator had no
+    # explicit guidance on what each `next_action` enum value means
+    # operationally, and especially what `next_agents` accepts.
+    # Observed in production: the coordinator emitted
+    # `next_action="continue", next_agents=["fourier-optics-physicist",
+    # "numerical-fft-methods-expert"]` — referencing experts that do
+    # NOT exist in the panel, expecting the runtime to spawn them.
+    # The runtime can only spawn dynamically via
+    # `request_external_research` (the adaptive `_pending_need` reads
+    # only that termination reason + `request_user_input`); a
+    # `continue` with phantom next_agents just gets the existing panel
+    # back. Spelling this out in the coordinator's system prompt
+    # avoids the silent failure mode.
+    coordinator_addendum = ""
+    if p.id == "coordinator":
+        coordinator_addendum = (
+            "\n## NEXT_ACTION GUIDANCE (coordinator-only)\n"
+            "Choose `next_action` from the 4-value enum and respect what each\n"
+            "actually does at runtime — the host scheduler dispatches on this\n"
+            "value:\n"
+            "\n"
+            "  - `continue`: panel keeps going for another round. `next_agents`\n"
+            "    selects who speaks next, but can ONLY reference panel members\n"
+            "    that are ALREADY IN THE PANEL. Phantom IDs are silently\n"
+            "    ignored — they do NOT cause a new persona to be created.\n"
+            "  - `finalize`: panel has converged; synthesis is triggered.\n"
+            "    Use when no new substantive claims would emerge from another\n"
+            "    round.\n"
+            "  - `request_external_research`: the deliberation pauses pending\n"
+            "    external info. **This is also the channel to expand the\n"
+            "    panel with a new domain expert** — describe the missing\n"
+            "    expertise as a `query` in the\n"
+            "    `external_research_request` payload, and the runtime's\n"
+            "    adaptive loop will spawn a `Persona` matching that need\n"
+            "    and continue the deliberation with the augmented panel.\n"
+            "  - `request_user_input`: pause for operator clarification. Use\n"
+            "    only when the human-in-the-loop is genuinely needed; do not\n"
+            "    use this as a substitute for `request_external_research`.\n"
+        )
+
+    return role_block + deliberation_framing + context_block + coordinator_addendum
+
+
+def _build_packet_user_prompt(packet: ContextPacket) -> str:
+    """Serialize the `ContextPacket` into the user-message content
+    (v1.10.10+, Codex review T9 #6).
+
+    Pre-fix `build_provider_request` set `user.content = packet.
+    problem_statement` — so the live persona only ever saw the
+    original problem and was BLIND to the panel disclosure, the prior
+    verdict, the current round's exchange, and any branch-origin
+    parent. Especially for the coordinator: it was asked to emit a
+    verdict on a round whose contributions it could not see.
+
+    This builder lays out the packet in a stable, human-readable
+    Markdown shape: problem statement first, then panel, then
+    previous verdict (if any), then current-round messages in
+    speaker/type order, then branch context (if any).
+    """
+    parts: List[str] = ["# PROBLEM STATEMENT\n", packet.problem_statement, "\n"]
+
+    if packet.panel_disclosure:
+        parts.append("\n# PANEL\n")
+        for entry in packet.panel_disclosure:
+            parts.append(f"- `{entry.id}` — {entry.role_summary}\n")
+
+    if packet.previous_verdict is not None:
+        pv = packet.previous_verdict
+        parts.append("\n# PREVIOUS COORDINATOR VERDICT\n")
+        # Readable summary first…
+        parts.append(f"- next_action: `{pv.next_action}`\n")
+        if pv.rationale:
+            parts.append(f"- rationale: {pv.rationale}\n")
+        if pv.focus:
+            parts.append(f"- focus: {pv.focus}\n")
+        if pv.next_agents:
+            parts.append(f"- next_agents: {', '.join(pv.next_agents)}\n")
+        if pv.confidence is not None:
+            parts.append(f"- confidence: {pv.confidence}\n")
+        if pv.unresolved_disagreements:
+            parts.append(
+                f"- unresolved disagreements: "
+                f"{len(pv.unresolved_disagreements)} item(s)\n"
+            )
+        if pv.resolved_disagreements:
+            parts.append(
+                f"- resolved disagreements: "
+                f"{len(pv.resolved_disagreements)} item(s)\n"
+            )
+        # …then the full dump so the persona has access to disagreement
+        # topics/positions and any user_input_request /
+        # external_research_request payloads. Codex review T10 minor:
+        # the readable summary lost the bodies of the disagreement
+        # entries, which is exactly what the next-round panelist needs
+        # to address.
+        parts.append("- full verdict (json):\n")
+        parts.append(
+            f"```json\n{pv.model_dump_json(exclude_none=True)}\n```\n"
+        )
+
+    if packet.current_round_messages:
+        parts.append("\n# CURRENT ROUND — CONTRIBUTIONS SO FAR\n")
+        for msg in packet.current_round_messages:
+            text = ""
+            c = msg.content
+            if isinstance(c, dict):
+                # mirror the get_run_status fallback chain (Codex T7 #6)
+                for key in ("text", "integrated_answer", "rationale", "focus"):
+                    v = c.get(key)
+                    if isinstance(v, str) and v:
+                        text = v
+                        break
+            elif isinstance(c, str):
+                text = c
+            parts.append(f"\n## {msg.speaker} ({msg.type})\n{text}\n")
+
+    if packet.parent_message is not None:
+        pm = packet.parent_message
+        parts.append("\n# BRANCH ORIGIN\n")
+        pmtext = ""
+        c = pm.content
+        if isinstance(c, dict):
+            pmtext = c.get("text") or c.get("rationale") or ""
+        elif isinstance(c, str):
+            pmtext = c
+        parts.append(f"From `{pm.speaker}` ({pm.type}): {pmtext}\n")
+    if packet.originating_direct_request is not None:
+        odr = packet.originating_direct_request
+        parts.append(
+            f"\n# DIRECT REQUEST TO YOU\n"
+            f"target=`{odr.target}` type=`{odr.type}` content={odr.content!r}\n"
+        )
+
+    return "".join(parts)
+
+
 def build_provider_request(
     session: Session,
     *,
@@ -287,17 +527,27 @@ def build_provider_request(
     packet: ContextPacket,
 ) -> ProviderRequest:
     ac = session.agent_by_id(agent_id)
-    # The provider request shape is intentionally minimal in the walking
-    # skeleton — the FakeProvider's match clause asserts on agent_id and
-    # expected_output_schema only.
+    # System prompt carries the persona's full charter + an explicit
+    # "deliberation mode" framing (v1.10.10+). Pre-v1.10.10 the system
+    # message was just `"persona={id}; round={N}"` — minimal enough to
+    # match the walking-skeleton FakeProvider, but it left the live
+    # claude/codex CLI personas without any awareness of their role.
+    # Observed failure mode: with cli-auto on a coding problem, the
+    # `visionary` persona repeatedly responded "I'm blocked — the
+    # sandbox is read-only, I cannot apply the patch" — treating the
+    # deliberation as an implementation task instead of as analysis.
+    # The richer system prompt frames the panelist as a DISCUSSANT
+    # who can read the project for grounding but must not implement.
+    # FakeProvider matching is unaffected (it asserts on agent_id /
+    # round / turn_index / expected_output_schema, not message content).
     messages = [
         ProviderRequestMessage(
             role="system",
-            content=f"persona={packet.persona_material.id}; round={packet.round}",
+            content=_build_persona_system_prompt(packet, expected_output_schema),
         ),
         ProviderRequestMessage(
             role="user",
-            content=packet.problem_statement,
+            content=_build_packet_user_prompt(packet),
         ),
     ]
     return ProviderRequest(
