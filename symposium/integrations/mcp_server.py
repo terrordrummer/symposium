@@ -157,6 +157,7 @@ def deliberate(
     max_total_tokens: int = 100_000_000,
     max_total_cost_usd: float = 1000.0,
     max_wallclock_seconds: int = 1800,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
     fake_script_path: Optional[str] = None,
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
@@ -191,7 +192,19 @@ def deliberate(
             "llm" (one bounded provider call; needs `selector_fake_script_path`
             under provider="fake").
         max_rounds, max_total_tokens, max_total_cost_usd,
-        max_wallclock_seconds: §4.7 hard caps.
+        max_wallclock_seconds: §4.7 hard caps. **Under `cli-auto` (the
+            default), `max_total_tokens` (100M) and `max_total_cost_usd`
+            ($1000) are telemetry canaries, NOT real quota** — codex CLI
+            reports cost=0 (subscription, not metered), and Claude's
+            `cost_usd` is API-equivalent reference, not a bill. The real
+            hard caps under `cli-auto` are `max_wallclock_seconds`
+            (default 1800s) and your subscription rate-limit window.
+            Lower the token/cost caps explicitly when forcing
+            `provider="anthropic"` / `"openai"` where every token is a
+            billable charge.
+        per_agent_token_budget: optional per-persona token cap, eg.
+            `{"logician": 200_000}`. Useful under `cli-auto` as a hard
+            per-agent canary even when the global cap is loose.
         fake_script_path: FakeProviderScript JSON, required when
             provider="fake".
         selector_fake_script_path: a distinct FakeProviderScript JSON
@@ -217,6 +230,7 @@ def deliberate(
             max_total_tokens=max_total_tokens,
             max_total_cost_usd=max_total_cost_usd,
             max_wallclock_seconds=max_wallclock_seconds,
+            per_agent_token_budget=per_agent_token_budget,
             fake_script_path=fake_script_path,
             selector_fake_script_path=selector_fake_script_path,
             output_dir=output_dir,
@@ -247,6 +261,7 @@ async def deliberate_streaming(
     max_total_tokens: int = 100_000_000,
     max_total_cost_usd: float = 1000.0,
     max_wallclock_seconds: int = 1800,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
     fake_script_path: Optional[str] = None,
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
@@ -289,6 +304,7 @@ async def deliberate_streaming(
                 max_total_tokens=max_total_tokens,
                 max_total_cost_usd=max_total_cost_usd,
                 max_wallclock_seconds=max_wallclock_seconds,
+                per_agent_token_budget=per_agent_token_budget,
                 fake_script_path=fake_script_path,
                 selector_fake_script_path=selector_fake_script_path,
                 output_dir=output_dir,
@@ -407,7 +423,12 @@ def get_run_summary(run_dir: str) -> Dict[str, Any]:
             ),
         }
         if artifact.outcome.kind == "termination":
-            result["termination_reason"] = artifact.outcome.termination_artifact.reason
+            ta = artifact.outcome.termination_artifact
+            result["termination_reason"] = ta.reason
+            if ta.last_provider_failure is not None:
+                result["last_provider_failure"] = ta.last_provider_failure.model_dump(
+                    mode="json", exclude_none=True,
+                )
         return result
     except Exception as exc:  # noqa: BLE001 — structured result, never crash transport
         return _error(exc)
@@ -453,6 +474,9 @@ def get_version() -> Dict[str, Any]:
           "package_path": "<dir containing symposium/__init__.py>",
           "mcp_server_module": "<path to mcp_server.py>",
           "mcp_server_mtime": "<ISO timestamp of mcp_server.py>",
+          "git_commit": "<short sha>" | null,
+          "clis": {"claude": "<version>"|null, "codex": "<version>"|null},
+          "cli_auto_routing": {"<persona_id>": "<cli>", ...},
           "budget_defaults": {
               "max_total_tokens": <int>,
               "max_total_cost_usd": <float>,
@@ -463,6 +487,8 @@ def get_version() -> Dict[str, Any]:
     """
     import inspect
     import os
+    import shutil
+    import subprocess
     import sys
     from pathlib import Path
     from datetime import datetime, timezone
@@ -492,6 +518,67 @@ def get_version() -> Dict[str, Any]:
         )
     }
 
+    # Best-effort git commit. We're a published package — most installs
+    # are NOT inside a git repo, so the repo lookup falls back to None
+    # without raising. Useful when running against an editable install
+    # from the source tree (eg. during development): pinpoints the
+    # commit the live server is on, even if the disk version says
+    # "1.10.x".
+    git_commit: Optional[str] = None
+    try:
+        # Look for .git starting from the package dir upward.
+        candidate = pkg_dir
+        for _ in range(6):  # bounded walk
+            if (candidate / ".git").exists():
+                proc = subprocess.run(
+                    ["git", "-C", str(candidate), "rev-parse", "--short=12", "HEAD"],
+                    capture_output=True, text=True, timeout=2.0,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    git_commit = proc.stdout.strip()
+                break
+            candidate = candidate.parent
+            if candidate == candidate.parent:  # filesystem root
+                break
+    except Exception:  # noqa: BLE001 — diagnostic, never crash get_version
+        git_commit = None
+
+    # Which terminal CLIs are actually installed on the server's host,
+    # with their --version. This is what tells the operator at a glance
+    # that an upcoming `cli-auto` run will (or won't) find the
+    # backend(s) it expects to route to. Each probe is bounded to 2s
+    # so a hung CLI can't stall the diagnostic.
+    def _probe(binary: str) -> Optional[str]:
+        path = shutil.which(binary)
+        if not path:
+            return None
+        try:
+            proc = subprocess.run(
+                [path, "--version"], capture_output=True, text=True, timeout=2.0,
+            )
+        except Exception:  # noqa: BLE001 — diagnostic, never crash get_version
+            return None
+        out = (proc.stdout or proc.stderr or "").strip()
+        return out.splitlines()[0] if out else None
+
+    clis = {"claude": _probe("claude"), "codex": _probe("codex")}
+
+    # Default `cli-auto` per-persona routing as currently encoded in
+    # `cli_routing.DEFAULT_ROUTING` + `DEFAULT_CLI` fallback. Surfacing
+    # the matrix here documents the silent policy that v1.10.x bakes in
+    # (visionary → codex, everyone else → claude) and helps the
+    # operator notice when a code change drifts it without updating
+    # the docs.
+    try:
+        from symposium.integrations.cli_routing import DEFAULT_CLI, DEFAULT_ROUTING
+        cli_auto_routing = {
+            p.id: DEFAULT_ROUTING.get(p.id, DEFAULT_CLI)
+            for p in DEFAULT_PANEL
+        }
+        cli_auto_routing["coordinator"] = DEFAULT_ROUTING.get("coordinator", DEFAULT_CLI)
+    except (ImportError, AttributeError):
+        cli_auto_routing = {}
+
     return {
         "version": _symposium.__version__,
         "schema_version": _SCHEMA_VERSION,
@@ -500,6 +587,9 @@ def get_version() -> Dict[str, Any]:
         "package_path": str(pkg_dir),
         "mcp_server_module": str(server_module),
         "mcp_server_mtime": server_mtime,
+        "git_commit": git_commit,
+        "clis": clis,
+        "cli_auto_routing": cli_auto_routing,
         "budget_defaults": budget_defaults,
     }
 
@@ -537,6 +627,7 @@ def deliberate_adaptive(
     max_total_tokens: int = 100_000_000,
     max_total_cost_usd: float = 1000.0,
     max_wallclock_seconds: int = 1800,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
     output_dir: str = "runs",
 ) -> Dict[str, Any]:
     """Deliberate with dynamic agent generation — early-start AND runtime.
@@ -572,7 +663,9 @@ def deliberate_adaptive(
             problem=problem, panel=panel, coordinator=coordinator, provider=provider,
             experts=experts, max_expansions=effective_expansions, max_rounds=max_rounds,
             max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
-            max_wallclock_seconds=max_wallclock_seconds, output_dir=output_dir,
+            max_wallclock_seconds=max_wallclock_seconds,
+            per_agent_token_budget=per_agent_token_budget,
+            output_dir=output_dir,
             persona_caller=caller,
         )
     except Exception as exc:  # noqa: BLE001 — structured result, never crash
@@ -592,6 +685,7 @@ async def deliberate_adaptive_streaming(
     max_total_tokens: int = 100_000_000,
     max_total_cost_usd: float = 1000.0,
     max_wallclock_seconds: int = 1800,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
     output_dir: str = "runs",
     ctx: Context,
 ) -> Dict[str, Any]:
@@ -637,6 +731,7 @@ async def deliberate_adaptive_streaming(
                 max_total_tokens=max_total_tokens,
                 max_total_cost_usd=max_total_cost_usd,
                 max_wallclock_seconds=max_wallclock_seconds,
+                per_agent_token_budget=per_agent_token_budget,
                 output_dir=output_dir,
             ):
                 if stop_event.is_set():
@@ -764,6 +859,7 @@ def _run_adaptive(
     output_dir: str,
     persona_caller,
     run_one=None,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Core adaptive loop. `run_one(config) -> (artifact, result_dict)`."""
     runner = run_one or (lambda cfg: _default_adaptive_run_one(cfg, provider, output_dir))
@@ -779,6 +875,7 @@ def _run_adaptive(
         selector_strategy="fixed", max_rounds=max_rounds,
         max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
         max_wallclock_seconds=max_wallclock_seconds,
+        per_agent_token_budget=per_agent_token_budget,
     )
     existing = {a.id for a in config.agents} | {config.coordinator.id}
     generated: List[Dict[str, Any]] = []
@@ -830,6 +927,7 @@ def stream_adaptive(
     max_total_tokens: int = 100_000_000,
     max_total_cost_usd: float = 1000.0,
     max_wallclock_seconds: int = 1800,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
     output_dir: str = "runs",
     persona_caller=None,
     stream_one=None,
@@ -880,6 +978,7 @@ def stream_adaptive(
             selector_strategy="fixed", max_rounds=max_rounds,
             max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
             max_wallclock_seconds=max_wallclock_seconds,
+            per_agent_token_budget=per_agent_token_budget,
         )
     except Exception as exc:  # noqa: BLE001
         yield {"event": "error", "error": _error(exc)["error"]}
@@ -1089,6 +1188,7 @@ def stream_deliberation(
     max_total_tokens: int = 100_000_000,
     max_total_cost_usd: float = 1000.0,
     max_wallclock_seconds: int = 1800,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
     fake_script_path: Optional[str] = None,
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
@@ -1126,6 +1226,7 @@ def stream_deliberation(
             max_total_tokens=max_total_tokens,
             max_total_cost_usd=max_total_cost_usd,
             max_wallclock_seconds=max_wallclock_seconds,
+            per_agent_token_budget=per_agent_token_budget,
             fake_script_path=fake_script_path,
             selector_fake_script_path=selector_fake_script_path,
             output_dir=output_dir,
@@ -1291,6 +1392,7 @@ def _prepare(
     fake_script_path: Optional[str],
     selector_fake_script_path: Optional[str],
     output_dir: str,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
 ) -> Tuple[Config, Dict[str, Any], Optional[Dict[str, Any]], Path, List[str]]:
     """Build the Config, providers, optional selector providers, run dir, panel.
 
@@ -1316,6 +1418,7 @@ def _prepare(
         max_total_tokens=max_total_tokens,
         max_total_cost_usd=max_total_cost_usd,
         max_wallclock_seconds=max_wallclock_seconds,
+        per_agent_token_budget=per_agent_token_budget,
     )
 
     # cli-auto: route each agent to claude-cli / codex-cli per persona, with
@@ -1369,7 +1472,15 @@ def _build_result(artifact: Artifact, run_dir: Path, panel_ids: List[str]) -> Di
     if artifact.outcome.kind == "synthesis":
         result["synthesis_answer"] = _synthesis_answer(artifact)
     else:
-        result["termination_reason"] = artifact.outcome.termination_artifact.reason
+        ta = artifact.outcome.termination_artifact
+        result["termination_reason"] = ta.reason
+        # Surface the provider's actual complaint so the MCP caller sees
+        # actionable diagnostics (eg. codex "unknown variant `max`")
+        # instead of just `provider_unrecoverable`. Codex review T1 #2.
+        if ta.last_provider_failure is not None:
+            result["last_provider_failure"] = ta.last_provider_failure.model_dump(
+                mode="json", exclude_none=True,
+            )
     return result
 
 
@@ -1386,6 +1497,7 @@ def _build_config(
     max_total_tokens: int,
     max_total_cost_usd: float,
     max_wallclock_seconds: int,
+    per_agent_token_budget: Optional[Dict[str, int]] = None,
 ) -> Config:
     """Resolve persona ids into inline `Persona` objects and build a Config.
 
@@ -1433,6 +1545,7 @@ def _build_config(
             max_total_cost_usd=max_total_cost_usd,
             max_rounds=max_rounds,
             max_wallclock_seconds=max_wallclock_seconds,
+            per_agent_token_budget=per_agent_token_budget,
         ),
     )
 

@@ -85,3 +85,29 @@ runtime. These are downstream of the protocol, not part of it.
   realizes the §12 "dynamic participant introduction" / persona-creation
   intent **without** in-loop panel mutation or any spec / schema change
   (true in-loop mutation remains a v1+/Roadmap runtime concern).
+
+## Open follow-ups (post v1.10.x)
+
+- **Forensic per-vendor usage detail.** The canonical `Usage`
+  (`prompt_tokens` / `completion_tokens` / `total_tokens` / `cost_usd`)
+  is provider-uniform per §6.5, which means provider-specific
+  observability — Claude's `cache_read_input_tokens` /
+  `cache_creation_input_tokens` split, codex's `reasoning_output_tokens`,
+  and the upstream `raw` payload — is summarized away by the adapters
+  before reaching the transcript or any persisted artifact. Operators
+  wanting to debug cache hit rates or reasoning-token spikes have no
+  in-band signal today; only the in-process `ProviderResult.raw` dict
+  carries it and it's not serialized. Codex review T1 #4 flagged this
+  as a real follow-up. Likely shape: an optional
+  `provider_raw_usage: Dict[str, Any]` on `Usage` (additive, optional →
+  schema-compatible) populated by each adapter from its native usage
+  block, surfaced in `get_run_summary` and in the streaming events.
+- **Custom MCP profile for CLI personas.** v1.10.4 set
+  `disable_mcps=True` as the cli-auto default to close the recursive-MCP
+  hang. Operators who legitimately want a domain-knowledge MCP available
+  inside a persona's reasoning currently must construct
+  `ClaudeCliProvider(disable_mcps=False, ...)` themselves and route it
+  manually — no MCP-tool kwarg exposes `mcp_config` through the
+  `deliberate*` surfaces. Open design question (Codex review T1 #7):
+  whitelist of registered MCPs vs. inline JSON payload vs. path to a
+  config file; pick one once a real use case shows up.

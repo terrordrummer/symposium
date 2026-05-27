@@ -48,15 +48,24 @@ def adapters():
     return {"claude-cli": _FakeAdapter("claude"), "codex-cli": _FakeAdapter("codex")}
 
 
-def test_codex_adapter_uses_xhigh_not_max_reasoning_effort():
+def test_codex_adapter_uses_xhigh_not_max_reasoning_effort(monkeypatch):
     """`_build_adapter("codex-cli")` MUST pass
     `-c model_reasoning_effort=xhigh`, NOT `max`. Codex CLI 0.12x
     started rejecting `max` with "unknown variant `max`, expected one
     of `none, minimal, low, medium, high, xhigh`" — a wrong value here
     silently terminates the entire deliberation as
     `provider_unrecoverable` after retry-budget exhaustion.
+
+    Hermetic: monkeypatches `shutil.which` so the test runs even on a
+    box without the codex binary installed (Codex review T1 item #6).
     """
+    import shutil
     from symposium.integrations.cli_routing import _build_adapter
+
+    # The CodexCliProvider constructor fail-fasts when codex isn't on
+    # PATH (check_binary=True default). Fake it so this test asserts
+    # pure routing logic, not the operator's local install state.
+    monkeypatch.setattr(shutil, "which", lambda binary: f"/fake/bin/{binary}")
 
     adapter = _build_adapter("codex-cli")
     args = adapter._extra_args
@@ -65,6 +74,29 @@ def test_codex_adapter_uses_xhigh_not_max_reasoning_effort():
     assert args[idx + 1] == "model_reasoning_effort=xhigh", (
         f"codex adapter must use xhigh (highest level accepted by current "
         f"codex CLI), got {args[idx + 1]!r}"
+    )
+
+
+def test_codex_registry_factory_matches_router_reasoning_effort(monkeypatch):
+    """`_codex_cli_factory` (registry — what `provider="codex-cli"` uses
+    when forced explicitly) MUST pass the same effort knob as
+    `cli_routing._build_adapter("codex-cli")` (what `provider="cli-auto"`
+    routes through). Without this they diverge silently — same provider
+    id, different effort level depending on routing path. (Codex review
+    T1 item #5.)
+    """
+    import shutil
+    from symposium.integrations.cli_routing import _build_adapter
+    from symposium.providers.registry import _codex_cli_factory
+
+    monkeypatch.setattr(shutil, "which", lambda binary: f"/fake/bin/{binary}")
+
+    router_adapter = _build_adapter("codex-cli")
+    registry_adapter = _codex_cli_factory("codex-cli", config=None)  # type: ignore[arg-type]
+
+    assert router_adapter._extra_args == registry_adapter._extra_args, (
+        f"router={router_adapter._extra_args} vs registry="
+        f"{registry_adapter._extra_args}"
     )
 
 

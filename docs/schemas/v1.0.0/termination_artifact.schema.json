@@ -63,6 +63,23 @@
     "pending_external_research_request": {
       "description": "Present only when `reason = external_research_required` (§4.4). Copy of the verdict's `external_research_request` payload.",
       "$ref": "verdict.schema.json#/properties/external_research_request"
+    },
+    "last_provider_failure": {
+      "description": "Diagnostic snapshot of the last provider error before retries were exhausted; populated when `reason` is provider-attributable (`provider_unrecoverable` / `schema_error`). Carries enough context for an operator to reproduce the failed spawn — `agent_id` + `provider` + `model` identify the routing; `kind` + `message` + `details` forward the upstream's actual complaint (eg. \"unknown variant `max`, expected one of `none, minimal, low, medium, high, xhigh`\" for a codex CLI version mismatch). Optional + additive: artifacts produced by 1.10.6 and earlier omit this field. Added v1.10.7 / Codex review T1 item #2.",
+      "type": "object",
+      "required": ["agent_id", "provider", "kind", "message"],
+      "properties": {
+        "agent_id": {"type": "string", "minLength": 1},
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": ["string", "null"]},
+        "kind": {
+          "description": "Mirrors §6.6 ErrorKind enum. The `error` field in provider_result is a `oneOf` of [null, object]; the kind enum lives inside the object branch at `oneOf/1/properties/kind` (Codex review T3 fix — the earlier `properties/error/properties/kind` pointer didn't resolve because `error` has no direct `properties`, it has `oneOf`).",
+          "$ref": "provider_result.schema.json#/properties/error/oneOf/1/properties/kind"
+        },
+        "message": {"type": "string", "minLength": 1},
+        "details": {"type": ["object", "null"]}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,

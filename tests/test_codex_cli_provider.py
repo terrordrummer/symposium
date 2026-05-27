@@ -264,3 +264,38 @@ def test_end_to_end_run_session_with_codex_cli(tmp_path):
     )
     artifact = run_session(config, {"default": provider}, runs_root=str(tmp_path))
     assert artifact.outcome.kind == "synthesis"
+
+
+def test_codex_child_env_scrubs_claude_auth(monkeypatch):
+    """`codex_child_env()` MUST strip Claude-side auth (OAuth tokens +
+    `ANTHROPIC_*`) before handing the env to a `codex exec` subprocess.
+
+    Codex review T1 item #9: the unified `headless_child_env()` preserved
+    every credential the parent process had — meaning a codex spawn ended
+    up with `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` in its
+    /proc/PID/environ. Codex never reads those, so the only effect was
+    widening the credential exposure surface inside an agentic CLI that
+    runs untrusted tool calls. Provider-specific helpers scrub the
+    other vendor's set.
+    """
+    from symposium.providers._cli_env import codex_child_env
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "claude-refresh-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-...")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    monkeypatch.setenv("CODEX_HOME", "/Users/x/.codex")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-...")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = codex_child_env()
+
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+    # codex auth must remain
+    assert env.get("CODEX_HOME") == "/Users/x/.codex"
+    assert env.get("OPENAI_API_KEY") == "sk-..."
+    # PATH must remain (subprocess needs it to find the binary)
+    assert env.get("PATH") == "/usr/bin"

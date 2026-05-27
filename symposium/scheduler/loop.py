@@ -65,9 +65,11 @@ from symposium.models import (
     Config,
     ContextPacket,
     DirectRequest,
+    LastProviderFailure,
     Message,
     PanelContractionContent,
     Persona,
+    ProviderError,
     ProviderRequest,
     ProviderRequestMessage,
     ProviderResult,
@@ -325,6 +327,11 @@ class _InvokeResult:
     terminating: Optional[str] = None  # termination reason (TerminationReason value)
     panel_contracted: bool = False
     contraction_reason: Optional[str] = None  # "provider_unrecoverable" | "schema_error"
+    # The last ProviderError observed before retries were exhausted —
+    # used by `_terminate` to populate
+    # `TerminationArtifact.last_provider_failure`, so an operator sees the
+    # upstream's actual complaint instead of just `provider_unrecoverable`.
+    last_error: Optional[ProviderError] = None
 
 
 def _provider_for(session: Session, agent_id: str) -> _ProviderAdapter:
@@ -360,6 +367,7 @@ def _invoke_with_retry(
     attempts = 1 + budget
 
     last_err_kind: Optional[str] = None
+    last_error: Optional[ProviderError] = None
     for attempt_idx in range(attempts):
         provider = _provider_for(session, agent_id)
         # If FakeProvider: stash round/turn_index hints so match assertions work.
@@ -374,6 +382,7 @@ def _invoke_with_retry(
 
         if result.error is not None:
             last_err_kind = result.error.kind
+            last_error = result.error
             if not result.error.retriable:
                 # Map §6.6 / §4.9: non-retriable error → either schema_error
                 # (malformed_response, invalid_request) or provider_unrecoverable
@@ -381,12 +390,15 @@ def _invoke_with_retry(
                 reason = _classify_unrecoverable(result.error.kind)
                 # §4.9 path: per on_agent_failure
                 if session.config.runtime.on_agent_failure == "terminate":
-                    return _InvokeResult(ok=False, result=result, terminating=reason)
+                    return _InvokeResult(
+                        ok=False, result=result, terminating=reason, last_error=last_error,
+                    )
                 return _InvokeResult(
                     ok=False,
                     result=result,
                     panel_contracted=True,
                     contraction_reason=reason,  # type: ignore[arg-type]
+                    last_error=last_error,
                 )
             # Retriable failure: backoff before next attempt (unless we're done).
             if attempt_idx + 1 < attempts:
@@ -401,12 +413,15 @@ def _invoke_with_retry(
     # Retries exhausted.
     final_reason = _classify_unrecoverable(last_err_kind or "internal")
     if session.config.runtime.on_agent_failure == "terminate":
-        return _InvokeResult(ok=False, result=None, terminating=final_reason)
+        return _InvokeResult(
+            ok=False, result=None, terminating=final_reason, last_error=last_error,
+        )
     return _InvokeResult(
         ok=False,
         result=None,
         panel_contracted=True,
         contraction_reason=final_reason,  # type: ignore[arg-type]
+        last_error=last_error,
     )
 
 
@@ -560,9 +575,12 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             return _terminate(session, writer, reason=breach)
 
         # §4.6 deferred queue drain (at round-open, before any primary_turn)
-        terminating = _drain_deferred_queue(session, writer)
-        if terminating:
-            return _terminate(session, writer, reason=terminating)
+        bt = _drain_deferred_queue(session, writer)
+        if bt is not None:
+            return _terminate(
+                session, writer, reason=bt.reason,
+                last_provider_failure=_failure_from(session, bt.target, bt.last_error),
+            )
 
         # §4.2 step 1–3: panel members in declared order
         for agent_id in list(session.active_panel):
@@ -580,14 +598,20 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             session.turn_index += 1
             inv = _invoke_with_retry(session, agent_id=agent_id, request=req)
             if inv.terminating:
-                return _terminate(session, writer, reason=inv.terminating)
+                return _terminate(
+                    session, writer, reason=inv.terminating,
+                    last_provider_failure=_failure_from(session, agent_id, inv.last_error),
+                )
             if inv.panel_contracted:
                 _append_panel_contraction(session, writer, agent_id, inv.contraction_reason)
                 # remove agent from panel; check if panel is non-empty
                 if agent_id in session.active_panel:
                     session.active_panel.remove(agent_id)
                 if not session.active_panel:
-                    return _terminate(session, writer, reason="provider_unrecoverable")
+                    return _terminate(
+                        session, writer, reason="provider_unrecoverable",
+                        last_provider_failure=_failure_from(session, agent_id, inv.last_error),
+                    )
                 continue
             assert inv.result is not None and inv.result.structured_output is not None
             tso = TurnStructuredOutput.model_validate(inv.result.structured_output)
@@ -650,11 +674,14 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             # Now dispatch the at-most-one inline branch. Propagate any
             # termination it bubbles up (on_agent_failure="terminate").
             if inline_request is not None:
-                terminating = _dispatch_branch(
+                bt = _dispatch_branch(
                     session, writer, parent_msg=primary_msg, request=inline_request,
                 )
-                if terminating:
-                    return _terminate(session, writer, reason=terminating)
+                if bt is not None:
+                    return _terminate(
+                        session, writer, reason=bt.reason,
+                        last_provider_failure=_failure_from(session, bt.target, bt.last_error),
+                    )
 
         # §4.2 step 4: coordination_turn
         breach = check_hard_caps(session)
@@ -672,10 +699,16 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
         session.turn_index += 1
         inv = _invoke_with_retry(session, agent_id=coord_id, request=req)
         if inv.terminating:
-            return _terminate(session, writer, reason=inv.terminating)
+            return _terminate(
+                session, writer, reason=inv.terminating,
+                last_provider_failure=_failure_from(session, coord_id, inv.last_error),
+            )
         if inv.panel_contracted:
             # Coordinator cannot be contracted per §4.9 — escalate.
-            return _terminate(session, writer, reason="provider_unrecoverable")
+            return _terminate(
+                session, writer, reason="provider_unrecoverable",
+                last_provider_failure=_failure_from(session, coord_id, inv.last_error),
+            )
         assert inv.result is not None and inv.result.structured_output is not None
 
         verdict = Verdict.model_validate(inv.result.structured_output)
@@ -723,14 +756,29 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             )
 
 
+@dataclass
+class _BranchTermination:
+    """Branch-dispatch termination payload (Codex review T2 #2b).
+
+    `_dispatch_branch` no longer returns just a reason string — the
+    last `ProviderError` from the branch's invocation MUST also bubble
+    up so the outer loop can build a `LastProviderFailure` with it. The
+    main loop's primary-turn path already does this; pre-T2, the branch
+    path silently dropped the error.
+    """
+    reason: str
+    last_error: Optional[ProviderError]
+    target: str
+
+
 def _dispatch_branch(
     session: Session,
     writer: Optional[RunWriter],
     *,
     parent_msg: Message,
     request: DirectRequest,
-) -> Optional[str]:
-    """Dispatch one branch_turn. Returns a termination reason if
+) -> Optional[_BranchTermination]:
+    """Dispatch one branch_turn. Returns a `_BranchTermination` if
     `on_agent_failure="terminate"` was honored mid-branch; otherwise None.
 
     Callers MUST check the return value and propagate termination up to the
@@ -754,8 +802,12 @@ def _dispatch_branch(
     inv = _invoke_with_retry(session, agent_id=target, request=req)
     if inv.terminating:
         # §4.9: honor the failure policy — propagate termination instead of
-        # silently demoting the failure to panel_contraction.
-        return inv.terminating
+        # silently demoting the failure to panel_contraction. Codex T2
+        # #2b: carry the provider error so the outer loop can build a
+        # `LastProviderFailure` (was dropped pre-T2).
+        return _BranchTermination(
+            reason=inv.terminating, last_error=inv.last_error, target=target,
+        )
     if inv.panel_contracted:
         _append_panel_contraction(session, writer, target, inv.contraction_reason)
         if target in session.active_panel:
@@ -787,11 +839,14 @@ def _dispatch_branch(
     return None
 
 
-def _drain_deferred_queue(session: Session, writer: Optional[RunWriter]) -> Optional[str]:
+def _drain_deferred_queue(
+    session: Session, writer: Optional[RunWriter],
+) -> Optional[_BranchTermination]:
     """Drain queued direct_requests as §4.6 branch_turns at round-open.
 
-    Returns a termination reason if any drained branch hits the failure policy
-    `terminate`; otherwise None. Callers MUST honor the return value.
+    Returns a `_BranchTermination` if any drained branch hits the failure
+    policy `terminate`; otherwise None. Callers MUST honor the return value
+    (Codex T2 #2b — the branch path's last_error now bubbles up too).
     """
     drains = 0
     max_drains = session.config.runtime.max_deferred_drains_per_round
@@ -805,12 +860,12 @@ def _drain_deferred_queue(session: Session, writer: Optional[RunWriter]) -> Opti
             coordinator=session.config.coordinator.id,
         ):
             continue
-        terminating = _dispatch_branch(
+        bt = _dispatch_branch(
             session, writer, parent_msg=parent_msg, request=request,
         )
         drains += 1
-        if terminating:
-            return terminating
+        if bt is not None:
+            return bt
     return None
 
 
@@ -845,11 +900,31 @@ def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
         return SynthesisOutcome(synthesis_message_id=synth_msg.id), None
 
     # Synthesis failed → terminate with provider_unrecoverable (R2).
-    return _terminate(session, writer, reason="provider_unrecoverable")
+    # Codex T2 #2b: carry the coordinator's last error into the artifact
+    # so synthesis-time provider failures are diagnosable too.
+    return _terminate(
+        session, writer, reason="provider_unrecoverable",
+        last_provider_failure=_failure_from(session, coord_id, inv.last_error),
+    )
 
 
-def _terminate(session: Session, writer: Optional[RunWriter], *, reason: str, pending=None):
-    """Build a TerminationOutcome and the per-§5.8 TerminationArtifact."""
+def _terminate(
+    session: Session,
+    writer: Optional[RunWriter],
+    *,
+    reason: str,
+    pending=None,
+    last_provider_failure: Optional["LastProviderFailure"] = None,
+):
+    """Build a TerminationOutcome and the per-§5.8 TerminationArtifact.
+
+    `last_provider_failure` (Codex review T1 #2): when a provider-side
+    failure terminated the run, the upstream's actual complaint is
+    forwarded into the artifact so the operator sees actionable
+    diagnostics instead of the bare `provider_unrecoverable` string.
+    Callers receive the original `ProviderError` from `_InvokeResult.
+    last_error` and pass it through `_failure_from(...)`.
+    """
     cumulative_usage = session.cumulative.to_usage()
     # Need the digest of the transcript *as terminated* (no synthesis added).
     digest = compute_transcript_digest(session.transcript)
@@ -866,10 +941,35 @@ def _terminate(session: Session, writer: Optional[RunWriter], *, reason: str, pe
         kwargs["pending_user_input_request"] = pending
     elif reason == "external_research_required" and pending is not None:
         kwargs["pending_external_research_request"] = pending
+    if last_provider_failure is not None:
+        kwargs["last_provider_failure"] = last_provider_failure
 
     term = TerminationArtifact(**kwargs)  # type: ignore[arg-type]
     outcome = TerminationOutcome(termination_artifact=term)
     return outcome, term
+
+
+def _failure_from(
+    session: Session, agent_id: str, error: Optional[ProviderError]
+) -> Optional["LastProviderFailure"]:
+    """Snapshot a per-agent ProviderError into a `LastProviderFailure`.
+
+    Returns ``None`` if the failure didn't carry a structured error
+    (e.g. all attempts produced `structured_output=None` without
+    `ProviderError`); the bare termination reason is the best we can do
+    in that path.
+    """
+    if error is None:
+        return None
+    ac = session.agent_by_id(agent_id)
+    return LastProviderFailure(
+        agent_id=agent_id,
+        provider=ac.provider,
+        model=ac.model,
+        kind=error.kind,
+        message=error.message,
+        details=error.details,
+    )
 
 
 def _append_panel_contraction(

@@ -141,6 +141,15 @@ def test_get_version_reports_runtime_state():
     assert info["package_path"].endswith("/symposium")
     assert info["mcp_server_module"].endswith("/mcp_server.py")
     assert info["mcp_server_mtime"]  # ISO timestamp, non-empty
+    # Optional diagnostic fields (added v1.10.7 per Codex review T1 #10).
+    assert "git_commit" in info
+    assert isinstance(info["clis"], dict) and set(info["clis"]) == {"claude", "codex"}
+    assert isinstance(info["cli_auto_routing"], dict)
+    # Default routing must include all built-in panel members + coordinator.
+    for required in ("logician", "visionary", "researcher", "critic", "engineer", "coordinator"):
+        assert required in info["cli_auto_routing"]
+    assert info["cli_auto_routing"]["visionary"] == "codex-cli"
+    assert info["cli_auto_routing"]["logician"] == "claude-cli"
 
     # Budget defaults must match the canonical signature, not drift.
     sig = inspect.signature(deliberate_adaptive_streaming)
@@ -149,6 +158,44 @@ def test_get_version_reports_runtime_state():
     assert bd["max_total_cost_usd"] == sig.parameters["max_total_cost_usd"].default
     assert bd["max_rounds"] == sig.parameters["max_rounds"].default
     assert bd["max_wallclock_seconds"] == sig.parameters["max_wallclock_seconds"].default
+
+
+def test_all_deliberate_signatures_share_the_same_budget_defaults():
+    """The 4 public `deliberate*` MCP tools (`deliberate`, `deliberate_streaming`,
+    `deliberate_adaptive`, `deliberate_adaptive_streaming`) MUST all expose
+    the same budget defaults AND all expose `per_agent_token_budget`. A drift
+    on any one of them silently turns the `get_version` report (derived from
+    `deliberate_adaptive_streaming` only) into a diagnostic lie: the user
+    reads "100M token cap" but the tool they called terminates at 100k.
+    Codex review T1 item #10 + T2 item #3 (per_agent_token_budget MUST be
+    on every deliberate* surface, not just `deliberate`).
+    """
+    import inspect
+    from symposium.integrations.mcp_server import (
+        deliberate,
+        deliberate_adaptive,
+        deliberate_adaptive_streaming,
+        deliberate_streaming,
+    )
+
+    keys = ("max_total_tokens", "max_total_cost_usd", "max_rounds", "max_wallclock_seconds")
+    reference = inspect.signature(deliberate_adaptive_streaming)
+    expected = {k: reference.parameters[k].default for k in keys}
+
+    for fn in (deliberate, deliberate_streaming, deliberate_adaptive,
+               deliberate_adaptive_streaming):
+        sig = inspect.signature(fn)
+        observed = {k: sig.parameters[k].default for k in keys}
+        assert observed == expected, (
+            f"{fn.__name__} budget defaults diverged from "
+            f"deliberate_adaptive_streaming: {observed} vs {expected}"
+        )
+        # Codex T2 #3 — per_agent_token_budget MUST exist on every public
+        # deliberate* MCP signature (was only on `deliberate` after T1).
+        assert "per_agent_token_budget" in sig.parameters, (
+            f"{fn.__name__} missing per_agent_token_budget (Codex T2 #3)"
+        )
+        assert sig.parameters["per_agent_token_budget"].default is None
 
 
 def test_list_personas_returns_six_builtins():
@@ -400,3 +447,136 @@ def test_deliberate_streaming_error_returns_structured_error(tmp_path):
     )
     assert "error" in result
     assert ctx.logs == []  # nothing streamed before the build failed
+
+
+def test_per_agent_token_budget_validation_rejects_non_positive():
+    """`BudgetConfig.per_agent_token_budget` MUST reject zero/negative
+    caps. Codex review T1 item #3: Pydantic accepted `Dict[str, int]`
+    without lower bound, while the JSON Schema requires `minimum: 1`.
+    A zero cap would terminate every persona on its first byte,
+    defeating the canary's whole purpose.
+    """
+    import pytest
+    from pydantic import ValidationError
+    from symposium.models import BudgetConfig
+
+    # Valid: positive ints accepted.
+    cfg = BudgetConfig(
+        max_total_tokens=1000, max_total_cost_usd=1.0, max_rounds=1,
+        max_wallclock_seconds=1, per_agent_token_budget={"logician": 100},
+    )
+    assert cfg.per_agent_token_budget == {"logician": 100}
+
+    # Invalid: zero cap.
+    with pytest.raises(ValidationError, match="positive integer"):
+        BudgetConfig(
+            max_total_tokens=1000, max_total_cost_usd=1.0, max_rounds=1,
+            max_wallclock_seconds=1, per_agent_token_budget={"logician": 0},
+        )
+
+    # Invalid: negative cap.
+    with pytest.raises(ValidationError, match="positive integer"):
+        BudgetConfig(
+            max_total_tokens=1000, max_total_cost_usd=1.0, max_rounds=1,
+            max_wallclock_seconds=1, per_agent_token_budget={"logician": -1},
+        )
+
+
+def test_deliberate_mcp_signature_exposes_per_agent_token_budget():
+    """`deliberate` MCP tool MUST expose `per_agent_token_budget` as a
+    parameter, so an MCP client can set per-persona caps from outside
+    the runtime. Codex review T1 item #3: the param existed in
+    `BudgetConfig` but no MCP signature surfaced it, so canary caps
+    were unreachable for the deliberation tools clients actually call.
+    """
+    import inspect
+    from symposium.integrations.mcp_server import deliberate
+
+    sig = inspect.signature(deliberate)
+    assert "per_agent_token_budget" in sig.parameters, (
+        "deliberate must expose per_agent_token_budget (Codex T1 #3)"
+    )
+    assert sig.parameters["per_agent_token_budget"].default is None
+
+
+def test_artifact_carries_last_provider_failure_end_to_end(tmp_path, repo_root):
+    """End-to-end: a non-retriable provider failure MUST surface as
+    `artifact.outcome.termination_artifact.last_provider_failure`,
+    `_build_result` MUST include it under the same key, and
+    `get_run_summary` MUST too. Codex review T2 item #2/#2b — covers
+    the path the regression test in test_retry_backoff stops short of.
+    """
+    import json
+    from unittest.mock import patch
+
+    from symposium.models import (
+        ProviderError,
+        ProviderRawMessage,
+        ProviderResult,
+        Usage,
+    )
+    from symposium.integrations.mcp_server import _build_result, get_run_summary
+    from symposium.providers.fake import FakeProvider
+    from symposium.scheduler import run_session
+    from symposium.models import FakeProviderScript
+
+    # FakeProvider entry that errors on the very first call (logician,
+    # round 1). The match is intentionally loose so the same entry
+    # matches every retry attempt (retry_budget=2 → 3 attempts, all
+    # fail identically → terminate as provider_unrecoverable).
+    error_entry = {
+        "match": {"agent_id": "logician"},
+        "result": {
+            "messages": [],
+            "tool_events": [],
+            "usage": {
+                "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "cost_usd": 0.0,
+            },
+            "finish_reason": "error",
+            "structured_output": None,
+            "raw": {"stderr": "unknown variant `max`"},
+            "error": {
+                "kind": "internal",
+                "message": "codex exited 1: unknown variant `max`, expected one of `none, minimal, low, medium, high, xhigh`",
+                "retriable": False,
+                "details": {"hint": "use xhigh in model_reasoning_effort"},
+            },
+        },
+    }
+    script_dict = {
+        "schema_version": "1.0.0",
+        "on_exhaustion": "loop",
+        "entries": [error_entry],
+    }
+    script_path = tmp_path / "fake-script.json"
+    script_path.write_text(json.dumps(script_dict))
+
+    from symposium.integrations.mcp_server import deliberate
+
+    result = deliberate(
+        "trigger codex failure",
+        provider="fake",
+        fake_script_path=str(script_path),
+        output_dir=str(tmp_path / "runs"),
+    )
+
+    assert "error" not in result, result
+    assert result["outcome"] == "termination"
+    assert result["termination_reason"] == "provider_unrecoverable"
+    # The actionable diagnostic must round-trip end-to-end.
+    assert "last_provider_failure" in result, (
+        f"missing last_provider_failure in MCP result: {result}"
+    )
+    lpf = result["last_provider_failure"]
+    assert lpf["agent_id"] == "logician"
+    assert lpf["provider"] == "fake"
+    assert lpf["kind"] == "internal"
+    assert "unknown variant `max`" in lpf["message"]
+    assert lpf["details"]["hint"] == "use xhigh in model_reasoning_effort"
+
+    # And get_run_summary surfaces it too (operator can re-fetch after the fact).
+    summary = get_run_summary(result["run_dir"])
+    assert summary["termination_reason"] == "provider_unrecoverable"
+    assert "last_provider_failure" in summary
+    assert "unknown variant `max`" in summary["last_provider_failure"]["message"]

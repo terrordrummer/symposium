@@ -70,7 +70,7 @@ from symposium.models import (
     Usage,
     Verdict,
 )
-from symposium.providers._cli_env import headless_child_env
+from symposium.providers._cli_env import claude_child_env
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -273,7 +273,7 @@ class ClaudeCliProvider(ProviderAdapter):
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
-                env=self._env_override if self._env_override is not None else headless_child_env(),
+                env=self._env_override if self._env_override is not None else claude_child_env(),
             )
         except subprocess.TimeoutExpired as exc:
             return _error_result(

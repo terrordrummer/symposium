@@ -118,3 +118,59 @@ def test_make_cli_caller_codex_path_scrubs_env(monkeypatch):
     caller = make_cli_persona_caller(prefer="codex", runner=runner)
     obj = caller("design a dba", {"type": "object"})
     assert obj["id"] == "dba"
+
+
+def test_claude_persona_call_includes_strict_mcp_config():
+    """The claude-side persona-generation spawn MUST pass
+    `--strict-mcp-config --mcp-config '{"mcpServers": {}}'` so the user's
+    global MCP registry isn't auto-loaded (same v1.10.4 fix
+    ClaudeCliProvider got, applied to the persona-factory path per
+    Codex review T1 #8 and verified per Codex T2 #8).
+    """
+    seen = {}
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(
+            argv, 0,
+            stdout=json.dumps({"structured_output": _valid_domain("dba")}),
+            stderr="",
+        )
+
+    caller = make_cli_persona_caller(runner=runner)
+    caller("design a dba", {"type": "object"})
+
+    argv = seen["argv"]
+    assert "--strict-mcp-config" in argv, (
+        f"missing --strict-mcp-config in claude persona-call argv: {argv}"
+    )
+    idx = argv.index("--mcp-config")
+    assert argv[idx + 1] == '{"mcpServers": {}}', (
+        f"--mcp-config payload must be empty mcpServers, got {argv[idx + 1]!r}"
+    )
+
+
+def test_codex_persona_call_includes_ignore_user_config():
+    """The codex-side persona-generation spawn MUST pass
+    `--ignore-user-config --ignore-rules` (parity with
+    `CodexCliProvider(isolated=True)`) so the spawn is invariant to the
+    operator's `~/.codex/config.toml` and any `.rules` execpolicy.
+    Codex review T1 #8.
+    """
+    seen = {}
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        seen["argv"] = argv
+        stdout = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps(_valid_domain("dba"))
+        }}) + "\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    caller = make_cli_persona_caller(prefer="codex", runner=runner)
+    caller("design a dba", {"type": "object"})
+
+    argv = seen["argv"]
+    assert "--ignore-user-config" in argv, (
+        f"missing --ignore-user-config in codex persona-call argv: {argv}"
+    )
+    assert "--ignore-rules" in argv, (
+        f"missing --ignore-rules in codex persona-call argv: {argv}"
+    )

@@ -169,3 +169,55 @@ def test_rng_seed_override_decouples_seed_from_session_id(example_config):
         "control: without rng_seed override, the replay-suffixed session_id "
         "must produce a different jitter sequence (so the override is doing work)"
     )
+
+
+def test_invoke_with_retry_preserves_last_provider_error(example_config, example_script):
+    """When a non-retriable provider error terminates, `_InvokeResult.last_error`
+    MUST carry the original `ProviderError` (kind + message + details) so
+    `_terminate(...)` can populate `TerminationArtifact.last_provider_failure`
+    with the upstream's actual complaint.
+
+    Codex review T1 item #2: the motivating incident was codex CLI 0.128
+    returning "unknown variant `max`, expected one of `none, minimal, low,
+    medium, high, xhigh`". Before this fix, the only signal at the MCP
+    boundary was the bare `provider_unrecoverable` reason — the actionable
+    diagnostic was retried 3× and discarded. The operator had to grep
+    stderr by hand to discover the typo.
+    """
+
+    class _AlwaysFails:
+        name = "fake"
+
+        def invoke(self, _request):
+            return ProviderResult(
+                messages=[ProviderRawMessage(role="assistant", content="")],
+                tool_events=[],
+                usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=0.0),
+                finish_reason="error",
+                structured_output=None,
+                raw={"stderr": "unknown variant `max`, expected one of `xhigh`"},
+                error=ProviderError(
+                    kind="internal",
+                    message="codex exited 1: unknown variant `max`",
+                    retriable=False,
+                    details={"stderr_tail": "...config.toml, model_reasoning_effort"},
+                ),
+            )
+
+    provider = _AlwaysFails()
+    session = Session(config=example_config, providers={"default": provider})
+    agent_id = example_config.agents[0].id
+    request = ProviderRequest(
+        provider="fake", model="fake-1", agent_id=agent_id,
+        messages=[ProviderRequestMessage(role="user", content="ping")],
+        expected_output_schema="turn_structured_output",
+    )
+
+    inv = _invoke_with_retry(session, agent_id=agent_id, request=request, sleep=lambda _s: None)
+    assert inv.ok is False
+    assert inv.terminating == "provider_unrecoverable"
+    assert inv.last_error is not None
+    assert inv.last_error.kind == "internal"
+    assert "unknown variant" in inv.last_error.message
+    assert inv.last_error.details is not None
+    assert "model_reasoning_effort" in inv.last_error.details["stderr_tail"]

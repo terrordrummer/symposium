@@ -146,9 +146,24 @@ def _claude_cli_factory(provider_id: str, config: Config) -> ProviderAdapter:
 def _codex_cli_factory(provider_id: str, config: Config) -> ProviderAdapter:
     # Late import: keeps the `codex` CLI optional. Needs NO API key — it
     # reuses the locally-installed CLI's existing auth.
+    #
+    # `-c model_reasoning_effort=xhigh` mirrors what `cli_routing._build_
+    # adapter("codex-cli")` passes when the panel is routed through
+    # `cli-auto`. Without it, an operator who forces `provider="codex-cli"`
+    # would get the codex CLI's intrinsic default reasoning effort
+    # (whatever that is on the installed version) plus the
+    # `--ignore-user-config` of the adapter (which suppresses the user's
+    # own `~/.codex/config.toml`). The result: same provider id but a
+    # different effort level depending on whether the operator chose
+    # `cli-auto` or `codex-cli` — a silent inconsistency that surfaced
+    # in the Codex review T1 (item #5). Keep the factory and the router
+    # in agreement until the two are unified behind a single profile.
+    # `xhigh` is the highest level accepted by codex CLI 0.12x (it
+    # rejects the older `max` with "unknown variant `max`, expected one
+    # of `none, minimal, low, medium, high, xhigh`").
     from symposium.providers.codex_cli import CodexCliProvider
 
-    return CodexCliProvider()
+    return CodexCliProvider(extra_args=["-c", "model_reasoning_effort=xhigh"])
 
 
 def make_fake_factory(provider: "ProviderAdapter") -> AdapterFactory:

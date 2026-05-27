@@ -370,7 +370,7 @@ turn through a locally-installed terminal CLI, reusing its existing login
 (OAuth/keychain) — no `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`. It routes by
 persona — the lateral/creative **visionary** to `codex-cli`
 (`codex exec --output-schema …`, model **`gpt-5.5`** with reasoning effort
-`max`), the technical/systematic personas (logician, engineer, researcher,
+`xhigh` — codex CLI 0.12x rejects the older `max`), the technical/systematic personas (logician, engineer, researcher,
 critic, coordinator) to `claude-cli` (`claude -p --output-format json
 --json-schema …`, model **`opus`** — alias for the latest Opus on the
 local CLI, currently 4.7) — and **falls back** to whichever CLI is
@@ -385,25 +385,41 @@ complete.
 **Hosted-inside-Claude-Code safety.** When the Symposium runtime is itself
 hosted inside a Claude Code session (eg. via the `symposium-mcp` server
 launched as an MCP child), the CLI adapters spawn each turn with a
-**headless child environment**: (1) nested-Claude-Code markers
+**headless, provider-specific child environment** (v1.10.7+):
+(1) nested-Claude-Code markers
 (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`/`EXECPATH`/`SESSION_ID`/
 `PROVIDER_MANAGED_BY_HOST`), effort overrides
 (`CLAUDE_CODE_EFFORT_LEVEL` / `CLAUDE_EFFORT`), and bare-mode markers
-(`CLAUDE_CODE_SIMPLE`) are stripped before each spawn; (2)
-`CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY`,
+(`CLAUDE_CODE_SIMPLE`) are stripped before *every* spawn;
+(2) `CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY`,
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, and
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` are set to `1` to suppress the
 child's *own* auto-loads (the CLAUDE.md auto-discovery walk alone can
 turn a sub-second deliberation turn into a multi-minute hang against a
-populated `~/.claude/` and Workspace tree). The child CLI then takes
-its normal headless `-p` / `exec --json` path and does not inherit the
-parent's session state or extended-thinking effort. `ANTHROPIC_*`,
-`CODEX_HOME`, `PATH`, locale, and proxy / cert vars are preserved. The
-codex adapter also passes `--ignore-user-config --ignore-rules` by default
+populated `~/.claude/` and Workspace tree);
+(3) **cross-vendor credentials are scrubbed**: a `claude -p` spawn gets
+its `ANTHROPIC_*` / `CLAUDE_CODE_OAUTH_TOKEN` preserved but `CODEX_HOME` /
+`OPENAI_*` actively removed (codex auth has no business inside a Claude
+spawn), and a `codex exec` spawn gets the symmetric treatment. `PATH`,
+locale, and proxy / cert vars are preserved on both sides. The codex
+adapter also passes `--ignore-user-config --ignore-rules` by default
 (opt-out via `isolated=False`; requires codex CLI ≥ 0.122.0). The claude
+adapter additionally passes `--strict-mcp-config --mcp-config '{"mcpServers":
+{}}'` so the child loads **zero MCP servers** from the operator's global
+`~/.claude.json` (was the root cause of the v1.10.4 hang: each registered
+MCP added 10–60s of `npm exec` startup per deliberation turn). The claude
 adapter offers an opt-in `bare=True` for full headless mode — off by
 default, because `--bare` disables OAuth/keychain and requires an
 `ANTHROPIC_API_KEY`.
+
+**Limitation — custom MCPs in CLI personas.** Today the cli-auto path forces
+the child claude into "no MCP servers" mode. If you need a domain-knowledge
+MCP available *inside* a persona's reasoning, you have to construct the
+provider directly (`ClaudeCliProvider(disable_mcps=False, ...)`) and route
+that explicitly — there is no MCP-level kwarg to pass a custom `mcp_config`
+through the `deliberate*` tools yet. Reach out if you have a use case; the
+opt-out shape (whitelist vs. inline JSON vs. path) is the open design
+question (Codex review T1 #7).
 
 **Billing.** When a CLI is logged in with a **subscription** (Claude
 Pro/Max for `claude`, a ChatGPT plan for `codex`), turns run against that
@@ -419,6 +435,22 @@ usage metered.) Use `provider="fake"` for free, deterministic, offline
 demos. The HTTP adapters (`anthropic`, `openai`) call the metered API and
 do read an API key. Both CLI providers also work from the plain CLI:
 `provider: claude-cli` / `codex-cli` in a config's agents.
+
+**Budget semantics under cli-auto.** The `max_total_tokens` (default
+100_000_000) and `max_total_cost_usd` (default 1000.0) MCP knobs are
+**telemetry canaries** under `cli-auto`, not real quota caps. Reasons:
+(1) codex CLI hardcodes `cost_usd = 0.0` (no metered cost under
+subscription), so cost-based termination only fires on the Claude side;
+(2) Claude's `cost_usd` is API-equivalent reference, NOT a real bill
+under subscription login; (3) the cap is checked *after* each invocation
+completes, so a single runaway claude-cli agentic loop (≈1M prompt
+tokens is normal for a substantive coding turn) can sail through any
+"reasonable" $-cap before any check fires. **The real hard caps under
+`cli-auto` are `max_wallclock_seconds` (default 1800s = 30min) and your
+subscription's rate-limit window.** For API providers (`anthropic` /
+`openai`), where every token IS a billable charge, lower the defaults
+explicitly per call (`max_total_tokens=200_000, max_total_cost_usd=5.0`
+or whatever fits your tolerance).
 
 The `mcp` dependency is optional: `import symposium` and the `symposium`
 CLI work without it. See `symposium/integrations/mcp_server.py`.

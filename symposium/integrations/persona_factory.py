@@ -21,7 +21,7 @@ import tempfile
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from symposium.models import Persona
-from symposium.providers._cli_env import headless_child_env
+from symposium.providers._cli_env import claude_child_env, codex_child_env
 
 # A caller turns (prompt, json_schema) into a parsed JSON object (the
 # candidate persona). Injectable so tests pass a canned object.
@@ -139,17 +139,26 @@ def make_cli_persona_caller(
 
 def _claude_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
     proc = run(
+        # `--strict-mcp-config --mcp-config '{"mcpServers": {}}'` mirrors
+        # the v1.10.4 fix in `ClaudeCliProvider`: force the spawned
+        # `claude -p` to load ZERO MCP servers, overriding the user's
+        # global `~/.claude.json`. Without these flags a persona-design
+        # call would auto-load every MCP in the operator's registry —
+        # the exact failure mode (10–60s per MCP × N MCPs, including a
+        # recursive symposium-mcp) that v1.10.4 closed for deliberation
+        # turns but Codex review T1 (item #8) flagged as still open in
+        # persona_factory. Keeps OAuth/keychain auth; --bare would also
+        # close the path but breaks subscription login. (v1.10.7)
         ["claude", "-p", "--output-format", "json", "--model", "sonnet",
+         "--strict-mcp-config", "--mcp-config", '{"mcpServers": {}}',
          "--system-prompt", _ARCHITECT_SYSTEM, "--json-schema", json.dumps(schema)],
         input=prompt, capture_output=True, text=True, timeout=timeout,
         # Mirror the ClaudeCliProvider env handling: strip inherited
         # nested-Claude-Code state AND set the CLAUDE_CODE_DISABLE_*
         # knobs that skip the child's own auto-loads (CLAUDE.md walk,
-        # auto-memory). Without this a single persona-design call hangs
-        # for minutes when the runtime is hosted inside a Claude Code
-        # session with a populated `~/.claude/CLAUDE.md` and project
-        # CLAUDE.md chain. See `symposium.providers._cli_env`.
-        env=headless_child_env(),
+        # auto-memory). v1.10.7+ uses the provider-specific helper to
+        # also scrub Codex auth (Codex review T1 #9).
+        env=claude_child_env(),
     )
     if proc.returncode != 0:
         raise PersonaGenerationError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
@@ -170,11 +179,26 @@ def _codex_call(prompt, schema, *, run, timeout) -> Dict[str, Any]:
         # rather than as argv, to avoid leaking the architect system block
         # and the user "need" to other users via `ps`.
         proc = run(
-            ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only",
+            # `--ignore-user-config --ignore-rules` mirror the
+            # `CodexCliProvider(isolated=True)` default: skip the
+            # operator's `~/.codex/config.toml` (which on this user's
+            # machine sets `model_reasoning_effort = "xhigh"`, a value
+            # we want the persona-design call to be invariant to) and
+            # any `.rules` execpolicy file. Without these, persona
+            # generation inherits whatever interactive customizations
+            # the operator has set, making the spawn non-deterministic
+            # and silently dependent on user state. (Codex review T1
+            # item #8, paired with the claude-side --strict-mcp-config
+            # fix above.) (v1.10.7)
+            ["codex", "exec", "--ignore-user-config", "--ignore-rules",
+             "--json", "--skip-git-repo-check", "-s", "read-only",
              "-C", tmp, "--output-schema", schema_path, "-"],
             input=f"{_ARCHITECT_SYSTEM}\n\n{prompt}",
             capture_output=True, text=True, timeout=timeout,
-            env=headless_child_env(),
+            # codex-specific env: scrubs Claude auth (which codex never
+            # reads but would otherwise sit in the spawn's environ).
+            # Codex review T1 #9.
+            env=codex_child_env(),
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

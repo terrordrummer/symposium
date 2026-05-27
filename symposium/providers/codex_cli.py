@@ -53,7 +53,7 @@ from symposium.models import (
     Usage,
     Verdict,
 )
-from symposium.providers._cli_env import headless_child_env
+from symposium.providers._cli_env import codex_child_env
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -96,12 +96,13 @@ class CodexCliProvider(ProviderAdapter):
     legacy behavior.
 
     `env` defaults to ``None``, which means
-    :func:`~symposium.providers._cli_env.headless_child_env` —
+    :func:`~symposium.providers._cli_env.codex_child_env` (v1.10.7+):
     ``os.environ`` minus the inherited-state blocklist
-    (nested-Claude-Code markers, effort overrides) plus the
-    ``CLAUDE_CODE_DISABLE_*`` auto-load knobs. The Claude-side
-    DISABLE knobs are harmless to ``codex exec`` but matter for any
-    descendant ``claude`` invocation the child might fork. See
+    (nested-Claude-Code markers, effort overrides) AND minus
+    Claude-only auth vars (``CLAUDE_CODE_OAUTH_TOKEN``,
+    ``ANTHROPIC_*``) which codex never reads but would otherwise sit
+    in the child's ``/proc/PID/environ`` — a cross-vendor credential
+    leak with no operational reason (Codex review T1 #9). See
     :mod:`symposium.providers._cli_env`. Pass an explicit dict to
     override entirely (must include ``PATH`` and Windows
     ``SystemRoot`` for the spawn to succeed).
@@ -199,7 +200,7 @@ class CodexCliProvider(ProviderAdapter):
                     capture_output=True,
                     text=True,
                     timeout=self._timeout,
-                    env=self._env_override if self._env_override is not None else headless_child_env(),
+                    env=self._env_override if self._env_override is not None else codex_child_env(),
                 )
             except subprocess.TimeoutExpired as exc:
                 return _error_result(

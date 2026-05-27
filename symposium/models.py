@@ -180,6 +180,29 @@ class BudgetConfig(BaseModel):
     per_agent_token_budget: Optional[Dict[str, int]] = None
     selector_budget: Optional[SelectorBudget] = None
 
+    @field_validator("per_agent_token_budget")
+    @classmethod
+    def _validate_per_agent_tokens(cls, v: Optional[Dict[str, int]]) -> Optional[Dict[str, int]]:
+        """Each per-agent token cap MUST be ≥ 1.
+
+        Codex review T1 item #3: the Pydantic model accepted
+        ``Dict[str, int]`` without lower bound on the values, while
+        the JSON Schema for the field requires ``minimum: 1``. A
+        zero/negative cap would slip past model validation and either
+        terminate every persona on its first byte (cap=0) or behave
+        nonsensically (cap=-1), defeating the whole point of the
+        per-agent canary.
+        """
+        if v is None:
+            return v
+        for agent_id, cap in v.items():
+            if not isinstance(cap, int) or cap < 1:
+                raise ValueError(
+                    f"per_agent_token_budget[{agent_id!r}] must be a positive integer, "
+                    f"got {cap!r}"
+                )
+        return v
+
 
 class RuntimeConfig(BaseModel):
     model_config = _strict()
@@ -615,6 +638,26 @@ class ContextPacket(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class LastProviderFailure(BaseModel):
+    """Snapshot of the last provider-side failure before a run terminated.
+
+    Surfaces in `TerminationArtifact.last_provider_failure` when the
+    termination reason was provider-attributable (`provider_unrecoverable`,
+    `schema_error`). Carries enough context for an operator to reproduce
+    the exact failed spawn — agent_id + provider + model identify the
+    routing; kind + message + details (forwarded verbatim from
+    `ProviderError`) carry the upstream's actual complaint.
+    """
+
+    model_config = _strict()
+    agent_id: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    model: Optional[str] = None
+    kind: ErrorKind
+    message: str = Field(min_length=1)
+    details: Optional[Dict[str, Any]] = None
+
+
 class TerminationArtifact(BaseModel):
     model_config = _strict()
     schema_version: str = Field(default=SCHEMA_VERSION, pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -626,6 +669,21 @@ class TerminationArtifact(BaseModel):
     transcript_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     pending_user_input_request: Optional[UserInputRequest] = None
     pending_external_research_request: Optional[ExternalResearchRequest] = None
+    # When `reason` is `provider_unrecoverable` / `schema_error`, the
+    # last `ProviderError` observed before retry exhaustion — including
+    # `kind` (rate_limit / timeout / internal / malformed_response /
+    # invalid_request), the upstream `message` (which carries actionable
+    # diagnostics like "unknown variant `max`, expected one of `none,
+    # minimal, low, medium, high, xhigh`"), and any `details` payload.
+    # Plus the agent_id / provider / model that owned the failed turn,
+    # so the operator can reproduce the exact spawn without grepping the
+    # transcript. Without this field the only thing the MCP caller sees
+    # is the bare reason string; the actionable signal that codex 0.128
+    # rejected `model_reasoning_effort=max` lived in stderr and was lost
+    # to retry-exhaustion. Added v1.10.7 (Codex review T1, item #2).
+    # Optional + default None preserves backward compatibility with
+    # existing on-disk artifacts produced by 1.10.6 and earlier.
+    last_provider_failure: Optional["LastProviderFailure"] = None
 
     @model_validator(mode="after")
     def _enforce_reason_payload(self) -> "TerminationArtifact":

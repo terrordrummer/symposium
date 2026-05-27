@@ -34,22 +34,35 @@ What is on the blocklist:
   identity. Cosmetic, but it bleeds parent identity into the child
   unnecessarily.
 
-What is *deliberately NOT* on the blocklist:
+What the *shared* blocklist deliberately does NOT touch:
 
-* ``ANTHROPIC_*`` (API key, base URL, betas, custom headers) and
-  ``CODEX_HOME`` — the child needs these for auth and endpoint
-  routing.
-* ``CLAUDE_CODE_OAUTH_TOKEN`` / ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN`` —
-  documented OAuth credentials; stripping them would break the
-  "reuses CLI login, no API key needed" promise of the CLI adapters.
+* ``PATH``, ``HOME``, locale vars, Windows ``SystemRoot`` /
+  ``PATHEXT`` — required to actually spawn the binary and resolve
+  its runtime.
 * Other documented ``CLAUDE_CODE_*`` knobs the user may have set
   intentionally (``CLAUDE_CODE_MAX_OUTPUT_TOKENS``,
   ``CLAUDE_CODE_DISABLE_THINKING``, proxy / cert vars, etc.). These
   are explicit operator choices — the scrub is a *minimum-necessary*
   filter against accidental inheritance, not an allowlist.
-* ``PATH``, ``HOME``, locale vars, Windows ``SystemRoot`` /
-  ``PATHEXT`` — required to actually spawn the binary and resolve
-  its runtime.
+
+Provider-specific auth handling (v1.10.7+, Codex review T1 #9): the
+shared `scrubbed_env()` no longer makes auth decisions — that's the
+job of the provider-specific helpers:
+
+* :func:`claude_child_env` preserves ``ANTHROPIC_*`` and
+  ``CLAUDE_CODE_OAUTH_TOKEN`` / ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN``
+  (Claude needs them) but actively strips ``CODEX_HOME`` and
+  ``OPENAI_*`` — codex credentials have no business in a claude spawn.
+* :func:`codex_child_env` preserves ``CODEX_HOME`` and ``OPENAI_*``
+  (codex needs them) but actively strips ``CLAUDE_CODE_OAUTH_TOKEN``
+  / ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN`` / ``ANTHROPIC_*`` — Claude
+  credentials in a codex spawn would just widen the credential
+  exposure surface inside an agentic CLI child without operational
+  benefit (codex never reads those vars).
+
+The legacy :func:`headless_child_env` is an alias for
+:func:`claude_child_env` kept for backward compatibility; new call
+sites should use the provider-specific variants.
 """
 
 from __future__ import annotations
@@ -129,6 +142,35 @@ _CHILD_AUTO_LOAD_DISABLES: Dict[str, str] = {
 }
 
 
+# Cross-vendor credential / state vars that should NOT leak across
+# provider spawns. Codex review T1 item #9: today both helpers go
+# through `headless_child_env()`, which preserves every credential the
+# parent has set. That means a `codex exec` spawn ends up with
+# `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_*` lying in its
+# `/proc/PID/environ` — and vice versa for a `claude -p` spawn that
+# inherits `CODEX_HOME` / `OPENAI_API_KEY`. Neither vendor reads the
+# other's vars, so the only effect is widening the credential exposure
+# surface inside agentic CLI children that themselves run untrusted
+# tool calls. Provider-specific helpers scrub the *other* vendor's set.
+_CLAUDE_ONLY_ENV: frozenset = frozenset({
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_API_BETAS",
+})
+_CODEX_ONLY_ENV: frozenset = frozenset({
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+})
+
+
 def headless_child_env() -> Dict[str, str]:
     """``scrubbed_env()`` plus the auto-load-disable knobs the child needs
     to skip its own heavy startup (CLAUDE.md walk, auto-memory, etc.).
@@ -147,8 +189,44 @@ def headless_child_env() -> Dict[str, str]:
     arg is for. Letting a stray "0" sticky-pass through would reopen
     exactly the path that caused the 9-minute hang this helper exists
     to prevent.
+
+    .. deprecated:: 1.10.7
+        Prefer :func:`claude_child_env` / :func:`codex_child_env` —
+        provider-specific variants don't leak the other vendor's auth
+        surface into the spawn (Codex review T1 #9). This alias keeps
+        the original semantics for backward compatibility.
+    """
+    return claude_child_env()
+
+
+def claude_child_env() -> Dict[str, str]:
+    """Headless child env for a `claude -p` spawn.
+
+    :func:`scrubbed_env` + the four ``CLAUDE_CODE_DISABLE_*`` knobs +
+    actively strips ``CODEX_HOME`` / ``OPENAI_*`` (codex auth has no
+    business being in a claude spawn).
     """
     env = scrubbed_env()
     for k, v in _CHILD_AUTO_LOAD_DISABLES.items():
         env[k] = v
+    for k in _CODEX_ONLY_ENV:
+        env.pop(k, None)
+    return env
+
+
+def codex_child_env() -> Dict[str, str]:
+    """Headless child env for a `codex exec` spawn.
+
+    :func:`scrubbed_env` + ``CLAUDE_CODE_DISABLE_*`` (no-ops for codex
+    itself, but protect any descendant ``claude`` invocation the child
+    might fork — same defensive override as the claude path) + actively
+    strips ``CLAUDE_CODE_OAUTH_TOKEN`` / ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN``
+    / ``ANTHROPIC_*``: claude auth in a codex spawn is a cross-vendor
+    credential leak with no operational reason. Codex review T1 item #9.
+    """
+    env = scrubbed_env()
+    for k, v in _CHILD_AUTO_LOAD_DISABLES.items():
+        env[k] = v
+    for k in _CLAUDE_ONLY_ENV:
+        env.pop(k, None)
     return env
