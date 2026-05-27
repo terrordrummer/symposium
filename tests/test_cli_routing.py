@@ -48,6 +48,26 @@ def adapters():
     return {"claude-cli": _FakeAdapter("claude"), "codex-cli": _FakeAdapter("codex")}
 
 
+def test_codex_adapter_uses_xhigh_not_max_reasoning_effort():
+    """`_build_adapter("codex-cli")` MUST pass
+    `-c model_reasoning_effort=xhigh`, NOT `max`. Codex CLI 0.12x
+    started rejecting `max` with "unknown variant `max`, expected one
+    of `none, minimal, low, medium, high, xhigh`" — a wrong value here
+    silently terminates the entire deliberation as
+    `provider_unrecoverable` after retry-budget exhaustion.
+    """
+    from symposium.integrations.cli_routing import _build_adapter
+
+    adapter = _build_adapter("codex-cli")
+    args = adapter._extra_args
+    assert "-c" in args
+    idx = args.index("-c")
+    assert args[idx + 1] == "model_reasoning_effort=xhigh", (
+        f"codex adapter must use xhigh (highest level accepted by current "
+        f"codex CLI), got {args[idx + 1]!r}"
+    )
+
+
 def test_per_persona_routing_both_installed(adapters):
     cfg = _config(["logician", "visionary", "critic"])
     new_cfg, providers = route_cli_providers(

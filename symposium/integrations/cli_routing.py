@@ -151,11 +151,16 @@ def _build_adapter(cli: str) -> ProviderAdapter:
     if cli == "codex-cli":
         from symposium.providers.codex_cli import CodexCliProvider
 
-        # `-c model_reasoning_effort=max` matches the operator's
+        # `-c model_reasoning_effort=xhigh` matches the operator's
         # documented preference for codex (their `~/.codex/config.toml`
         # uses `xhigh` by default and we pass `--ignore-user-config` to
         # avoid inheriting an interactive setup — so the effort knob
-        # has to be reasserted on the argv). `max` is the highest
-        # reasoning level supported by the codex CLI.
-        return CodexCliProvider(extra_args=["-c", "model_reasoning_effort=max"])
+        # has to be reasserted on the argv). `xhigh` is the highest
+        # reasoning level supported by codex CLI 0.122+ (the prior
+        # `max` value was rejected starting some 0.12x build with
+        # "unknown variant `max`, expected one of `none, minimal, low,
+        # medium, high, xhigh`" — observed against codex-cli 0.128.0,
+        # which terminated the symposium run with
+        # `provider_unrecoverable` after retry-budget exhaustion).
+        return CodexCliProvider(extra_args=["-c", "model_reasoning_effort=xhigh"])
     raise ValueError(f"unknown CLI provider id: {cli!r}")
