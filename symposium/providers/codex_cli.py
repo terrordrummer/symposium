@@ -71,6 +71,80 @@ _SCHEMA_MODELS: Dict[str, Any] = {
     "synthesis_content": SynthesisContent,
 }
 
+
+def _strictify_for_openai(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Patch a Pydantic-generated JSON Schema into OpenAI structured-output
+    strict-mode compliance.
+
+    The OpenAI strict mode used by ``codex exec --output-schema`` (and the
+    underlying chat-completions `response_format=json_schema, strict=true`)
+    rejects any submitted schema that doesn't satisfy:
+
+      1. **Every object type carries** ``additionalProperties: false``.
+         Pydantic emits ``false`` at the root but leaves it ``true`` (or
+         omits it) inside nested ``anyOf`` branches — notably ``Dict[str,
+         Any]`` variants, which Pydantic renders as
+         ``{"type": "object", "additionalProperties": true}``.
+      2. **Every property is listed in** ``required``. Pydantic omits
+         optional fields (``Optional[X] = None``) from ``required`` even
+         though their generated type already includes ``null``. Strict
+         mode wants them present in ``required`` and the model is
+         expected to emit ``null`` for "not provided".
+
+    Failing either rule trips a ``400 invalid_json_schema`` from the
+    OpenAI backend — observed in the wild as ``codex exec`` exiting with
+    rc=1 and the actual error embedded in the stdout JSONL stream
+    (``{"type": "error", "message": "Invalid schema for response_format
+    'codex_output_schema': 'additionalProperties' is required to be
+    supplied and to be false."}``), not in stderr. This walker is what
+    we apply just-in-time before writing ``schema.json`` to the temp dir
+    codex reads from.
+
+    Semantic impact:
+
+      * **Optional fields are preserved** — the model can still emit
+        ``null`` for them since their generated type already includes a
+        ``null`` branch in the original ``anyOf``.
+      * **Open object payloads are narrowed.** A union member of the
+        form ``{"type": "object", "additionalProperties": true}`` —
+        emitted by Pydantic for a ``Dict[str, Any]`` field — becomes
+        ``{"type": "object", "additionalProperties": false}`` with no
+        ``properties``, i.e. accepts only ``{}``. Today this affects
+        ``DirectRequest.content`` (``Union[str, Dict[str, Any]]``):
+        through this adapter, a persona that wants to attach structured
+        content to a direct_request MUST use the string branch (eg.
+        a JSON-encoded envelope). The Pydantic model still accepts the
+        object branch — the narrowing is only at the codex submission
+        boundary. (Codex review T5 #1/#2 — flagged explicitly to avoid
+        the misleading "protocol-equivalent" framing the first draft of
+        this docstring used.)
+
+    Pure-functional: returns a deep copy, leaves the input untouched.
+    """
+    import copy
+
+    out = copy.deepcopy(schema)
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            # An object schema (explicit `type: object` OR has `properties`)
+            # MUST have additionalProperties: false AND every property in
+            # required.
+            is_object = node.get("type") == "object" or "properties" in node
+            if is_object:
+                node["additionalProperties"] = False
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    node["required"] = list(props.keys())
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(out)
+    return out
+
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
@@ -215,10 +289,43 @@ class CodexCliProvider(ProviderAdapter):
 
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
-            kind, retriable = _classify_cli_exit(stderr)
+            # Codex emits the actual error in the stdout JSONL stream
+            # (`{"type": "error", "message": "..."}`) for backend-side
+            # failures (invalid schema, model error, auth), often with
+            # an EMPTY stderr. Pre-v1.10.8 the operator just saw
+            # `<no stderr>` and had to dig through artifact.json by
+            # hand. Now: parse stdout for the JSONL error event and
+            # surface its message verbatim.
+            _, _, stdout_error = _parse_jsonl(proc.stdout or "")
+            stdout_msg = ""
+            if stdout_error is not None:
+                # The error event's `message` field is sometimes a JSON
+                # string itself (the upstream API error body) — try to
+                # pretty-extract the human-readable bit if so, AND
+                # surface the upstream `code` when present (Codex review
+                # T5 #4: "invalid_json_schema" is often more diagnostic
+                # than the message prose alone).
+                raw_msg = stdout_error.get("message", "")
+                if isinstance(raw_msg, str):
+                    try:
+                        inner = json.loads(raw_msg)
+                        if isinstance(inner, dict):
+                            err_obj = inner.get("error") or inner
+                            if isinstance(err_obj, dict):
+                                code = err_obj.get("code")
+                                msg = err_obj.get("message", "") or raw_msg
+                                stdout_msg = f"[{code}] {msg}" if code else msg
+                            else:
+                                stdout_msg = raw_msg
+                        else:
+                            stdout_msg = raw_msg
+                    except json.JSONDecodeError:
+                        stdout_msg = raw_msg
+            detail = stderr or stdout_msg or "<no stderr, no stdout error>"
+            kind, retriable = _classify_cli_exit(stderr or stdout_msg)
             return _error_result(
                 kind,
-                f"codex CLI exited {proc.returncode}: {stderr[:500] or '<no stderr>'}",
+                f"codex CLI exited {proc.returncode}: {detail[:500]}",
                 retriable=retriable,
             )
 
@@ -281,13 +388,27 @@ _SCHEMA_CACHE: Dict[str, str] = {}
 
 
 def _schema_for(expected: Optional[str]) -> Optional[str]:
+    """Pydantic JSON Schema for `expected`, **strictified for OpenAI**
+    (v1.10.8+): see :func:`_strictify_for_openai`.
+
+    Without strictify, `codex exec --output-schema` rejects the schema
+    upfront with `invalid_json_schema` (the strict-mode backend requires
+    `additionalProperties: false` on every object AND every property in
+    `required`) — observed as a silent `rc=1` with the error in stdout
+    JSONL, not stderr. Strictifying makes the schema submittable. Note
+    the open-object narrowing the helper documents: through codex,
+    `DirectRequest.content` accepts string or `{}` only — not arbitrary
+    object payloads (use the string branch + JSON envelope for
+    structured content).
+    """
     if expected in (None, "null"):
         return None
     model = _SCHEMA_MODELS.get(expected)
     if model is None:
         return None
     if expected not in _SCHEMA_CACHE:
-        _SCHEMA_CACHE[expected] = json.dumps(model.model_json_schema())
+        strict = _strictify_for_openai(model.model_json_schema())
+        _SCHEMA_CACHE[expected] = json.dumps(strict)
     return _SCHEMA_CACHE[expected]
 
 
@@ -329,8 +450,30 @@ def _parse_jsonl(stdout: str):
             u = ev.get("usage")
             if isinstance(u, dict):
                 usage_event = u
-        elif etype in ("turn.failed", "error", "stream.error"):
-            error_event = ev
+        elif etype in ("error", "stream.error"):
+            # Prefer the first error/stream.error event WITH a non-empty
+            # message — codex sometimes emits a leading `stream.error`
+            # with no payload before the actual `error` event that
+            # carries the upstream API complaint. Pure "first wins"
+            # would lock us onto the empty one. (Codex review T5 #3.)
+            # A later `turn.failed` event would otherwise overwrite the
+            # actionable event, leaving the operator with a contentless
+            # "<no stderr>" diagnostic. (v1.10.8)
+            existing_msg = ""
+            if isinstance(error_event, dict):
+                em = error_event.get("message")
+                if isinstance(em, str):
+                    existing_msg = em.strip()
+            new_msg = ev.get("message") if isinstance(ev.get("message"), str) else ""
+            if not existing_msg and new_msg.strip():
+                error_event = ev
+            elif error_event is None:
+                error_event = ev
+        elif etype == "turn.failed":
+            # turn.failed is a generic "the turn didn't complete" signal
+            # — useful only when no richer error event preceded it.
+            if error_event is None:
+                error_event = ev
     return agent_text, usage_event, error_event
 
 

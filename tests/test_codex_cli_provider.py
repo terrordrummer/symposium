@@ -299,3 +299,242 @@ def test_codex_child_env_scrubs_claude_auth(monkeypatch):
     assert env.get("OPENAI_API_KEY") == "sk-..."
     # PATH must remain (subprocess needs it to find the binary)
     assert env.get("PATH") == "/usr/bin"
+
+
+def test_strictify_for_openai_patches_pydantic_schema():
+    """`_strictify_for_openai` MUST set `additionalProperties: false` on
+    every object type (including inside anyOf branches) AND list every
+    property in `required`. OpenAI structured-output strict mode rejects
+    the schema otherwise — observed in the wild as codex exec exiting
+    rc=1 with the actual error embedded in stdout JSONL (not stderr),
+    silently surfaced to the operator as "codex CLI exited 1: <no
+    stderr>" before this fix.
+    """
+    from symposium.providers.codex_cli import _strictify_for_openai
+
+    pydantic_like = {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "direct_requests": {
+                "anyOf": [
+                    {"type": "array", "items": {"$ref": "#/$defs/Req"}},
+                    {"type": "null"},
+                ],
+                "default": None,
+            },
+        },
+        "required": ["text"],
+        "additionalProperties": False,
+        "$defs": {
+            "Req": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "content": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "object", "additionalProperties": True},
+                        ],
+                    },
+                },
+                "required": ["target", "content"],
+                "additionalProperties": False,
+            }
+        },
+    }
+
+    strict = _strictify_for_openai(pydantic_like)
+
+    # All originally-optional fields now in `required`.
+    assert "direct_requests" in strict["required"]
+    # additionalProperties=true inside anyOf got flipped to false.
+    inner_dict = strict["$defs"]["Req"]["properties"]["content"]["anyOf"][1]
+    assert inner_dict["additionalProperties"] is False
+    # Input untouched (pure-functional contract).
+    assert pydantic_like["required"] == ["text"]
+    assert pydantic_like["$defs"]["Req"]["properties"]["content"]["anyOf"][1][
+        "additionalProperties"
+    ] is True
+
+
+def test_codex_schema_for_turn_structured_output_is_openai_strict():
+    """The actual TurnStructuredOutput / Verdict / SynthesisContent
+    schemas that codex_cli writes to `--output-schema` MUST satisfy
+    OpenAI strict mode (every object: additionalProperties=false + all
+    properties in required). Regression guard for the v1.10.8 fix.
+    """
+    import json as _json
+    from symposium.providers.codex_cli import _SCHEMA_MODELS, _schema_for
+
+    # Clear cache so the test sees a fresh strictify call (other tests
+    # may have populated _SCHEMA_CACHE pre-fix in old test runs).
+    from symposium.providers.codex_cli import _SCHEMA_CACHE
+    _SCHEMA_CACHE.clear()
+
+    for expected in _SCHEMA_MODELS:
+        raw = _schema_for(expected)
+        assert raw is not None
+        schema = _json.loads(raw)
+
+        def _check(node, path=""):
+            if isinstance(node, dict):
+                if node.get("type") == "object" or "properties" in node:
+                    assert node.get("additionalProperties") is False, (
+                        f"{expected} {path}: additionalProperties != False"
+                    )
+                    props = list((node.get("properties") or {}).keys())
+                    req = node.get("required") or []
+                    missing = [p for p in props if p not in req]
+                    assert not missing, (
+                        f"{expected} {path}: optional fields not in required: {missing}"
+                    )
+                for k, v in node.items():
+                    _check(v, f"{path}.{k}")
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    _check(item, f"{path}[{i}]")
+
+        _check(schema, "$")
+
+
+def test_codex_exit_error_surfaces_stdout_jsonl_message(monkeypatch):
+    """When codex exits rc!=0 with EMPTY stderr but a `{"type":"error",
+    "message": "..."}` event in stdout, the adapter MUST surface that
+    stdout message in `ProviderError.message` — not the unhelpful
+    `<no stderr>` string. This is the v1.10.7 hole that left the
+    operator looking at a meaningless termination reason while the
+    real cause (invalid_json_schema) sat in stdout.
+    """
+    from symposium.providers.codex_cli import CodexCliProvider
+    stdout_payload = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"error","message":"{\\"type\\":\\"error\\",\\"error\\":'
+        '{\\"type\\":\\"invalid_request_error\\",\\"code\\":\\"invalid_json_schema\\",'
+        '\\"message\\":\\"Invalid schema for response_format \'codex_output_schema\': '
+        '\\\\u0027additionalProperties\\\\u0027 is required to be supplied and to be false.\\"},'
+        '\\"status\\":400}"}\n'
+        '{"type":"turn.failed"}\n'
+    )
+
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        return subprocess.CompletedProcess(argv, 1, stdout=stdout_payload, stderr="")
+
+    provider = CodexCliProvider(runner=runner, check_binary=False)
+    result = provider.invoke(_req())
+
+    assert result.error is not None
+    msg = result.error.message
+    # Surfaces the actual upstream complaint, not '<no stderr>'.
+    assert "invalid_json_schema" in msg or "additionalProperties" in msg, (
+        f"expected codex stdout error in message, got: {msg!r}"
+    )
+    assert "<no stderr>" not in msg
+
+
+def test_codex_schema_narrows_open_object_payloads_intentionally():
+    """`DirectRequest.content: Union[str, Dict[str, Any]]` is a known
+    semantic narrowing through codex (Codex review T5 #1/#2): the
+    strictified schema accepts string content + `{}`, but NOT arbitrary
+    object payloads like `{"q": "why"}`. The Pydantic model still
+    accepts the object branch; the narrowing is purely at codex
+    submission. Documented here as intentional behavior so future
+    refactors don't silently re-open the path without thinking
+    through the OpenAI-strict implications.
+    """
+    import json as _json
+    from jsonschema import Draft202012Validator
+    from symposium.providers.codex_cli import _schema_for, _SCHEMA_CACHE
+
+    _SCHEMA_CACHE.clear()
+    schema = _json.loads(_schema_for("turn_structured_output"))
+    validator = Draft202012Validator(schema)
+
+    # Find the DirectRequest sub-schema and its `content` field.
+    dr = schema["$defs"]["DirectRequest"]
+    content_schema = dr["properties"]["content"]
+    # Both branches must be present in the union.
+    assert len(content_schema["anyOf"]) == 2
+    # The object branch MUST have additionalProperties: false (strict).
+    object_branch = next(
+        b for b in content_schema["anyOf"] if b.get("type") == "object"
+    )
+    assert object_branch["additionalProperties"] is False
+    # No properties → only `{}` validates (intentional narrowing).
+    assert "properties" not in object_branch or object_branch.get("properties") == {}
+
+    # End-to-end: a payload with string content validates.
+    string_payload = {
+        "text": "ok",
+        "direct_requests": [
+            {"target": "logician", "type": "ask",
+             "content": '{"q":"why"}'},  # JSON-string envelope, the supported shape
+        ],
+    }
+    errors = list(validator.iter_errors(string_payload))
+    assert errors == [], f"string content payload should validate: {errors}"
+
+    # End-to-end: a payload with object content does NOT validate
+    # against the strictified codex schema (the documented limitation)…
+    object_payload = {
+        "text": "ok",
+        "direct_requests": [
+            {"target": "logician", "type": "ask",
+             "content": {"q": "why"}},  # object branch — rejected by strictified schema
+        ],
+    }
+    errors = list(validator.iter_errors(object_payload))
+    assert errors, (
+        "object-typed content MUST be rejected by the strictified schema "
+        "(intentional limitation, see _strictify_for_openai docstring)"
+    )
+
+    # …but the Pydantic model STILL accepts it. The narrowing exists
+    # only at the codex submission boundary; the protocol contract
+    # itself is unchanged. Proves both halves of the limitation, not
+    # just the codex-side rejection. (Codex review T6 closure.)
+    from symposium.models import TurnStructuredOutput
+    TurnStructuredOutput.model_validate(object_payload)
+
+
+def test_parse_jsonl_prefers_error_event_with_non_empty_message():
+    """A `stream.error` with no message followed by a real `error` event
+    with the actionable upstream complaint — the real event wins.
+    Codex review T5 #3: first-wins was too rude when codex sometimes
+    emits an empty leading stream.error.
+    """
+    from symposium.providers.codex_cli import _parse_jsonl
+
+    stdout = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"stream.error"}\n'  # empty leading error
+        '{"type":"error","message":"the actionable complaint"}\n'
+        '{"type":"turn.failed"}\n'
+    )
+    _, _, err = _parse_jsonl(stdout)
+    assert err is not None
+    assert err.get("message") == "the actionable complaint"
+
+
+def test_codex_exit_error_surfaces_upstream_code_when_present():
+    """When the inner API error carries `code` (eg. `invalid_json_schema`),
+    that code MUST be in the surfaced message — it's often more
+    diagnostic than the message prose. Codex review T5 #4.
+    """
+    from symposium.providers.codex_cli import CodexCliProvider
+    stdout_payload = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"error","message":"{\\"type\\":\\"error\\",\\"error\\":'
+        '{\\"type\\":\\"invalid_request_error\\",\\"code\\":\\"invalid_json_schema\\",'
+        '\\"message\\":\\"prose here.\\"},\\"status\\":400}"}\n'
+    )
+    def runner(argv, *, input=None, capture_output=None, text=None, timeout=None, env=None):
+        return subprocess.CompletedProcess(argv, 1, stdout=stdout_payload, stderr="")
+
+    result = CodexCliProvider(runner=runner, check_binary=False).invoke(_req())
+    assert result.error is not None
+    assert "[invalid_json_schema]" in result.error.message, (
+        f"missing upstream code in surfaced message: {result.error.message!r}"
+    )

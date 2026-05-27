@@ -111,3 +111,13 @@ runtime. These are downstream of the protocol, not part of it.
   `deliberate*` surfaces. Open design question (Codex review T1 #7):
   whitelist of registered MCPs vs. inline JSON payload vs. path to a
   config file; pick one once a real use case shows up.
+- **codex `_classify_cli_exit` ordering bug.** In
+  `symposium/providers/codex_cli.py`, the substring match for
+  `"exceeded"` runs before the more-specific check for
+  `"context length"`, so a "context length exceeded" stderr is
+  classified as `quota_exhausted` instead of a context-window kind.
+  Diagnostic-only (both classifications are non-retriable today, so
+  retry behavior is unaffected). Fix is one-line: move the
+  `context && length` check before the generic `exceeded` match, with
+  two regression tests. Codex review T6 side-find — deferred from
+  v1.10.8 because it predates the cli-auto diff window.
