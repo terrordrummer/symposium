@@ -210,6 +210,31 @@ def test_bare_flag_opt_in():
     assert "--bare" in runner.calls[0]["argv"]
 
 
+def test_disable_mcps_on_by_default():
+    """The child `claude -p` MUST start with --strict-mcp-config and an
+    empty --mcp-config so the user's global MCP registry (context7,
+    firebase, gemini-image, vendor MCPs…) is NOT auto-loaded on every
+    turn. Without this, each deliberation turn pays 10–60s of npm-exec
+    startup per registered MCP, blowing the wallclock and producing a
+    noisy process tree (including a recursive symposium-mcp child when
+    symposium itself is registered).
+    """
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    argv = runner.calls[0]["argv"]
+    assert "--strict-mcp-config" in argv
+    idx = argv.index("--mcp-config")
+    assert argv[idx + 1] == '{"mcpServers": {}}'
+
+
+def test_disable_mcps_opt_out():
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner, disable_mcps=False).invoke(_turn_request())
+    argv = runner.calls[0]["argv"]
+    assert "--strict-mcp-config" not in argv
+    assert "--mcp-config" not in argv
+
+
 def test_env_scrubs_inherited_claude_code_state(monkeypatch):
     """When hosted inside Claude Code, parent env vars that would force the
     child into nested-Claude-Code mode (heavy bootstrap), high effort

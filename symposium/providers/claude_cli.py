@@ -137,6 +137,25 @@ class ClaudeCliProvider(ProviderAdapter):
         effort overrides), so ``bare=False`` is safe for the failure
         mode this flag was added for. Requires Claude Code >= 2.1.81
         when enabled.
+    disable_mcps:
+        When True (the **default**), append
+        ``--strict-mcp-config --mcp-config '{"mcpServers": {}}'`` to
+        every CLI invocation, which forces the spawned ``claude -p`` to
+        load **zero MCP servers** — overriding the user's global
+        ``~/.claude.json``. Why this is on by default: the user's MCP
+        registry typically holds 3–8 servers (context7, firebase,
+        gemini-image, vendor MCPs, etc.). Each one auto-spawns at
+        ``claude -p`` startup via ``npm exec`` / node, adding 10–60s of
+        latency *per deliberation turn* and producing a noisy process
+        tree (including, often, a recursive ``symposium-mcp`` child
+        when symposium itself is registered). A deliberation turn does
+        not need any of those MCPs — it is a single structured-output
+        call. The env-var scrub (``CLAUDE_CODE_DISABLE_*``) alone does
+        NOT prevent MCP loading; only this flag pair does, and unlike
+        ``--bare`` it preserves OAuth / keychain auth. Set
+        ``disable_mcps=False`` only if you have a specific reason for
+        the spawned child to load MCPs (eg. tool-use over CLI, not yet
+        wired through this adapter as of v1.10).
     env:
         Environment passed to the subprocess. ``None`` (the default)
         means :func:`~symposium.providers._cli_env.headless_child_env`:
@@ -167,6 +186,7 @@ class ClaudeCliProvider(ProviderAdapter):
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         extra_args: Optional[List[str]] = None,
         bare: bool = False,
+        disable_mcps: bool = True,
         env: Optional[Dict[str, str]] = None,
         runner: Optional[Runner] = None,
         check_binary: bool = True,
@@ -176,6 +196,7 @@ class ClaudeCliProvider(ProviderAdapter):
         self._timeout = timeout
         self._extra_args = list(extra_args or [])
         self._bare = bare
+        self._disable_mcps = disable_mcps
         self._env_override = env
         self._run: Runner = runner or subprocess.run
         if check_binary and runner is None and shutil.which(binary) is None:
@@ -222,6 +243,15 @@ class ClaudeCliProvider(ProviderAdapter):
             # sync, no auto-memory, no CLAUDE.md auto-discovery, no keychain
             # reads). See the class docstring for the rationale.
             argv.append("--bare")
+        if self._disable_mcps:
+            # Force the spawned `claude -p` to load zero MCP servers by
+            # making the user's MCP registry unreachable: --strict-mcp-config
+            # restricts the child to MCPs declared via --mcp-config (only),
+            # and we hand it an empty config. Without this the child
+            # auto-loads every MCP from ~/.claude.json, each one a multi-
+            # second npm-exec at startup; a deliberation turn doesn't need
+            # any of them. Unlike --bare, this preserves OAuth/keychain.
+            argv += ["--strict-mcp-config", "--mcp-config", '{"mcpServers": {}}']
         # The system block — which carries persona material and may contain
         # confidential prompt fragments — is ALWAYS folded into the stdin
         # payload with a `[SYSTEM]` sentinel; we never put it on the argv
