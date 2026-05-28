@@ -57,8 +57,10 @@ Python 3.11+.
 claude mcp add symposium -- symposium-mcp
 ```
 
-```jsonc
-deliberate(problem="Should we migrate the monolith to microservices?")
+Then just ask Claude in plain language:
+
+```text
+> Use symposium to debate whether we should migrate the monolith to microservices.
 ```
 
 The panel debates over your local `claude` / `codex` login and streams each turn back live. That's it.
@@ -77,22 +79,20 @@ symposium watch  runs/demo-walking-skeleton-001     # ↑ watch it in the browse
 
 ## Use it in Claude Code
 
-The MCP server exposes the runtime as tools. The default `provider="cli-auto"` routes each persona to a local CLI — the creative **visionary** to `codex`, the rest to `claude` — and falls back to whichever you have installed. **No API key.**
+Once the server is registered, you don't type any special syntax — just **ask Claude in plain language** and it calls the right tool. The default routes each persona to a local CLI (the creative **visionary** to `codex`, the rest to `claude`) and falls back to whichever you have installed. **No API key.**
 
-```jsonc
-// default: stream the debate live, no key
-deliberate(problem="…")
+```text
+> Use symposium to debate whether we should migrate the monolith to microservices.
 
-// dynamic experts: generate a domain specialist mid-debate when the panel gets stuck
-deliberate_adaptive(problem="…", experts=["GDPR compliance", "Postgres internals"])
+> Run a symposium on our caching strategy, and pull in experts on
+  GDPR compliance and Postgres internals if the panel needs them.
 
-// force one CLI, or opt into the metered HTTP API instead
-deliberate(problem="…", provider="claude-cli")   // or "codex-cli"
-deliberate(problem="…", provider="anthropic")     // reads ANTHROPIC_API_KEY
+> Have symposium deliberate this RFC, but run the whole panel on claude.
 
-// deterministic, offline (tests & demos)
-deliberate(problem="demo", provider="fake", fake_script_path="examples/scripts/walking-skeleton.json")
+> Summarize the last symposium run in runs/.
 ```
+
+Claude maps these to `deliberate` / `deliberate_adaptive` / `get_run_summary` and streams the debate back turn by turn. Under the hood:
 
 | Tool | Does |
 |---|---|

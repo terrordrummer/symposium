@@ -54,7 +54,7 @@ __all__ = [
 # protocol + JSON Schemas, which MUST NOT move here) and from
 # storage.writer.PRODUCER_VERSION (the §7.6-condition-#1
 # reproduction-surface identity).
-__version__ = "1.11.3"
+__version__ = "1.11.4"
 SCHEMA_VERSION = "1.0.0"
 
 
