@@ -1,617 +1,175 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="Symposium logo" width="180">
+  <img src="docs/assets/logo.png" alt="Symposium logo" width="160">
 </p>
 
 <h1 align="center">Symposium</h1>
 
 <p align="center">
-  <em>An opinionated protocol for structured, sequential, adversarial multi-agent deliberation.</em>
+  <em>A panel of AI experts that actually argue — structured, sequential, and replayable to the byte.</em>
 </p>
 
 <p align="center">
   <a href="docs/specification.md"><img alt="Spec" src="https://img.shields.io/badge/spec-1.0-1a365d?style=flat-square"></a>
   <a href="docs/schemas/v1.0.0/"><img alt="Schemas" src="https://img.shields.io/badge/JSON%20Schema-v1.0.0-d4a017?style=flat-square"></a>
-  <a href="symposium/"><img alt="Reference impl" src="https://img.shields.io/badge/reference%20impl-Python%203.11%2B-3776ab?style=flat-square"></a>
+  <a href="https://pypi.org/project/symposium-protocol/"><img alt="PyPI" src="https://img.shields.io/pypi/v/symposium-protocol?style=flat-square&color=3776ab"></a>
   <a href="https://github.com/terrordrummer/symposium/actions/workflows/validate.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/terrordrummer/symposium/validate.yml?branch=main&label=ci&style=flat-square"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-333333?style=flat-square"></a>
 </p>
 
 ---
 
-## What is this?
+Symposium runs a small panel of AI personas through a **structured debate** — each takes a turn, a neutral coordinator steers, and you get back **one synthesized answer**. Every session is saved as a tamper-evident artifact you can **replay byte-for-byte**.
 
-Symposium is a **protocol specification** + a **reference Python
-runtime** that orchestrates a small panel of LLM-backed agents through
-a structured, turn-based deliberation, producing a single, replayable,
-schema-validated artifact.
+It's not another free-form "group chat" framework. Symposium enforces exactly **one** conversation shape — fixed panel, one turn per agent per round, a coordinator that recommends but never decides when to stop. You trade flexibility for something most multi-agent stacks can't give you: **reproducibility**.
 
-It is **not** a generic agent framework. It enforces exactly one
-conversation topology — fixed panel, one primary turn per agent per
-round, one structurally-separated coordinator, bounded forks — and
-trades topology flexibility for **testable scheduler invariants** and
-**byte-identical replay** of any past session.
+```text
+        critic ── logician
+       /                  \
+  engineer    (coordinator)   visionary
+       \                  /
+        researcher ───────
+   → one debate, one synthesized answer, one replayable artifact
+```
 
-Two things ship together in this repo:
+## Why Symposium
 
-1. **`docs/specification.md`** — the normative protocol. Implementable
-   in any language. The spec is what conformance means.
-2. **`symposium/`** — the reference Python runtime. Today: full
-   scheduler, persistence, replay, offline metrics, a live browser
-   viewer, an MCP server, and five provider adapters — the
-   deterministic `fake` adapter, an OpenAI-shaped HTTP adapter, an
-   Anthropic-shaped HTTP adapter, and two **terminal-CLI** adapters
-   (`claude-cli`, `codex-cli`) that drive the locally-installed `claude`
-   / `codex` CLIs **with no API key**.
-
----
-
-## Why one more protocol?
-
-Most multi-agent stacks expose enough flexibility (group chat,
-arbitrary handoffs, nested supervisors) that any two implementations
-diverge on the parts that matter — when does the conversation stop, what
-exactly is replayed, what fails the run, how is delegation routed. Each
-implementation invents its own answers, and operators end up debugging
-the framework instead of the agents.
-
-Symposium goes the opposite way: **one opinionated topology, sharp
-boundaries, closed enums.** What you get in exchange:
-
-| | Symposium |
-|---|---|
-| **Topology** | Fixed `deliberation_panel`, one `primary_turn` per agent per round, single `coordination_turn` from a structurally-separated `coordinator_agent`. |
-| **Inter-agent routing** | Schema-validated `direct_request` only. Inline `@AgentName` in prose is never routing — prompt-injection resistant by construction. |
-| **Roles** | Three-way separation: `Selector` chooses *who*, `CoordinatorAgent` recommends *what next* (LLM, no executive power), `OrchestratorRuntime` schedules and terminates (deterministic code, sole party that decides when a session stops). |
-| **Failure surface** | Closed 7-value termination-reason enum; closed 12-value adapter `error.kind` enum; closed 3-value `on_agent_failure` policy. |
-| **Replayability** | Four distinct contracts documented separately: `transcript_replay` (unconditional byte identity), `execution_replay` (conditional on ten pinning conditions), golden-test byte identity, `fake_provider` determinism. No "it should be deterministic" hand-waving. |
-| **Persistence** | Canonical `Artifact` (§5.10) with RFC-8785 JCS-canonicalized `transcript_digest` (SHA-256). Tamper-evident. |
-| **Execution mode** | MVP is **batch-only** (ADR-004). Interactive / event-stream / async are explicitly v1+. |
-
-Full discussion in §10 *Competitive Positioning* of the spec.
-
----
+- 🔑 **No API key needed.** By default it drives your local `claude` / `codex` CLI login — nothing metered, nothing to configure.
+- 🧠 **A real panel.** Five complementary personas (logician, visionary, researcher, critic, engineer) plus a separate coordinator. Add your own on the fly.
+- 🔁 **Byte-identical replay.** Every run is a SHA-256-sealed artifact; re-render it or re-execute it and prove it didn't change.
+- 📺 **Watch it live.** `symposium watch` opens a browser viewer — personas on a circle, a glow on the speaker, arrows for every direct question.
+- 🧩 **Built for Claude Code.** Ships an MCP server: kick off a deliberation and stream the debate straight into your client.
+- 📜 **A spec, not just code.** The protocol is language-independent; this Python package is one reference implementation.
 
 ## Install
 
-The distribution name is `symposium-protocol`; the import package is
-`symposium` (cf. scikit-learn → sklearn).
-
 ```bash
-# Stable install (PyPI)
-pip install symposium-protocol           # then: import symposium
-
-# With the optional MCP server (Claude Code / Claude Desktop integration)
-pip install "symposium-protocol[mcp]"
-
-# Released tag, straight from GitHub (works without PyPI)
-pip install "git+https://github.com/terrordrummer/symposium@v1.11.1"
-
-# Development install (editable, from a clone)
-git clone https://github.com/terrordrummer/symposium
-cd symposium
-pip install -e ".[test]"
+pip install symposium-protocol            # import symposium
+pip install "symposium-protocol[mcp]"     # + the Claude Code / Desktop MCP server
 ```
 
-Requires Python 3.11+. The core install is HTTP-only; `import symposium`
-and the `symposium` CLI work without the `mcp` extra.
-
----
-
-## Which API keys are used — and which are not
-
-This trips people up, so it is stated up front:
-
-| Path | API key required | What it reads |
-|---|---|---|
-| **`cli-auto`** (MCP default) | **None.** | Reuses the locally-installed `claude` / `codex` CLI login (OAuth / keychain / subscription). No `ANTHROPIC_API_KEY`, no `OPENAI_API_KEY`. |
-| **`claude-cli`** / **`codex-cli`** | **None.** | Same as above, forced onto one CLI. |
-| **`fake`** | **None.** | Deterministic, offline. Reads a scripted JSON; never touches the network. |
-| **`anthropic`** (HTTP adapter) | `ANTHROPIC_API_KEY` | Calls `api.anthropic.com`. Optional `ANTHROPIC_BASE_URL` to point at a self-hosted Anthropic-compatible endpoint. |
-| **`openai`** (HTTP adapter) | `OPENAI_API_KEY` | Calls `api.openai.com`. Optional `OPENAI_BASE_URL` for an OpenAI-compatible endpoint. |
-
-**The keys that are *not* used by default:** `ANTHROPIC_API_KEY` and
-`OPENAI_API_KEY`. They are consumed **only** by the metered HTTP
-adapters (`provider="anthropic"` / `"openai"`). Every other path — the
-MCP default `cli-auto`, both forced CLIs, and `fake` — ignores them
-entirely. If you have those variables exported in your shell, a
-`cli-auto` or `fake` run will simply not look at them. The CLI adapters
-deliberately **scrub cross-vendor credentials** before each spawn (a
-`claude` spawn gets `OPENAI_*` / `CODEX_HOME` removed, and vice-versa).
-
----
+Python 3.11+.
 
 ## Quick start
 
-Every flow below produces a persisted, byte-identically replayable
-artifact under the output directory.
+**In Claude Code (the easy path — no key).** Register the server, then just ask:
 
-### Fake-driven session (no API key, no network)
+```bash
+claude mcp add symposium -- symposium-mcp
+```
+
+```jsonc
+deliberate(problem="Should we migrate the monolith to microservices?")
+```
+
+The panel debates over your local `claude` / `codex` login and streams each turn back live. That's it.
+
+**From the terminal (no key, no network).** Run the deterministic demo, then replay it:
 
 ```bash
 symposium run \
   --config examples/configs/walking-skeleton.yaml \
   --script examples/scripts/walking-skeleton.json \
-  --output runs/ \
-  examples/problem.md
+  --output runs/ examples/problem.md
 
-# Replay (byte-identity check on the stored canonical_transcript)
-symposium replay runs/demo-walking-skeleton-001
-
-# Validate the artifact against the v1.0.0 JSON Schemas
-symposium validate runs/demo-walking-skeleton-001/artifact.json
+symposium replay runs/demo-walking-skeleton-001     # byte-identity check
+symposium watch  runs/demo-walking-skeleton-001     # ↑ watch it in the browser
 ```
 
-### Anthropic-driven session (metered API)
+## Use it in Claude Code
+
+The MCP server exposes the runtime as tools. The default `provider="cli-auto"` routes each persona to a local CLI — the creative **visionary** to `codex`, the rest to `claude` — and falls back to whichever you have installed. **No API key.**
+
+```jsonc
+// default: stream the debate live, no key
+deliberate(problem="…")
+
+// dynamic experts: generate a domain specialist mid-debate when the panel gets stuck
+deliberate_adaptive(problem="…", experts=["GDPR compliance", "Postgres internals"])
+
+// force one CLI, or opt into the metered HTTP API instead
+deliberate(problem="…", provider="claude-cli")   // or "codex-cli"
+deliberate(problem="…", provider="anthropic")     // reads ANTHROPIC_API_KEY
+
+// deterministic, offline (tests & demos)
+deliberate(problem="demo", provider="fake", fake_script_path="examples/scripts/walking-skeleton.json")
+```
+
+| Tool | Does |
+|---|---|
+| `deliberate` | Run a debate, stream every turn live. The default. |
+| `deliberate_adaptive` | Same, but generates new expert personas on demand (early-start + mid-run). |
+| `*_muted` variants | Same result, no live streaming — just the final answer. |
+| `get_run_status` | Poll a still-running debate for new turns. |
+| `get_run_summary` | Outcome + metrics + replay check for a finished run. |
+| `list_personas` / `generate_persona` | Inspect the built-in panel / design a new expert. |
+| `get_version` | What's actually running (handy after a reinstall). |
+
+> **Billing.** Logged in with a Pro/Max or ChatGPT subscription? CLI turns spend **subscription quota and rate limits**, not metered API dollars. The real ceiling under `cli-auto` is `max_wallclock_seconds` (default 1h) and your plan's rate limit — the token/cost caps are telemetry, not a hard budget. Only the `anthropic` / `openai` HTTP adapters bill per token.
+
+## API keys: what's used, what isn't
+
+| Provider | API key |
+|---|---|
+| `cli-auto` (default), `claude-cli`, `codex-cli` | **None** — reuses your local CLI login |
+| `fake` | **None** — offline & deterministic |
+| `anthropic` | `ANTHROPIC_API_KEY` *(optional `ANTHROPIC_BASE_URL`)* |
+| `openai` | `OPENAI_API_KEY` *(optional `OPENAI_BASE_URL`)* |
+
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are read **only** when you explicitly pick the metered `anthropic` / `openai` HTTP adapter. Every default path ignores them — and the CLI adapters actively scrub cross-vendor credentials before each spawn.
+
+## CLI commands
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-# Optional: point at a self-hosted Anthropic-compatible endpoint
-# export ANTHROPIC_BASE_URL=https://my-llm-proxy.internal/v1
-
-symposium run \
-  --config examples/configs/anthropic.yaml \
-  --output runs/ \
-  examples/problem.md
+symposium run                 # run a session against any provider
+symposium watch               # live browser viewer (follows the newest run)
+symposium replay              # re-render a stored transcript; verify the digest
+symposium execution-replay    # re-run under the 10 pinning conditions; prove reproducibility
+symposium validate            # check an artifact against the v1.0.0 JSON Schemas
+symposium metrics             # tokens, cost, latency, branch depth — computed offline
 ```
 
-### OpenAI-driven session (metered API)
+To run real models from the CLI without a key, set `provider: claude-cli` (or `codex-cli`) on each agent in your config and drop the vendor key — the adapters are registered out of the box.
 
-```bash
-export OPENAI_API_KEY=sk-...
-# Optional: point at a self-hosted OpenAI-compatible endpoint
-# export OPENAI_BASE_URL=https://my-llm-proxy.internal/v1
-
-symposium run \
-  --config examples/configs/openai.yaml \
-  --output runs/ \
-  examples/problem.md
-```
-
-### Watch a deliberation live (browser viewer)
-
-`symposium watch` serves a read-only single-page viewer that tails a
-run's `transcript.jsonl` over SSE: personas arranged on a circle
-(coordinator at the centre), a glow on the current speaker, a live chat
-panel, and an animated arrow for every directed inter-agent
-`direct_request`. It follows the newest run under `--runs-dir`
-automatically, works on a finished run too (replay), and **never writes**
-to the run directory.
-
-```bash
-# Follow the newest run under runs/ (auto-picks a free port, opens a browser)
-symposium watch --runs-dir runs/
-
-# Pin a single run, on a fixed port, without opening a browser
-symposium watch --run runs/demo-walking-skeleton-001 --port 8800 --no-open
-```
-
-### Selecting the panel
-
-Before round 1 the §4.1 **selector** chooses the active deliberation
-panel and binds the coordinator. `Config.selector.strategy` picks one of
-three strategies, each emitting a schema-valid `SelectorOutput`
-(§5.11) written to `<run_dir>/selector_output.json` on every run:
-
-- **`fixed`** (default, MVP/R3) — degenerate: the panel is the declared
-  `default_deliberation_panel` and the coordinator is the declared
-  `coordinator_agent`. Makes **no** provider call.
-- **`rules`** — pure, deterministic. Matches each agent's persona
-  metadata (`reasoning_scope` / `domain_scope`) against the
-  `problem_statement` via a transparent keyword table; records dropped
-  agents in `excluded_agents`. No provider call, so the same `(config)`
-  yields a byte-identical decision (and stays replayable under §7.6).
-- **`llm`** — one bounded provider invocation (the §6.2
-  `expected_output_schema = null` free-text path, driven by the
-  coordinator agent's `provider`/`model`) parsed into a `SelectorOutput`.
-  Requires a `selector_budget` (§5.2); its usage is budgeted separately
-  and never enters `Artifact.cumulative_usage` or the `transcript_digest`.
-  For fake sessions, script the single selector call with
-  `--selector-script` (mirrors `--script`).
-
-```bash
-# rules: deterministic, no model call
-symposium run \
-  --config examples/configs/rules-selector.yaml \
-  --script examples/scripts/walking-skeleton.json \
-  --output runs/
-
-# llm: one bounded selector call (separate fake script) + deliberation
-symposium run \
-  --config examples/configs/llm-selector.yaml \
-  --selector-script examples/scripts/llm-selector.json \
-  --script examples/scripts/walking-skeleton.json \
-  --output runs/
-# → stdout: selector_strategy=… / selected_agents=…
-# → <run_dir>/selector_output.json
-```
-
-The selector is a distinct ADR-005 role: it chooses *who* deliberates,
-emits no `canonical_transcript` message, and an empty/malformed selection
-terminates the session with `reason = schema_error` before round 1.
-
-### Inspecting metrics
-
-Every persisted run directory can be analysed offline with `symposium
-metrics`, which computes the §7.9 MVP observability set (token / cost
-usage per agent and per `(provider, model)`, latency per invocation,
-participation per round, branch depth, deferred-queue length, panel
-contractions, schema-failure counts, termination reason, the
-`usage_estimated` flag) and writes `metrics.json` next to the
-artifact:
-
-```bash
-symposium metrics runs/demo-walking-skeleton-001
-# → runs/demo-walking-skeleton-001/metrics.json (full breakdown)
-# → stdout: one-screen human-readable summary
-```
-
-The §7.9 set is deliberately MVP — `role_purity_score`,
-`disagreement_frequency`, `interaction_graph`,
-`delegation_frequency`, per-invocation provider-retry counts and a
-live `observability_event` stream are §7.10 v1+ extensions and
-formally deferred. The MVP set is fully derivable from the persisted
-`artifact.json` alone; no live event bus required.
-
-The CLI resolves each agent's `provider` string through the adapter
-registry (§6.11). Built-in registrations: `openai`, `anthropic`,
-`claude-cli`, `codex-cli`, and — when `--script` is given — `fake`. Plug
-your own adapter in by registering a factory before the run.
-
-### Re-running a session
-
-`symposium replay` (above) is the §7.5 **`transcript_replay`** — it
-re-renders the *stored* `canonical_transcript` and is byte-identical
-unconditionally (no model call). `symposium execution-replay` is the
-§7.6 **`execution_replay`** — it *re-runs the orchestrator* against the
-original `problem_statement` / `Config` to regenerate a fresh transcript,
-and is reproducible only when every non-deterministic source is pinned
-(the ten **pinning conditions** of §7.6: runtime, adapter, provider,
-model, sampling, cache, tool_env, wallclock, persona, transcript_prefix).
-
-```bash
-symposium execution-replay runs/demo-walking-skeleton-001 \
-  --script examples/scripts/walking-skeleton.json \
-  --output runs/
-# → runs/demo-walking-skeleton-001-replay/  (fresh run, distinct session id)
-# → digest=match | digest=MISMATCH (first_divergence=…)
-```
-
-Before touching the runtime it checks every pinning condition decidable
-offline and **aborts** with a `pinning_violation` diagnostic (naming the
-exact condition) on the first one that cannot be satisfied — §7.6
-forbids silent best-effort replay. Exit codes: `0` digest match, `3`
-pinning violation, `4` digest mismatch, `1` any other error.
-
-Reproducibility is conditional, not free (§7.8: *replayable ≠
-reproducible*). Two runtime-allocated fields feed the digest but aren't
-produced by the provider — `Message.id` (`uuid4`) and `Message.timestamp`
-(wall-clock). `execution-replay` pins both to the values recorded in the
-original transcript (§7.6 condition #8's *fixed clock source* + §9.4.1's
-*deterministic id allocator*), so a deterministic `fake` run reproduces
-its digest exactly — no special recording step required. A re-execution
-that genuinely diverges (different content, count, or routing) desyncs
-from the recorded sequence and reports a mismatch with the first
-diverging message id, never a spurious match. A caller can override the
-timestamp source with `fixed_clock` (a library knob).
-
-### Library use
+## Use it as a library
 
 ```python
-from symposium import Config, FakeProviderScript
-from symposium.providers import FakeProvider, default_registry
+from symposium.providers import default_registry
 from symposium.scheduler import run_session
 
-# Fake-driven: pass an explicit per-agent map
-artifact = run_session(config, {"default": FakeProvider(script=script)},
-                       runs_root="runs/")
-
-# HTTP-API-driven: build providers from the registry (reads the API key)
 providers = default_registry().build_session_providers(config)
 artifact = run_session(config, providers, runs_root="runs/")
 
-print(artifact.transcript_digest)        # 64-hex JCS-SHA-256 digest
-print(artifact.outcome.kind)             # "synthesis" or "termination"
-
-# §7.6 execution_replay — re-execute under the ten pinning conditions and
-# compare the fresh digest. ids/timestamps are replayed from the recording,
-# so a deterministic run reproduces its digest with no extra setup.
-from symposium.replay import execution_replay, PinningViolation
-
-try:
-    result = execution_replay("runs/" + config.session_id,
-                              providers={"default": FakeProvider(script=script)})
-    print(result.digest_matches)         # True — every pinning condition satisfied
-    print(result.conditions_checked, result.conditions_assumed)
-except PinningViolation as exc:
-    print("aborted on §7.6 condition:", exc.condition)
+print(artifact.outcome.kind)          # "synthesis" or "termination"
+print(artifact.transcript_digest)     # 64-hex SHA-256 over the canonical transcript
 ```
 
----
+## How it's different
 
-## Use in Claude Code (MCP server)
+| | Symposium |
+|---|---|
+| **Topology** | One fixed shape — no arbitrary handoffs or nested supervisors. |
+| **Routing** | Schema-validated `direct_request` only; inline `@mentions` are never routing (injection-resistant). |
+| **Who decides to stop** | Deterministic runtime code — never the LLM coordinator. |
+| **Replay** | Unconditional transcript replay *and* conditional re-execution, both spelled out. |
+| **Failure modes** | Closed, enumerated — not "whatever the framework happened to do". |
 
-Symposium ships an optional **MCP server** that exposes the runtime as
-tools, so a Claude client (Claude Code, Claude Desktop, claude.ai) can
-launch a structured deliberation and read back its result, replay status,
-and metrics — over the same `run_session(...)` API, with no changes to the
-runtime or the protocol.
+The full rationale, and a comparison against AutoGen / CrewAI / LangGraph / OpenAI Agents SDK, lives in [the specification](docs/specification.md).
+
+## Project layout
+
+- **[`docs/specification.md`](docs/specification.md)** — the normative protocol (language-independent) + 16 JSON Schemas under [`docs/schemas/v1.0.0/`](docs/schemas/v1.0.0/).
+- **`symposium/`** — the reference Python runtime (scheduler, providers, replay, viewer, MCP server, CLI).
+- **`examples/`**, **`tests/`** — runnable configs and the conformance suite.
+
+A conformant runtime in any language is just as valid as this one, as long as it matches the spec and validates against the schemas.
+
+## Contributing & status
+
+The **v1.0 spec is frozen** (ratified 2026-05-26); the runtime ships as `symposium-protocol` on PyPI. Issues, errata, and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md).
 
 ```bash
-# Install with the optional MCP extra
-pip install "symposium-protocol[mcp]"
-# …or from the released tag:
-pip install "symposium-protocol[mcp] @ git+https://github.com/terrordrummer/symposium@v1.11.1"
-
-# Register the stdio server with Claude Code
-claude mcp add symposium -- symposium-mcp
+pip install -e ".[test]" && pytest -q     # run the suite
 ```
-
-For **Claude Desktop**, add the server to your `mcpServers` config
-(`claude_desktop_config.json`). The default `cli-auto` path needs **no
-key** — set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in `env` *only* if you
-intend to force `provider="anthropic"` / `"openai"`:
-
-```json
-{
-  "mcpServers": {
-    "symposium": {
-      "command": "symposium-mcp"
-    }
-  }
-}
-```
-
-The server exposes these tools:
-
-- **`deliberate(problem, …)`** — **the default.** Build a `Config` from
-  arguments (panel persona ids resolved into inline personas exactly as the
-  CLI does), run a session, and **stream each turn live as the panel
-  produces it** (every agent turn, each coordinator verdict, the final
-  synthesis) via MCP progress + log notifications, so you can follow the
-  discussion as it evolves. The final return is `{outcome,
-  synthesis_answer | termination_reason, selected_agents,
-  transcript_digest, cumulative_usage, run_dir, rounds}`.
-- **`deliberate_muted(problem, …)`** — same arguments and same final result
-  as `deliberate`, but with **no live streaming**: one synchronous result
-  returned when the whole session ends. Use when you only want the answer.
-- **`deliberate_adaptive(problem, *, experts=None, max_expansions=2, …)`** —
-  the default **adaptive** tool: dynamic agent generation **with live
-  streaming** (use `deliberate_adaptive_muted` for the non-streaming
-  variant). *Early-start*: each capability in `experts` (free-text needs)
-  becomes a generated domain persona added to the panel before the first
-  session. *Runtime*: if a session terminates asking for help
-  (`user_input_required` / `external_research_required`), a persona is
-  generated for that need and the deliberation continues in a fresh session
-  with the augmented panel (up to `max_expansions`, server-capped at 5).
-  Returns `{final, sessions, generated_agents, expansions, panel_final}`.
-  Host-orchestrated over the frozen runtime.
-- **`get_run_status(run_dir, *, since_index=0, limit=20)`** — read
-  transcript messages from a **still-running** deliberation, polling-style,
-  without depending on MCP progress rendering. Returns the new messages,
-  a `next_index` cursor, a `remaining` count, and `run_active` /
-  `lock_stale` flags (PID-alive lock probe, so a crashed run won't loop a
-  poller forever).
-- **`get_run_summary(run_dir)`** — load a persisted run, recompute the §7.9
-  metrics, verify the §7.5 transcript replay, and return a compact summary.
-- **`get_version()`** — runtime introspection: package version, schema
-  version, package path, installed CLI versions, the live `cli-auto`
-  routing matrix, and the budget defaults. Use it to confirm *what code is
-  actually running* (e.g. after an editable reinstall) rather than what
-  `pip show` claims on disk.
-- **`generate_persona(need, …)`** — design one new expert `Persona` for a
-  capability gap (constrained to the `Persona` JSON Schema, validated) and
-  return it, to use as a `panel` member.
-- **`list_personas()`** — the six built-in personas (R3 default panel +
-  coordinator: logician, visionary, researcher, critic, engineer,
-  coordinator) to use as `panel` / `coordinator` arguments.
-
-A typical `deliberate` call from a Claude client:
-
-```jsonc
-// default: route each persona across the installed terminal CLIs — NO API
-// key (provider="cli-auto"): visionary → codex, the rest → claude, with
-// fallback to whichever CLI is installed
-deliberate(problem="Should we adopt a structured deliberation protocol?")
-
-// force a single terminal CLI for all agents
-deliberate(problem="…", provider="claude-cli")   // or "codex-cli"
-
-// real HTTP API instead (reads ANTHROPIC_API_KEY from the env)
-deliberate(problem="…", provider="anthropic")
-
-// deterministic, network-free (used by the tests and demos)
-deliberate(
-  problem="demo",
-  provider="fake",
-  fake_script_path="examples/scripts/walking-skeleton.json"
-)
-```
-
-**No API key needed (the default).** `provider="cli-auto"` runs each
-panel turn through a locally-installed terminal CLI, reusing its existing
-login (OAuth / keychain / subscription) — it does **not** read
-`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. It routes by persona: the
-lateral/creative **visionary** to `codex-cli` (`codex exec
---output-schema …`, model **`gpt-5.5`** with reasoning effort `xhigh` —
-codex CLI 0.12x rejects the older `max`), and the technical/systematic
-personas (logician, engineer, researcher, critic, coordinator) to
-`claude-cli` (`claude -p --output-format json --json-schema …`, model
-**`opus`** — alias for the latest Opus on the local CLI). It **falls
-back** to whichever CLI is actually installed (only `claude` installed →
-the whole panel runs on claude, and vice-versa). Force one CLI with
-`provider="claude-cli"` / `"codex-cli"`. Per-call CLI timeout is **600s**;
-session wallclock defaults to **3600s** (60 min) so a full 5-agent ×
-4-round panel has room to complete.
-
-**Hosted-inside-Claude-Code safety.** When the Symposium runtime is itself
-hosted inside a Claude Code session (e.g. via the `symposium-mcp` server
-launched as an MCP child), the CLI adapters spawn each turn with a
-**headless, provider-specific child environment** (v1.10.7+):
-(1) nested-Claude-Code markers
-(`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`/`EXECPATH`/`SESSION_ID`/
-`PROVIDER_MANAGED_BY_HOST`), effort overrides
-(`CLAUDE_CODE_EFFORT_LEVEL` / `CLAUDE_EFFORT`), and bare-mode markers
-(`CLAUDE_CODE_SIMPLE`) are stripped before *every* spawn;
-(2) `CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY`,
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, and
-`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` are set to `1` to suppress the
-child's *own* auto-loads (the CLAUDE.md auto-discovery walk alone can
-turn a sub-second deliberation turn into a multi-minute hang against a
-populated `~/.claude/` and Workspace tree);
-(3) **cross-vendor credentials are scrubbed**: a `claude -p` spawn gets
-its `ANTHROPIC_*` / `CLAUDE_CODE_OAUTH_TOKEN` preserved but `CODEX_HOME` /
-`OPENAI_*` actively removed (codex auth has no business inside a Claude
-spawn), and a `codex exec` spawn gets the symmetric treatment. `PATH`,
-locale, and proxy / cert vars are preserved on both sides. The codex
-adapter also passes `--ignore-user-config --ignore-rules` by default
-(opt-out via `isolated=False`; requires codex CLI ≥ 0.122.0). The claude
-adapter additionally passes `--strict-mcp-config --mcp-config '{"mcpServers":
-{}}'` so the child loads **zero MCP servers** from the operator's global
-`~/.claude.json` (was the root cause of the v1.10.4 hang: each registered
-MCP added 10–60s of `npm exec` startup per deliberation turn). The claude
-adapter offers an opt-in `bare=True` for full headless mode — off by
-default, because `--bare` disables OAuth/keychain and requires an
-`ANTHROPIC_API_KEY`.
-
-**Limitation — custom MCPs in CLI personas.** Today the cli-auto path forces
-the child claude into "no MCP servers" mode. If you need a domain-knowledge
-MCP available *inside* a persona's reasoning, you have to construct the
-provider directly (`ClaudeCliProvider(disable_mcps=False, ...)`) and route
-that explicitly — there is no MCP-level kwarg to pass a custom `mcp_config`
-through the `deliberate*` tools yet.
-
-**Billing.** When a CLI is logged in with a **subscription** (Claude
-Pro/Max for `claude`, a ChatGPT plan for `codex`), turns run against that
-subscription's usage and **rate limits — not metered, per-token API
-billing**. There is no separate dollar charge to an API account; you are
-spending subscription quota, so a full panel (≈ one call per turn) and
-especially `deliberate_adaptive` (multiple linked sessions) consume that
-quota faster and can hit plan limits. The `cost_usd` Symposium records for
-a CLI turn is an **API-equivalent reference** (what the tokens would cost
-at API rates), reported as estimated — not a bill. (Only if a CLI is
-authenticated via an **API key** instead of a subscription login is the
-usage metered.) Use `provider="fake"` for free, deterministic, offline
-demos. The HTTP adapters (`anthropic`, `openai`) call the metered API and
-*do* read an API key. Both CLI providers also work from the plain CLI:
-`provider: claude-cli` / `codex-cli` in a config's agents.
-
-**Budget semantics under cli-auto.** The `max_total_tokens` (default
-100,000,000) and `max_total_cost_usd` (default 1000.0) MCP knobs are
-**telemetry canaries** under `cli-auto`, not real quota caps. Reasons:
-(1) codex CLI hardcodes `cost_usd = 0.0` (no metered cost under
-subscription), so cost-based termination only fires on the Claude side;
-(2) Claude's `cost_usd` is API-equivalent reference, NOT a real bill
-under subscription login; (3) the cap is checked *after* each invocation
-completes, so a single runaway claude-cli agentic loop (≈1M prompt
-tokens is normal for a substantive coding turn) can sail through any
-"reasonable" $-cap before any check fires. **The real hard caps under
-`cli-auto` are `max_wallclock_seconds` (default 3600s = 60 min) and your
-subscription's rate-limit window.** For API providers (`anthropic` /
-`openai`), where every token IS a billable charge, lower the defaults
-explicitly per call (`max_total_tokens=200_000, max_total_cost_usd=5.0`
-or whatever fits your tolerance).
-
-The `mcp` dependency is optional: `import symposium` and the `symposium`
-CLI work without it. See `symposium/integrations/mcp_server.py`.
-
----
-
-## What's in this repo
-
-```
-.
-├── docs/
-│   ├── specification.md          # The protocol (normative, ~6440 lines)
-│   ├── repository-strategy.md    # Reference-impl conventions (non-normative)
-│   └── schemas/v1.0.0/           # 16 JSON Schemas (Draft 2020-12)
-│       └── examples/             # 28 positive + 36 negative fixtures + validators
-├── symposium/                    # Reference Python runtime
-│   ├── models.py                 # Pydantic models mirroring the JSON Schemas
-│   ├── providers/                # ProviderAdapter + registry + Fake/OpenAI/Anthropic/Claude-CLI/Codex-CLI adapters
-│   ├── selector/                 # §4.1 selector: fixed / rules / llm strategies
-│   ├── scheduler/                # §4.11 pseudocode → executable loop
-│   ├── storage/                  # Run directory layout + JCS digest
-│   ├── replay/                   # transcript_replay (§7.5) + execution_replay (§7.6)
-│   ├── observability/            # §7.9 MVP metric set (offline)
-│   ├── personas/                 # MVP default panel (R3)
-│   ├── viewer/                   # `symposium watch` — read-only live SSE browser viewer
-│   ├── integrations/             # Host integrations — MCP server (`symposium-mcp`) + cli routing
-│   └── cli/                      # `symposium` command (run / watch / replay / validate / metrics / execution-replay)
-├── examples/                     # Walking-skeleton + rules/llm selector configs + scripts
-├── tests/                        # pytest suite (FakeProvider determinism,
-│                                 #   scheduler invariants, e2e schema
-│                                 #   validation, replay byte-identity)
-├── pyproject.toml
-├── .github/workflows/            # validate (CI) + release (publish on tag)
-├── CONTRIBUTING.md
-├── ROADMAP.md                    # thin pointer to spec §12 (normative roadmap)
-├── LICENSE                       # Apache 2.0
-└── README.md
-```
-
-**What's normative**: `docs/specification.md` §1–§9 + the JSON Schemas
-under `docs/schemas/v1.0.0/`. A conformant Symposium runtime satisfies
-every MUST / MUST NOT there and validates against the schemas. Sections
-§10–§13 are positioning, integration, roadmap, and vision (non-binding).
-§14 is a thin pointer to the non-normative companion.
-
-**What's reference, not normative**: everything under `symposium/`,
-`examples/`, and `tests/`. The Python package is one valid implementation
-of the protocol; a different runtime in a different language is equally
-valid as long as it conforms to the spec.
-
----
-
-## Conformance check
-
-Two validators ship with the schemas. Any contributor or implementor
-can re-run them locally:
-
-```bash
-cd docs/schemas/v1.0.0/examples
-pip install "jsonschema==4.26.0" "referencing>=0.35" "rfc8785>=0.1.4"
-python3 validate.py            # 28/28
-python3 validate_negative.py   # 36/36
-```
-
-The reference runtime's own test suite (pytest) cross-checks the
-artifact it emits against those same schemas:
-
-```bash
-pip install -e ".[test]"
-pytest -q
-```
-
-CI runs both on every push and every pull request (see badge above).
-
----
-
-## Reading order
-
-If you only want the gist, the first 200 lines of the spec are enough:
-§1 (conformance surface), §2 (vocabulary), §3 (overview + non-goals).
-
-If you intend to implement: §1 → §2 → §4 (runtime + scheduler) →
-§5 (schemas) → §6 (provider/tool adapter contract) → §7
-(persistence + replay) → §8 (budget + failure + security) →
-§9 (testing harness). §4.11 is the canonical pseudocode.
-
-If you want to compare against existing frameworks: §10 covers
-AutoGen, CrewAI, LangGraph, and OpenAI Agents SDK.
-
----
-
-## Status
-
-**v1.0 — specification frozen 2026-05-26.** Ratified by joint adversarial
-review (10 passes, bilateral sign-off). The 16 JSON Schemas under
-`docs/schemas/v1.0.0/` are pinned at this version. Forward-compatible
-changes will publish under `docs/schemas/v1.1.0/` etc., per the
-versioning policy in §5.1.
-
-The reference runtime is at **v1.11.1** (the `symposium-protocol`
-distribution). Issues, errata, and discussion: use the GitHub issue
-tracker.
 
 ## License
 
