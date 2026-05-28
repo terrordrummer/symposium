@@ -68,7 +68,9 @@ sites should use the provider-specific variants.
 from __future__ import annotations
 
 import os
-from typing import Dict, FrozenSet
+import signal
+import subprocess
+from typing import Any, Dict, FrozenSet, Optional
 
 INHERITED_ENV_BLOCKLIST: FrozenSet[str] = frozenset({
     # Nested-Claude-Code markers — set by a parent Claude Code session
@@ -230,3 +232,77 @@ def codex_child_env() -> Dict[str, str]:
     for k in _CLAUDE_ONLY_ENV:
         env.pop(k, None)
     return env
+
+
+def run_in_process_group(
+    argv,
+    *,
+    input: Optional[str] = None,
+    capture_output: bool = False,
+    text: bool = False,
+    timeout: Optional[float] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    """`subprocess.run`-shaped runner that kills the whole process GROUP on
+    timeout — the default runner for the CLI provider adapters.
+
+    Why not plain `subprocess.run`: the vendor CLIs (`claude`, `codex`) spawn
+    their own child processes. `subprocess.run`'s timeout only SIGKILLs the
+    direct child; orphaned grandchildren can keep doing work (and holding the
+    stdout pipe), so a per-turn timeout may not actually bound wall-clock under
+    load. We launch the child as a process-group leader (`start_new_session`)
+    and, on timeout, `killpg` the entire group so the deadline is enforced for
+    the whole subtree. The injectable `runner=` seam means tests never hit this
+    (they pass their own fake), so this runs in production only.
+    """
+    stdout = subprocess.PIPE if capture_output else None
+    stderr = subprocess.PIPE if capture_output else None
+    stdin = subprocess.PIPE if input is not None else None
+    proc = subprocess.Popen(
+        argv,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        # Reap so the pipes close and no zombie/grandchild lingers.
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def effective_timeout(request: Any, default: float) -> float:
+    """Resolve the subprocess timeout for a CLI turn.
+
+    The scheduler's deadline-aware path may pass a per-turn budget via
+    ``request.metadata["symposium_timeout_seconds"]``. We honor it but only
+    to TIGHTEN the adapter's own ``default`` — a request can never extend a
+    turn past the adapter-configured ceiling, only shorten it to fit the
+    remaining session wall-clock. A missing/invalid/non-positive hint falls
+    back to ``default``.
+    """
+    meta = getattr(request, "metadata", None)
+    if not isinstance(meta, dict):
+        return default
+    raw = meta.get("symposium_timeout_seconds")
+    if raw is None:
+        return default
+    try:
+        requested = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if requested <= 0:
+        return default
+    return min(default, requested)

@@ -220,3 +220,6 @@ __marimo__/
 # Symposium spec — internal review trail and archived v0 draft
 research/
 docs/specification-v0-draft.md
+
+# Claude Code session scratch (scheduled-task locks, etc.)
+.claude/

@@ -15,6 +15,7 @@ import subprocess
 
 import pytest
 
+import symposium.providers.claude_cli as claude_mod
 from symposium.models import ProviderRequest, ProviderRequestMessage
 from symposium.providers import default_registry
 from symposium.providers.claude_cli import ClaudeCliProvider
@@ -76,6 +77,70 @@ def _turn_request(expected="turn_structured_output", model="sonnet"):
 
 def test_registered_in_default_registry():
     assert default_registry().has("claude-cli")
+
+
+def test_run_in_process_group_kills_subtree_on_timeout():
+    """The production runner must enforce the timeout on the whole process
+    tree, not just the direct child. A child that spawns a grandchild holding
+    the stdout pipe would, under plain subprocess.run, make the post-kill read
+    block until the grandchild exits (~30s here). With process-group kill the
+    call returns promptly (~timeout)."""
+    import time
+
+    from symposium.providers._cli_env import run_in_process_group
+
+    # `sh` backgrounds a 30s sleeper (a grandchild that inherits the stdout
+    # pipe) and then sleeps 30s itself. Nothing finishes within the 1s timeout;
+    # the backgrounded sleeper is what a direct-child kill would leave holding
+    # the pipe.
+    t0 = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_in_process_group(
+            ["sh", "-c", "sleep 30 & sleep 30"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    elapsed = time.time() - t0
+    assert elapsed < 10.0, f"process-group kill blocked for {elapsed:.1f}s (grandchild not killed)"
+
+
+def test_per_request_timeout_budget_is_split_across_corrective_retry(monkeypatch):
+    """Codex PR1 review #2: the deadline-aware per-request timeout budgets the
+    WHOLE invoke (first call + the one corrective retry), not each subprocess.
+    A request asking for a 100s budget where the first call 'takes' 30s must
+    leave the corrective call only the ~70s remainder — so the two subprocess
+    timeouts together never exceed the budget the scheduler reserved."""
+    clock = {"v": 0.0}
+
+    def fake_monotonic():
+        cur = clock["v"]
+        clock["v"] += 30.0
+        return cur
+
+    monkeypatch.setattr(claude_mod.time, "monotonic", fake_monotonic)
+
+    runner = _RecordingRunner(
+        [
+            _completed(_cli_json(structured=None)),                 # malformed → corrective
+            _completed(_cli_json(structured={"text": "fixed"})),    # corrective ok
+        ]
+    )
+    request = ProviderRequest(
+        provider="claude-cli",
+        model="sonnet",
+        agent_id="logician",
+        messages=[ProviderRequestMessage(role="user", content="q")],
+        expected_output_schema="turn_structured_output",
+        metadata={"symposium_timeout_seconds": 100.0},
+    )
+    result = ClaudeCliProvider(runner=runner).invoke(request)
+
+    assert result.error is None
+    assert result.structured_output == {"text": "fixed"}
+    assert runner.calls[0]["timeout"] == 100.0
+    # second call gets budget minus the 30s the first call consumed
+    assert runner.calls[1]["timeout"] == 70.0
 
 
 def test_successful_turn_extracts_structured_output_and_usage():

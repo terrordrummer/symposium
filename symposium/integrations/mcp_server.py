@@ -69,6 +69,7 @@ from symposium.models import (
     Config,
     FakeProviderScript,
     Persona,
+    RuntimeConfig,
     SelectorBudget,
     SelectorConfig,
 )
@@ -1682,6 +1683,15 @@ def _build_config(
         else None
     )
 
+    # Best-effort salvage synthesis is enabled by default for CLI-backed runs
+    # (cli-auto / claude-cli / codex-cli), where each turn is a slow agentic
+    # subprocess and a wall-clock timeout would otherwise discard the entire
+    # deliberation with no answer. API/fake providers keep the spec default
+    # (off) so existing deterministic behavior is unchanged.
+    runtime = RuntimeConfig(
+        synthesize_on_terminate=provider in ("cli-auto", "claude-cli", "codex-cli"),
+    )
+
     return Config(
         schema_version="1.0.0",
         session_id=session_id,
@@ -1695,6 +1705,7 @@ def _build_config(
         ),
         agents=agents,
         coordinator=coordinator_agent,
+        runtime=runtime,
         budget=BudgetConfig(
             max_total_tokens=max_total_tokens,
             max_total_cost_usd=max_total_cost_usd,

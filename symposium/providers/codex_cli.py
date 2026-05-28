@@ -41,6 +41,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from symposium.models import (
@@ -53,7 +54,11 @@ from symposium.models import (
     Usage,
     Verdict,
 )
-from symposium.providers._cli_env import codex_child_env
+from symposium.providers._cli_env import (
+    codex_child_env,
+    effective_timeout,
+    run_in_process_group,
+)
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -222,7 +227,7 @@ class CodexCliProvider(ProviderAdapter):
         # so a project-rooted workdir still cannot be mutated.
         self._workdir = workdir
         self._env_override = env
-        self._run: Runner = runner or subprocess.run
+        self._run: Runner = runner or run_in_process_group
         if check_binary and runner is None and shutil.which(binary) is None:
             raise FileNotFoundError(
                 f"the {binary!r} CLI was not found on PATH; install the Codex CLI and "
@@ -235,8 +240,18 @@ class CodexCliProvider(ProviderAdapter):
     # ------------------------------------------------------------------
 
     def invoke(self, request: ProviderRequest) -> ProviderResult:
-        first = self._invoke_once(request, prompt_suffix=None)
+        # The per-request timeout (deadline-aware path) is a budget for the
+        # WHOLE invocation, including the at-most-one corrective retry below —
+        # not per subprocess. We measure elapsed and hand the corrective call
+        # only the remaining budget so two subprocess calls together can never
+        # exceed the deadline the scheduler reserved (Codex PR1 review #2).
+        budget = effective_timeout(request, self._timeout)
+        start = time.monotonic()
+        first = self._invoke_once(request, prompt_suffix=None, timeout=budget)
         if first.error is not None and first.error.kind == "malformed_response":
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                return first
             details = first.error.details or {}
             suffix = (
                 "\n\nYour previous response did not conform to the required schema "
@@ -244,7 +259,7 @@ class CodexCliProvider(ProviderAdapter):
                 f"`{details.get('failing_path')}`: {details.get('validator_message')}. "
                 "Re-emit ONLY the structured object that conforms to the schema."
             )
-            return self._invoke_once(request, prompt_suffix=suffix)
+            return self._invoke_once(request, prompt_suffix=suffix, timeout=remaining)
         return first
 
     # ------------------------------------------------------------------
@@ -252,7 +267,7 @@ class CodexCliProvider(ProviderAdapter):
     # ------------------------------------------------------------------
 
     def _invoke_once(
-        self, request: ProviderRequest, *, prompt_suffix: Optional[str]
+        self, request: ProviderRequest, *, prompt_suffix: Optional[str], timeout: float
     ) -> ProviderResult:
         prompt = _build_prompt(request)
         if prompt_suffix:
@@ -304,12 +319,12 @@ class CodexCliProvider(ProviderAdapter):
                     input=prompt,
                     capture_output=True,
                     text=True,
-                    timeout=self._timeout,
+                    timeout=timeout,
                     env=self._env_override if self._env_override is not None else codex_child_env(),
                 )
             except subprocess.TimeoutExpired as exc:
                 return _error_result(
-                    "timeout", f"codex CLI timed out after {self._timeout}s: {exc}", True
+                    "timeout", f"codex CLI timed out after {timeout}s: {exc}", True
                 )
             except FileNotFoundError as exc:
                 return _error_result("internal", f"codex CLI not found: {exc}", False)

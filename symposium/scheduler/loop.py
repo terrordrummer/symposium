@@ -31,6 +31,20 @@ _BACKOFF_BASE_SECONDS = 0.25
 _BACKOFF_MAX_SECONDS = 8.0
 _BACKOFF_JITTER = 0.25
 
+# Wall-clock reserved (in seconds) so a best-effort synthesis can still run
+# after the deliberation has consumed its turn budget. Only enforced when
+# `runtime.synthesize_on_terminate` is set: the soft deadline = hard
+# wallclock − this reserve. Without the reserve, the last panel turn would
+# eat the whole clock and the salvage synthesis would have no window — the
+# exact "wired the flag but it never produces output" trap.
+_SYNTHESIS_RESERVE_SECONDS = 120.0
+
+# Floor on the budget a normal turn must have before we open it. If less than
+# this remains above the synthesis reserve, we stop opening turns and go
+# straight to synthesis rather than spend the budget on a turn that would be
+# timed out mid-flight anyway.
+_MIN_TURN_TIMEOUT_SECONDS = 30.0
+
 
 def _backoff_delay(
     attempt_idx: int,
@@ -211,6 +225,74 @@ def check_hard_caps(session: Session) -> Optional[str]:
             if session.cumulative.per_agent_tokens.get(aid, 0) > cap:
                 return "budget_exceeded"
     return None
+
+
+def _remaining_wallclock_seconds(session: Session) -> float:
+    """Seconds left before the hard wall-clock cap trips."""
+    elapsed = time.monotonic() - session.started_monotonic
+    return session.config.budget.max_wallclock_seconds - elapsed
+
+
+def _budget_gate(session: Session) -> Optional[str]:
+    """Combined cap check for the points where a new turn may be opened.
+
+    Returns a termination reason, or None to proceed. Layers a *soft*
+    wall-clock deadline on top of `check_hard_caps`: when
+    `runtime.synthesize_on_terminate` is set, we stop opening new turns once
+    less than `_SYNTHESIS_RESERVE_SECONDS + _MIN_TURN_TIMEOUT_SECONDS`
+    remains, so the reserved window survives for a salvage synthesis. When
+    the flag is off, behavior is unchanged (hard caps only) — the soft
+    deadline would otherwise cut deliberation short for no benefit.
+    """
+    hard = check_hard_caps(session)
+    if hard:
+        return hard
+    if session.config.runtime.synthesize_on_terminate:
+        remaining = _remaining_wallclock_seconds(session)
+        if remaining <= _SYNTHESIS_RESERVE_SECONDS + _MIN_TURN_TIMEOUT_SECONDS:
+            return "timeout"
+    return None
+
+
+def _turn_timeout(session: Session) -> Optional[float]:
+    """Per-turn provider timeout hint: the wall-clock budget for a normal
+    turn, leaving the synthesis reserve intact. Returns None when
+    `synthesize_on_terminate` is off (adapters use their own default).
+
+    The value is a *ceiling* the adapter clamps against its own timeout
+    (the request can only tighten, never extend, the provider timeout).
+    """
+    if not session.config.runtime.synthesize_on_terminate:
+        return None
+    budget = _remaining_wallclock_seconds(session) - _SYNTHESIS_RESERVE_SECONDS
+    return max(budget, _MIN_TURN_TIMEOUT_SECONDS)
+
+
+def _synthesis_timeout(session: Session) -> Optional[float]:
+    """Per-call provider timeout hint for a synthesis turn: use all the
+    remaining wall-clock (which, at salvage time, is ~the reserve). Returns
+    None when the flag is off so the clean-finalize path keeps adapter
+    defaults.
+    """
+    if not session.config.runtime.synthesize_on_terminate:
+        return None
+    # Floor at the reserve: a salvage synthesis triggered right at (or just
+    # past) the hard cap still deserves a usable window — overrunning the
+    # wall-clock by up to the reserve to actually produce an answer is the
+    # whole point of synthesize_on_terminate.
+    return max(_remaining_wallclock_seconds(session), _SYNTHESIS_RESERVE_SECONDS)
+
+
+def _has_substantive_turn(session: Session) -> bool:
+    """True if at least one panelist contribution exists in the transcript.
+
+    Gates the salvage synthesis: synthesizing over a transcript that holds
+    only the problem statement (e.g. a round-0 provider failure) would
+    produce nothing useful, so we let those terminate normally.
+    """
+    return any(
+        m.type in ("primary_turn", "branch_turn") for m in session.transcript
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +607,7 @@ def build_provider_request(
     agent_id: str,
     expected_output_schema: str,
     packet: ContextPacket,
+    timeout_seconds: Optional[float] = None,
 ) -> ProviderRequest:
     ac = session.agent_by_id(agent_id)
     # System prompt carries the persona's full charter + an explicit
@@ -550,6 +633,15 @@ def build_provider_request(
             content=_build_packet_user_prompt(packet),
         ),
     ]
+    # Deadline-aware invocation: pass the per-turn wall-clock budget through
+    # request metadata. CLI adapters clamp their subprocess timeout to
+    # min(default, this) so a turn can never overrun the budget the loop
+    # has reserved for the eventual synthesis.
+    metadata = (
+        {"symposium_timeout_seconds": float(timeout_seconds)}
+        if timeout_seconds is not None
+        else None
+    )
     return ProviderRequest(
         provider=ac.provider,
         model=ac.model,
@@ -562,6 +654,7 @@ def build_provider_request(
         sampling=None,
         tools=list(ac.tools) if ac.tools else [],
         expected_output_schema=expected_output_schema,  # type: ignore[arg-type]
+        metadata=metadata,
     )
 
 
@@ -594,6 +687,7 @@ def _invoke_with_retry(
     agent_id: str,
     request: ProviderRequest,
     sleep=time.sleep,
+    attempts_override: Optional[int] = None,
 ) -> _InvokeResult:
     """Invoke `agent_id`'s provider with `per_agent_retry_budget` retries.
 
@@ -614,11 +708,34 @@ def _invoke_with_retry(
     """
     ac = session.agent_by_id(agent_id)
     budget = ac.retry_budget if ac.retry_budget is not None else session.config.runtime.per_agent_retry_budget
-    attempts = 1 + budget
+    # `attempts_override` is used by the salvage synthesis path to force a
+    # single no-retry attempt: a best-effort synthesis must not consume the
+    # reserved window with retry backoffs.
+    attempts = attempts_override if attempts_override is not None else 1 + budget
 
     last_err_kind: Optional[str] = None
     last_error: Optional[ProviderError] = None
     for attempt_idx in range(attempts):
+        # Deadline-aware retries (Codex PR1 review #1): when
+        # synthesize_on_terminate is on, a retry must never eat into the
+        # synthesis reserve. Before any retry (attempt_idx > 0) stop if the
+        # reserve is all that's left, and otherwise refresh the per-attempt
+        # timeout from the CURRENT remaining wall-clock (the value baked into
+        # request.metadata at build time is stale after the first attempt +
+        # its backoff). The first attempt keeps its as-built timeout — which
+        # for a salvage synthesis is the floored reserve, so this never
+        # shrinks the salvage call.
+        if (
+            attempt_idx > 0
+            and session.config.runtime.synthesize_on_terminate
+        ):
+            remaining = _remaining_wallclock_seconds(session)
+            if remaining <= _SYNTHESIS_RESERVE_SECONDS + _MIN_TURN_TIMEOUT_SECONDS:
+                break
+            if request.metadata and "symposium_timeout_seconds" in request.metadata:
+                request.metadata["symposium_timeout_seconds"] = max(
+                    remaining - _SYNTHESIS_RESERVE_SECONDS, _MIN_TURN_TIMEOUT_SECONDS
+                )
         provider = _provider_for(session, agent_id)
         # If FakeProvider: stash round/turn_index hints so match assertions work.
         if hasattr(provider, "last_request_round"):
@@ -820,7 +937,7 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
         session.round += 1
         session.turn_index = 0
 
-        breach = check_hard_caps(session)
+        breach = _budget_gate(session)
         if breach:
             return _terminate(session, writer, reason=breach)
 
@@ -834,7 +951,7 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
 
         # §4.2 step 1–3: panel members in declared order
         for agent_id in list(session.active_panel):
-            breach = check_hard_caps(session)
+            breach = _budget_gate(session)
             if breach:
                 return _terminate(session, writer, reason=breach)
 
@@ -844,6 +961,7 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                 agent_id=agent_id,
                 expected_output_schema="turn_structured_output",
                 packet=packet,
+                timeout_seconds=_turn_timeout(session),
             )
             session.turn_index += 1
             inv = _invoke_with_retry(session, agent_id=agent_id, request=req)
@@ -933,8 +1051,11 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                         last_provider_failure=_failure_from(session, bt.target, bt.last_error),
                     )
 
-        # §4.2 step 4: coordination_turn
-        breach = check_hard_caps(session)
+        # §4.2 step 4: coordination_turn. At the soft deadline we skip the
+        # verdict and go straight to salvage synthesis (the salvage path is
+        # itself a coordinator call) rather than spend the reserve on a
+        # verdict that would only ask for another round we cannot afford.
+        breach = _budget_gate(session)
         if breach:
             return _terminate(session, writer, reason=breach)
 
@@ -945,6 +1066,7 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             agent_id=coord_id,
             expected_output_schema="verdict",
             packet=packet,
+            timeout_seconds=_turn_timeout(session),
         )
         session.turn_index += 1
         inv = _invoke_with_retry(session, agent_id=coord_id, request=req)
@@ -986,8 +1108,6 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             return _terminate(session, writer, reason=breach)
 
         # §4.4 verdict dispatch
-        if verdict.next_action == "continue":
-            continue
         if verdict.next_action == "finalize":
             return _attempt_finalize(session, writer)
         if verdict.next_action == "request_user_input":
@@ -1004,6 +1124,20 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                 reason="external_research_required",
                 pending=verdict.external_research_request,
             )
+        # next_action == "continue"
+        # Force-finalize (Codex review): a `continue` on the last allowed
+        # round, or one that leaves no wall-clock room for another round,
+        # must synthesize NOW instead of opening a round that cannot finish
+        # (the pre-fix behavior re-looped, hit a cap at round-open, and
+        # terminated with no synthesis). Routed through the salvage path so
+        # it shares the bounded no-retry synthesis + termination fallback;
+        # the reserve guarantees the synthesis has a window.
+        if session.round >= session.config.budget.max_rounds:
+            return _terminate(session, writer, reason="budget_exceeded")
+        soft = _budget_gate(session)
+        if soft:
+            return _terminate(session, writer, reason=soft)
+        continue
 
 
 @dataclass
@@ -1036,6 +1170,14 @@ def _dispatch_branch(
     failing invocation happened to be a branch).
     """
     target = request.target
+    # Budget gate (Codex PR1 review #3): branches are optional turns and must
+    # not be opened past a hard cap or the soft synthesis-reserve deadline.
+    # Without this, a primary turn that leaves only the reserve could still
+    # spawn an inline/deferred branch and eat the salvage window. Surfacing a
+    # termination here routes the outer loop to the salvage-synthesis path.
+    breach = _budget_gate(session)
+    if breach:
+        return _BranchTermination(reason=breach, last_error=None, target=target)
     packet = derive_context_packet(
         session,
         agent_id=target,
@@ -1047,6 +1189,7 @@ def _dispatch_branch(
         agent_id=target,
         expected_output_schema="turn_structured_output",
         packet=packet,
+        timeout_seconds=_turn_timeout(session),
     )
     session.turn_index += 1
     inv = _invoke_with_retry(session, agent_id=target, request=req)
@@ -1119,8 +1262,21 @@ def _drain_deferred_queue(
     return None
 
 
-def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
-    """§4.8 — invoke coordinator for a synthesis. On failure, fall back to terminate."""
+def _try_synthesis(
+    session: Session,
+    writer: Optional[RunWriter],
+    *,
+    timeout_seconds: Optional[float] = None,
+    attempts_override: Optional[int] = None,
+) -> Tuple[Optional[SynthesisOutcome], Optional[ProviderError]]:
+    """Invoke the coordinator for a synthesis and append it on success.
+
+    Returns ``(SynthesisOutcome, None)`` on success or ``(None, last_error)``
+    on failure — leaving termination handling to the caller. Shared by the
+    clean §4.8 finalize path (`_attempt_finalize`, full retry budget) and the
+    salvage-on-terminate path (`_terminate`, single no-retry attempt with a
+    bounded timeout so it cannot overrun the reserved window).
+    """
     coord_id = session.config.coordinator.id
     packet = derive_context_packet(session, agent_id=coord_id)
     req = build_provider_request(
@@ -1128,9 +1284,12 @@ def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
         agent_id=coord_id,
         expected_output_schema="synthesis_content",
         packet=packet,
+        timeout_seconds=timeout_seconds,
     )
     session.turn_index += 1
-    inv = _invoke_with_retry(session, agent_id=coord_id, request=req)
+    inv = _invoke_with_retry(
+        session, agent_id=coord_id, request=req, attempts_override=attempts_override,
+    )
     if inv.ok and inv.result is not None and inv.result.structured_output is not None:
         sc = SynthesisContent.model_validate(inv.result.structured_output)
         synth_msg = Message(
@@ -1148,14 +1307,39 @@ def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
         if writer:
             writer.append_message(synth_msg)
         return SynthesisOutcome(synthesis_message_id=synth_msg.id), None
+    return None, inv.last_error
+
+
+def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
+    """§4.8 — invoke coordinator for a synthesis. On failure, fall back to terminate."""
+    coord_id = session.config.coordinator.id
+    outcome, last_error = _try_synthesis(
+        session, writer, timeout_seconds=_synthesis_timeout(session),
+    )
+    if outcome is not None:
+        return outcome, None
 
     # Synthesis failed → terminate with provider_unrecoverable (R2).
     # Codex T2 #2b: carry the coordinator's last error into the artifact
     # so synthesis-time provider failures are diagnosable too.
+    # allow_synthesis=False: we just tried to synthesize and it failed; the
+    # salvage path inside _terminate must not attempt it a second time.
     return _terminate(
-        session, writer, reason="provider_unrecoverable",
-        last_provider_failure=_failure_from(session, coord_id, inv.last_error),
+        session, writer, reason="provider_unrecoverable", allow_synthesis=False,
+        last_provider_failure=_failure_from(session, coord_id, last_error),
     )
+
+
+# Termination reasons eligible for a best-effort salvage synthesis when
+# `runtime.synthesize_on_terminate` is set. user_input_required /
+# external_research_required are deliberately excluded: the adaptive loop
+# keys panel expansion off those terminations, so synthesizing over them
+# would break expansion.
+_SALVAGEABLE_TERMINATION_REASONS = (
+    "timeout",
+    "budget_exceeded",
+    "provider_unrecoverable",
+)
 
 
 def _terminate(
@@ -1165,6 +1349,7 @@ def _terminate(
     reason: str,
     pending=None,
     last_provider_failure: Optional["LastProviderFailure"] = None,
+    allow_synthesis: bool = True,
 ):
     """Build a TerminationOutcome and the per-§5.8 TerminationArtifact.
 
@@ -1174,7 +1359,32 @@ def _terminate(
     diagnostics instead of the bare `provider_unrecoverable` string.
     Callers receive the original `ProviderError` from `_InvokeResult.
     last_error` and pass it through `_failure_from(...)`.
+
+    Best-effort salvage (spec §4.8 synthesize-on-terminate): when
+    `allow_synthesis` and `runtime.synthesize_on_terminate` are set, the
+    reason is salvageable, and at least one substantive turn exists, attempt
+    ONE bounded no-retry synthesis BEFORE terminating. On success the run
+    ends with a `synthesis` outcome instead of an empty termination — so a
+    long deliberation that ran out of wall-clock/budget still yields an
+    answer. On failure we fall through to the normal termination artifact.
+    `allow_synthesis=False` is passed by the clean finalize path, which has
+    already attempted (and failed) a synthesis, to avoid a double attempt.
     """
+    if (
+        allow_synthesis
+        and session.config.runtime.synthesize_on_terminate
+        and reason in _SALVAGEABLE_TERMINATION_REASONS
+        and _has_substantive_turn(session)
+    ):
+        outcome, _ = _try_synthesis(
+            session,
+            writer,
+            timeout_seconds=_synthesis_timeout(session),
+            attempts_override=1,
+        )
+        if outcome is not None:
+            return outcome, None
+
     cumulative_usage = session.cumulative.to_usage()
     # Need the digest of the transcript *as terminated* (no synthesis added).
     digest = compute_transcript_digest(session.transcript)

@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from symposium.models import (
@@ -70,7 +71,11 @@ from symposium.models import (
     Usage,
     Verdict,
 )
-from symposium.providers._cli_env import claude_child_env
+from symposium.providers._cli_env import (
+    claude_child_env,
+    effective_timeout,
+    run_in_process_group,
+)
 from symposium.providers._http_common import validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
@@ -198,7 +203,7 @@ class ClaudeCliProvider(ProviderAdapter):
         self._bare = bare
         self._disable_mcps = disable_mcps
         self._env_override = env
-        self._run: Runner = runner or subprocess.run
+        self._run: Runner = runner or run_in_process_group
         if check_binary and runner is None and shutil.which(binary) is None:
             raise FileNotFoundError(
                 f"the {binary!r} CLI was not found on PATH; install Claude Code and "
@@ -212,8 +217,17 @@ class ClaudeCliProvider(ProviderAdapter):
     # ------------------------------------------------------------------
 
     def invoke(self, request: ProviderRequest) -> ProviderResult:
-        first = self._invoke_once(request, system_suffix=None)
+        # The per-request timeout (deadline-aware path) budgets the WHOLE
+        # invocation, including the §6.7 corrective retry below. Split it across
+        # both subprocess calls so they can't together overrun the deadline the
+        # scheduler reserved for the synthesis (Codex PR1 review #2).
+        budget = effective_timeout(request, self._timeout)
+        start = time.monotonic()
+        first = self._invoke_once(request, system_suffix=None, timeout=budget)
         if first.error is not None and first.error.kind == "malformed_response":
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                return first
             # §6.7 single corrective retry: re-state the schema requirement.
             details = first.error.details or {}
             suffix = (
@@ -222,7 +236,7 @@ class ClaudeCliProvider(ProviderAdapter):
                 f"`{details.get('failing_path')}`: {details.get('validator_message')}. "
                 "Re-emit ONLY the structured object that conforms to the schema."
             )
-            return self._invoke_once(request, system_suffix=suffix)
+            return self._invoke_once(request, system_suffix=suffix, timeout=remaining)
         return first
 
     # ------------------------------------------------------------------
@@ -230,7 +244,7 @@ class ClaudeCliProvider(ProviderAdapter):
     # ------------------------------------------------------------------
 
     def _invoke_once(
-        self, request: ProviderRequest, *, system_suffix: Optional[str]
+        self, request: ProviderRequest, *, system_suffix: Optional[str], timeout: float
     ) -> ProviderResult:
         system_prompt, user_prompt = _split_prompt(request)
         if system_suffix:
@@ -272,12 +286,12 @@ class ClaudeCliProvider(ProviderAdapter):
                 input=stdin_payload,
                 capture_output=True,
                 text=True,
-                timeout=self._timeout,
+                timeout=timeout,
                 env=self._env_override if self._env_override is not None else claude_child_env(),
             )
         except subprocess.TimeoutExpired as exc:
             return _error_result(
-                "timeout", f"claude CLI timed out after {self._timeout}s: {exc}", True
+                "timeout", f"claude CLI timed out after {timeout}s: {exc}", True
             )
         except FileNotFoundError as exc:
             return _error_result(
