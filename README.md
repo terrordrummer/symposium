@@ -315,19 +315,23 @@ it for fake-driven, deterministic runs:
 }
 ```
 
-The server exposes six tools:
+The server exposes these tools:
 
-- **`deliberate(problem, …)`** — build a `Config` from arguments (panel
-  persona ids resolved into inline personas exactly as the CLI does), run a
-  session, and return `{outcome, synthesis_answer | termination_reason,
-  selected_agents, transcript_digest, cumulative_usage, run_dir, rounds}`.
-- **`deliberate_streaming(problem, …)`** — same arguments and same final
-  result as `deliberate`, but streams each turn **live as the panel
+- **`deliberate(problem, …)`** — **the default.** Build a `Config` from
+  arguments (panel persona ids resolved into inline personas exactly as the
+  CLI does), run a session, and **stream each turn live as the panel
   produces it** (every agent turn, each coordinator verdict, the final
   synthesis) via MCP progress + log notifications, so you can follow the
-  discussion as it evolves instead of waiting for the whole session.
+  discussion as it evolves. The final return is `{outcome,
+  synthesis_answer | termination_reason, selected_agents,
+  transcript_digest, cumulative_usage, run_dir, rounds}`.
+- **`deliberate_muted(problem, …)`** — same arguments and same final result
+  as `deliberate`, but with **no live streaming**: one synchronous result
+  returned when the whole session ends. Use when you only want the answer.
 - **`deliberate_adaptive(problem, *, experts=None, max_expansions=2, …)`** —
-  deliberate with **dynamic agent generation**. *Early-start*: each
+  the default **adaptive** tool: dynamic agent generation **with live
+  streaming** (use `deliberate_adaptive_muted` for the non-streaming
+  variant). *Early-start*: each
   capability in `experts` (free-text needs) becomes a generated domain
   persona added to the panel before the first session. *Runtime*: if a
   session terminates asking for help (`user_input_required` /

@@ -16,14 +16,17 @@ back the same way.
 
 Tools exposed:
 
-  * ``deliberate``                    — build a Config from arguments, run
-    one session, return outcome + synthesis answer (or termination
-    reason) and a compact run summary.
-  * ``deliberate_streaming``          — same as ``deliberate`` but pushes
-    each transcript message live via ``ctx.info`` / ``ctx.report_progress``.
-  * ``deliberate_adaptive``           — adds dynamic agent generation
-    (early-start + runtime) over multiple linked sessions.
-  * ``deliberate_adaptive_streaming`` — adaptive + live streaming.
+  * ``deliberate``                    — DEFAULT. Build a Config from
+    arguments, run one session, and stream each transcript message live
+    (``ctx.info`` / ``ctx.report_progress``) as it is produced; the final
+    return carries outcome + synthesis answer (or termination reason) and
+    a compact run summary.
+  * ``deliberate_muted``              — same as ``deliberate`` but with NO
+    live streaming: one synchronous result returned when the session ends.
+  * ``deliberate_adaptive``           — DEFAULT adaptive. Adds dynamic agent
+    generation (early-start + runtime) over multiple linked sessions, with
+    live streaming.
+  * ``deliberate_adaptive_muted``     — adaptive without live streaming.
   * ``get_run_summary``               — load a persisted run, recompute
     §7.9 metrics, verify the §7.5 transcript replay, return the summary.
   * ``get_run_status``                — read transcript progressively
@@ -158,7 +161,7 @@ mcp = FastMCP("symposium")
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="deliberate_muted")
 def deliberate(
     problem: str,
     *,
@@ -176,7 +179,12 @@ def deliberate(
     selector_fake_script_path: Optional[str] = None,
     output_dir: str = "runs",
 ) -> Dict[str, Any]:
-    """Run a structured Symposium deliberation and return its result.
+    """Non-streaming Symposium deliberation — one final result, no live events.
+
+    Muted variant, registered as the MCP tool ``deliberate_muted``:
+    identical arguments and return value to the streaming default
+    ``deliberate``, but it pushes no per-turn events and returns only once
+    the whole session is done. Prefer ``deliberate`` for interactive use.
 
     Builds a `Config` exactly as the CLI does — resolving each panel id and
     the coordinator id through `persona_by_id` into inline `Persona`
@@ -262,7 +270,7 @@ def deliberate(
         return _error(exc)
 
 
-@mcp.tool()
+@mcp.tool(name="deliberate")
 async def deliberate_streaming(
     problem: str,
     *,
@@ -281,9 +289,11 @@ async def deliberate_streaming(
     output_dir: str = "runs",
     ctx: Context,
 ) -> Dict[str, Any]:
-    """Like `deliberate`, but stream each turn live as the panel produces it.
+    """Default Symposium deliberation — streams each turn live as it is produced.
 
-    Same arguments and same final return value as `deliberate`. The
+    The streaming default, registered as the MCP tool ``deliberate``. Same
+    arguments and same final return value as the muted variant
+    ``deliberate_muted``. The
     difference is that while the deliberation runs, every transcript
     message (each agent turn, each coordinator verdict, the final
     synthesis) is pushed to the MCP client *as it is appended to the
@@ -770,7 +780,7 @@ def generate_persona(
         return _error(exc)
 
 
-@mcp.tool()
+@mcp.tool(name="deliberate_adaptive_muted")
 def deliberate_adaptive(
     problem: str,
     *,
@@ -786,7 +796,11 @@ def deliberate_adaptive(
     per_agent_token_budget: Optional[Dict[str, int]] = None,
     output_dir: str = "runs",
 ) -> Dict[str, Any]:
-    """Deliberate with dynamic agent generation — early-start AND runtime.
+    """Non-streaming adaptive deliberation — dynamic agent generation, no live events.
+
+    Muted variant, registered as the MCP tool ``deliberate_adaptive_muted``:
+    same behavior as the streaming default ``deliberate_adaptive`` but it
+    returns only the final aggregate result, with no per-turn streaming.
 
     Two ways a *new* expert agent joins the panel, both host-orchestrated
     over the frozen runtime (no spec / schema changes):
@@ -828,7 +842,7 @@ def deliberate_adaptive(
         return _error(exc)
 
 
-@mcp.tool()
+@mcp.tool(name="deliberate_adaptive")
 async def deliberate_adaptive_streaming(
     problem: str,
     *,
@@ -845,9 +859,11 @@ async def deliberate_adaptive_streaming(
     output_dir: str = "runs",
     ctx: Context,
 ) -> Dict[str, Any]:
-    """Combined: adaptive (dynamic agent generation) + streaming (live events).
+    """Default adaptive deliberation — dynamic agent generation + live streaming.
 
-    Same arguments / final return shape as ``deliberate_adaptive``. The
+    The streaming default, registered as the MCP tool ``deliberate_adaptive``.
+    Same arguments / final return shape as the muted variant
+    ``deliberate_adaptive_muted``. The
     difference is that each persona generation, session start/end, and
     every per-turn transcript message is pushed live to the MCP client
     via ``ctx.info`` and ``ctx.report_progress`` as the deliberation
@@ -858,7 +874,7 @@ async def deliberate_adaptive_streaming(
         runtime).
       * ``session_start`` — when a new adaptive session begins, with its
         ``session_id`` and the panel composition at that point.
-      * per-turn ``message`` — same shape as ``deliberate_streaming``.
+      * per-turn ``message`` — same shape as ``deliberate``.
       * ``session_end`` — when a session completes, with its outcome.
 
     On any failure the streaming stops and the final return value is the
