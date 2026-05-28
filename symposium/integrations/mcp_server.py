@@ -392,7 +392,16 @@ async def deliberate_streaming(
             if kind == "message":
                 await ctx.info(ev["line"])
                 try:
-                    await ctx.report_progress(progress=float(ev["index"]), total=None)
+                    # Route the turn preview into the progress `message` too:
+                    # some MCP clients (e.g. Claude Code) render the progress
+                    # message inline next to the counter but collapse/hide the
+                    # `ctx.info` log notifications — so without this the live
+                    # text is invisible and only the bare tick ("Processing… N")
+                    # shows. `ev["line"]` is already a bounded (~280-char)
+                    # preview, safe to send as a one-line progress message.
+                    await ctx.report_progress(
+                        progress=float(ev["index"]), total=None, message=ev["line"]
+                    )
                 except Exception:  # noqa: BLE001 — progress is best-effort
                     pass
             elif kind == "result":
@@ -950,7 +959,16 @@ async def deliberate_adaptive_streaming(
             if kind == "message":
                 await ctx.info(ev["line"])
                 try:
-                    await ctx.report_progress(progress=float(ev["index"]), total=None)
+                    # Route the turn preview into the progress `message` too:
+                    # some MCP clients (e.g. Claude Code) render the progress
+                    # message inline next to the counter but collapse/hide the
+                    # `ctx.info` log notifications — so without this the live
+                    # text is invisible and only the bare tick ("Processing… N")
+                    # shows. `ev["line"]` is already a bounded (~280-char)
+                    # preview, safe to send as a one-line progress message.
+                    await ctx.report_progress(
+                        progress=float(ev["index"]), total=None, message=ev["line"]
+                    )
                 except Exception:  # noqa: BLE001 — progress is best-effort
                     pass
             elif kind == "agent_generated":

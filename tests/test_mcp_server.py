@@ -255,12 +255,14 @@ class _FakeCtx:
     def __init__(self) -> None:
         self.logs: list[str] = []
         self.progress: list[float] = []
+        self.progress_messages: list[str | None] = []
 
     async def info(self, message: str, **extra) -> None:
         self.logs.append(message)
 
     async def report_progress(self, progress: float, total=None, message=None) -> None:
         self.progress.append(progress)
+        self.progress_messages.append(message)
 
 
 def test_stream_deliberation_emits_messages_then_result(tmp_path, script_path):
@@ -354,6 +356,11 @@ def test_deliberate_streaming_forwards_each_turn_to_context(tmp_path, script_pat
     assert ctx.logs[-1].startswith("[r2")
     assert len(ctx.progress) == 14
     assert ctx.progress == sorted(ctx.progress)  # monotonic
+    # The turn preview is also routed into the progress `message` (some MCP
+    # clients render that inline but hide the `ctx.info` log notifications).
+    assert len(ctx.progress_messages) == 14
+    assert all(m for m in ctx.progress_messages)  # every tick carries a preview
+    assert ctx.progress_messages == ctx.logs  # same preview on both channels
 
 
 def test_stream_adaptive_no_expansion_one_session(tmp_path):
