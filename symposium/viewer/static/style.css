@@ -1,0 +1,100 @@
+:root {
+  --bg: #0c0f17;
+  --bg-soft: #131826;
+  --panel: #161c2c;
+  --ink: #e8ecf6;
+  --ink-dim: #93a0bd;
+  --line: #243049;
+  --accent: #d4a017;     /* symposium gold */
+  --accent2: #3b82f6;    /* coordinator blue */
+  --horizontal: #6ea8fe;
+  --domain: #f0a35e;
+  --speaking: #ffd451;
+  --good: #34d399;
+  --warn: #fbbf24;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: radial-gradient(1200px 800px at 30% -10%, #18203400, #0c0f17 60%), var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 -apple-system, "SF Pro Text", Inter, Segoe UI, Roboto, sans-serif;
+  display: flex; flex-direction: column;
+}
+
+/* ---- top bar ---- */
+#topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px; border-bottom: 1px solid var(--line);
+  background: rgba(12,15,23,.7); backdrop-filter: blur(8px);
+}
+.brand { font-weight: 700; letter-spacing: .3px; color: var(--accent); }
+.brand-sub { color: var(--ink-dim); font-weight: 500; }
+.controls { display: flex; align-items: center; gap: 16px; }
+.controls label { color: var(--ink-dim); display: flex; align-items: center; gap: 6px; }
+select {
+  background: var(--bg-soft); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 7px; padding: 4px 8px; max-width: 260px;
+}
+.toggle input { accent-color: var(--accent); }
+.status { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); }
+.status-idle { color: var(--ink-dim); }
+.status-live { color: #07140c; background: var(--good); border-color: var(--good); font-weight: 600; }
+.status-done { color: var(--ink-dim); background: var(--bg-soft); }
+
+/* ---- layout ---- */
+/* chat is the dominant pane (~62%); the circle is the smaller companion. */
+main { flex: 1; display: grid; grid-template-columns: minmax(300px, 38%) 1fr; min-height: 0; }
+#stage { position: relative; min-width: 0; display: flex; align-items: center; justify-content: center; }
+#circle { width: 100%; height: 100%; max-height: calc(100vh - 56px); }
+
+.problem {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+  max-width: 70%; text-align: center; color: var(--ink-dim);
+  font-size: 13px; line-height: 1.4; pointer-events: none;
+}
+
+/* ---- chat ---- */
+#chat { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+.chat-head { padding: 12px 16px; border-bottom: 1px solid var(--line); color: var(--ink-dim); text-transform: uppercase; font-size: 11px; letter-spacing: 1.5px; }
+.chat-log { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; font-size: 15px; }
+
+.bubble { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; background: var(--bg-soft); animation: rise .25s ease; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.bubble .meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--ink-dim); margin-bottom: 5px; }
+.bubble .who { font-weight: 700; color: var(--ink); }
+.bubble .dot { width: 9px; height: 9px; border-radius: 50%; }
+.bubble .rt { margin-left: auto; opacity: .7; }
+.bubble .text { white-space: pre-wrap; font-size: 15px; line-height: 1.6; }
+.bubble.branch { border-left: 3px solid var(--accent); }
+.bubble.coordination { border-left: 3px solid var(--accent2); background: #12203a; }
+.bubble.synthesis { border-left: 3px solid var(--good); background: #0f2a1f; }
+.bubble.problem_statement { border-left: 3px solid var(--ink-dim); }
+.req-badge { display: inline-block; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; margin-top: 6px; margin-right: 4px; border: 1px solid currentColor; }
+
+/* ---- circle nodes ---- */
+.node circle { transition: stroke-width .2s, filter .2s; }
+.node text { fill: var(--ink); font-size: 22px; text-anchor: middle; dominant-baseline: middle; font-weight: 600; pointer-events: none; }
+.node .scope { fill: var(--ink-dim); font-size: 14px; font-weight: 400; }
+/* THINKING NOW — the agent predicted to be generating: bright gold pulse. */
+.node.thinking circle { filter: url(#glow); stroke: var(--speaking); stroke-width: 6; }
+.node.thinking { animation: pulse 1.05s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .7; } }
+
+/* JUST FINISHED — the agent whose turn we just received: a brief green
+   flash that fades and releases back to the node's own stroke colour (no
+   `forwards`, so domain/horizontal colours are not permanently overridden). */
+.node.spoke circle { animation: spokeFlash 2.2s ease; }
+@keyframes spokeFlash {
+  0%   { stroke: var(--good); stroke-width: 6; }
+  100% { stroke: var(--good); stroke-width: 3; }
+}
+
+/* ---- edges (direct requests) ---- */
+.edge path.wire { fill: none; stroke-width: 3; stroke-linecap: round;
+  stroke-dasharray: 12 10; animation: flow 1s linear infinite; opacity: .95; }
+@keyframes flow { to { stroke-dashoffset: -22; } }
+.edge text { font-size: 17px; font-weight: 600; paint-order: stroke; stroke: var(--bg); stroke-width: 4px; }
+.edge.fade { transition: opacity 1.2s ease; opacity: 0; }

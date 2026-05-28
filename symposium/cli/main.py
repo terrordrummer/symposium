@@ -157,6 +157,43 @@ def run_cmd(
     click.echo(f"persisted_to={run_dir}/")
 
 
+@main.command("watch")
+@click.option(
+    "--runs-dir", "runs_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("runs"),
+    show_default=True,
+    help="Root directory holding run dirs to watch (newest is followed live).",
+)
+@click.option(
+    "--run", "run",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Pin a single run dir instead of following the newest one.",
+)
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind host.")
+@click.option("--port", default=0, show_default=True, help="Bind port (0 = auto-pick a free port).")
+@click.option("--no-open", "no_open", is_flag=True, help="Do not open a browser window.")
+def watch_cmd(runs_dir: Path, run: Optional[Path], host: str, port: int, no_open: bool) -> None:
+    """Open a read-only live viewer for a (possibly running) deliberation.
+
+    Serves a single-page browser viewer that tails `transcript.jsonl` over
+    SSE: personas on a circle (coordinator at the centre), a glow on the
+    speaker, a live chat panel, and an animated arrow for every directed
+    inter-agent request (branch_turn). Works on a finished run too (replay).
+    Pure consumer — it never writes to the run directory.
+    """
+    from symposium.viewer.server import serve
+
+    serve(
+        runs_dir,
+        host=host,
+        port=port,
+        open_browser=not no_open,
+        run=str(run) if run is not None else None,
+    )
+
+
 @main.command("replay")
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 def replay_cmd(run_dir: Path) -> None:

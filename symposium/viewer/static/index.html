@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Symposium · live</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">⬡ Symposium <span class="brand-sub">live</span></div>
+    <div class="controls">
+      <label class="run-select">
+        run
+        <select id="runSelect"></select>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="followNewest" checked> follow newest
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="ttsToggle"> 🔊 voice
+      </label>
+      <span id="status" class="status status-idle">idle</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="stage">
+      <svg id="circle" viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="3"
+                  orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L8,3 L0,6 Z" fill="currentColor"></path>
+          </marker>
+          <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="9" result="b"></feGaussianBlur>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <g id="edges"></g>
+        <g id="nodes"></g>
+      </svg>
+      <div id="problem" class="problem"></div>
+    </section>
+
+    <aside id="chat">
+      <div id="chatHead" class="chat-head">deliberation</div>
+      <div id="chatLog" class="chat-log"></div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

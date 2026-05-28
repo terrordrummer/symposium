@@ -1469,39 +1469,10 @@ def stream_deliberation(
     yield {"event": "result", "result": _build_result(artifact, run_dir, panel_ids)}
 
 
-class _JournalTail:
-    """Incremental reader for a line-delimited `transcript.jsonl`.
-
-    Tracks a seek cookie and a partial trailing line so each `drain()`
-    returns only the message dicts appended since the last call.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._offset = 0
-        self._pending = ""
-
-    def drain(self) -> List[Dict[str, Any]]:
-        if not self._path.exists():
-            return []
-        with open(self._path, "r", encoding="utf-8") as fp:
-            fp.seek(self._offset)
-            chunk = fp.read()
-            self._offset = fp.tell()
-        if not chunk:
-            return []
-        self._pending += chunk
-        lines = self._pending.split("\n")
-        self._pending = lines.pop()  # trailing partial (or "") survives to next drain
-        out: List[Dict[str, Any]] = []
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:  # pragma: no cover — line-buffered writes are atomic
-                continue
-        return out
+# Single source of truth for tailing the journal lives in the read-only
+# viewer package; the streaming path here re-uses it so the two consumers
+# (MCP streaming + `symposium watch`) cannot drift on truncated-line handling.
+from symposium.viewer.tail import JournalTail as _JournalTail  # noqa: E402
 
 
 def _message_event(index: int, msg: Dict[str, Any]) -> Dict[str, Any]:

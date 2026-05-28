@@ -223,3 +223,6 @@ docs/specification-v0-draft.md
 
 # Claude Code session scratch (scheduled-task locks, etc.)
 .claude/
+
+# Local deliberation run output (per-session artifacts; not part of the package)
+runs/
