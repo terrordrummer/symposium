@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "jsonschema==4.26.0" "referencing>=0.35" "rfc8785>=0.1.4"
+          pip install "jsonschema>=4.26" "referencing>=0.35" "rfc8785>=0.1.4"
 
       - name: Run positive validator (28 cases)
         working-directory: docs/schemas/v1.0.0/examples
@@ -31,8 +31,8 @@ jobs:
         working-directory: docs/schemas/v1.0.0/examples
         run: python3 validate_negative.py
 
-  python-tests:
-    name: python reference impl (pytest)
+  lint:
+    name: ruff
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,10 +42,32 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run ruff
+        run: ruff check .
+
+  python-tests:
+    name: python reference impl (pytest)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
       - name: Install package + test extras
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test]"
 
       - name: Run pytest
-        run: pytest -q
+        run: pytest -q --cov=symposium --cov-fail-under=75

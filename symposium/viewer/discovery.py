@@ -16,12 +16,35 @@ from pathlib import Path
 from typing import List, Optional
 
 
+def _is_stale_lock_safe(lock_path: Path) -> bool:
+    # Reuse the writer's PID-liveness check; treat any import/parse failure
+    # as "not stale" (safe: we keep streaming rather than cut off early).
+    try:
+        from symposium.storage.writer import _is_stale_lock
+
+        return _is_stale_lock(lock_path)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_active(run_dir: Path) -> bool:
+    """Live iff the writer's lock is present AND names a running pid.
+
+    Same staleness logic as the stream's status events (`server._status`),
+    so a crashed run reads inactive in the list and the stream alike.
+    """
+    lock = run_dir / ".lock"
+    if not lock.exists():
+        return False
+    return not _is_stale_lock_safe(lock)
+
+
 @dataclass(frozen=True)
 class RunInfo:
     name: str          # directory name (session_id)
     path: str          # absolute path to the run directory
     mtime: float       # newest of transcript/config mtime, for ordering
-    active: bool       # .lock present (best-effort "live" hint)
+    active: bool       # .lock present and not stale (best-effort "live" hint)
     has_transcript: bool
 
 
@@ -56,7 +79,7 @@ def list_runs(runs_root: Path) -> List[RunInfo]:
                 name=child.name,
                 path=str(child.resolve()),
                 mtime=_run_mtime(child),
-                active=(child / ".lock").exists(),
+                active=_is_active(child),
                 has_transcript=(child / "transcript.jsonl").exists(),
             )
         )

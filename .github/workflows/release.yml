@@ -1,11 +1,10 @@
 name: release
 
-# Runs when a version tag is pushed. Always builds the dists and creates a
-# GitHub Release with them attached (works with the built-in token, no
-# external setup). It additionally attempts a PyPI publish via Trusted
-# Publishing (OIDC) under the `pypi` environment — that step is best-effort
-# (`continue-on-error`) so a not-yet-configured publisher does not fail the
-# release; configure the publisher on PyPI and re-run this job to publish.
+# Runs when a version tag is pushed. Gates on the full test suite plus the
+# schema validators, then builds the dists, creates a GitHub Release with
+# them attached (works with the built-in token, no external setup), and
+# publishes to PyPI via Trusted Publishing (OIDC) under the `pypi`
+# environment.
 #
 #   git tag v1.5.0 && git push origin v1.5.0
 on:
@@ -14,8 +13,36 @@ on:
       - "v*"
 
 jobs:
+  test:
+    name: tests + schema validators
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + test extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run pytest
+        run: python -m pytest tests/ -q
+
+      - name: Run positive validator (28 cases)
+        working-directory: docs/schemas/v1.0.0/examples
+        run: python3 validate.py
+
+      - name: Run negative validator (36 cases)
+        working-directory: docs/schemas/v1.0.0/examples
+        run: python3 validate_negative.py
+
   build:
     name: build distributions
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,9 +96,6 @@ jobs:
     name: publish to PyPI
     needs: build
     runs-on: ubuntu-latest
-    # Best-effort: a not-yet-configured Trusted Publisher must not fail the
-    # release. Configure it on PyPI, then re-run this job to publish.
-    continue-on-error: true
     environment:
       name: pypi
       url: https://pypi.org/project/symposium-protocol/

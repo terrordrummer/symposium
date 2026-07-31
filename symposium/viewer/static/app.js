@@ -21,7 +21,7 @@ const els = {
 
 const state = {
   source: null,
-  runPath: null,
+  runName: null,         // run-dir name (opaque id; resolved server-side)
   pinned: null,          // ?run= forces a single run, disables follow
   positions: new Map(),  // id -> {x, y}
   panelOrder: [],        // persona ids in turn order (drives "who's next")
@@ -58,13 +58,13 @@ async function fetchRuns() {
 }
 
 function populateRunSelect(runs) {
-  const cur = state.runPath;
+  const cur = state.runName;
   els.runSelect.innerHTML = "";
   for (const run of runs) {
     const opt = document.createElement("option");
-    opt.value = run.path;
+    opt.value = run.name;
     opt.textContent = run.name + (run.active ? "  ●" : "");
-    if (run.path === cur) opt.selected = true;
+    if (run.name === cur) opt.selected = true;
     els.runSelect.appendChild(opt);
   }
 }
@@ -87,10 +87,10 @@ async function refreshAndMaybeSwitch(initial) {
 
   let target = state.pinned;
   if (!target) {
-    if (els.followNewest.checked || initial) target = runs[0].path;
-    else target = state.runPath || runs[0].path;
+    if (els.followNewest.checked || initial) target = runs[0].name;
+    else target = state.runName || runs[0].name;
   }
-  if (target && target !== state.runPath) connect(target);
+  if (target && target !== state.runName) connect(target);
 }
 
 els.runSelect.addEventListener("change", () => {
@@ -99,14 +99,14 @@ els.runSelect.addEventListener("change", () => {
 });
 
 // ---- SSE connection -------------------------------------------------------
-function connect(runPath) {
+function connect(runName) {
   if (state.source) { state.source.close(); state.source = null; }
   resetStage();
-  state.runPath = runPath;
+  state.runName = runName;
   // reflect selection in the dropdown without rebuilding it
-  for (const o of els.runSelect.options) o.selected = (o.value === runPath);
+  for (const o of els.runSelect.options) o.selected = (o.value === runName);
 
-  const src = new EventSource(`/api/stream?run=${encodeURIComponent(runPath)}`);
+  const src = new EventSource(`/api/stream?run=${encodeURIComponent(runName)}`);
   state.source = src;
   src.addEventListener("config", e => onConfig(JSON.parse(e.data)));
   src.addEventListener("message", e => onMessage(JSON.parse(e.data)));
@@ -406,7 +406,7 @@ els.ttsToggle.addEventListener("change", () => { if (!els.ttsToggle.checked) can
 
 // ---- utils ----------------------------------------------------------------
 function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }
-function escapeHtml(s) { return (s + "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function escapeHtml(s) { return (s + "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : (s + "").replace(/"/g, '\\"'); }
 
 bootstrap();

@@ -9,6 +9,9 @@ over these helpers).
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from symposium.viewer.discovery import list_runs, newest_run
@@ -52,6 +55,52 @@ def test_tail_holds_partial_trailing_line(tmp_path):
     assert drained[0]["speaker"] == "x"
 
 
+def test_tail_resets_after_truncation(tmp_path):
+    """A shrunken journal (rotation, re-created run dir) restarts the tail
+    from the top instead of seeking past EOF and going silent forever."""
+    j = tmp_path / "transcript.jsonl"
+    tail = JournalTail(j)
+    _write_lines(j, [{"id": "a"}, {"id": "b"}])
+    assert [m["id"] for m in tail.drain()] == ["a", "b"]
+
+    # the file is replaced by a shorter one mid-stream
+    j.write_text(json.dumps({"id": "z"}) + "\n", encoding="utf-8")
+    assert [m["id"] for m in tail.drain()] == ["z"]
+
+    # and the tail keeps following appends afterwards
+    _write_lines(j, [{"id": "z2"}])
+    assert [m["id"] for m in tail.drain()] == ["z2"]
+
+
+def test_tail_truncation_clears_pending_partial(tmp_path):
+    """A buffered partial line must not be glued onto post-truncation content."""
+    j = tmp_path / "transcript.jsonl"
+    tail = JournalTail(j)
+    j.write_text(json.dumps({"id": "a"}) + "\n" + '{"id": "b", "spea', encoding="utf-8")
+    assert [m["id"] for m in tail.drain()] == ["a"]
+
+    j.write_text('{"id": "c"}\n', encoding="utf-8")
+    assert [m["id"] for m in tail.drain()] == ["c"]
+
+
+def test_tail_multibyte_char_split_across_drains(tmp_path):
+    """Catching the writer mid-flush of a multi-byte UTF-8 character must
+    buffer the partial sequence, not raise UnicodeDecodeError."""
+    j = tmp_path / "transcript.jsonl"
+    tail = JournalTail(j)
+    payload = json.dumps({"id": "a", "text": "caffè"}, ensure_ascii=False).encode("utf-8") + b"\n"
+    split = payload.index("è".encode("utf-8")) + 1  # inside the 2-byte è
+    with open(j, "wb") as f:
+        f.write(payload[:split])
+    assert tail.drain() == []  # partial character held over, no crash
+
+    with open(j, "ab") as f:
+        f.write(payload[split:])
+    drained = tail.drain()
+    assert [m["id"] for m in drained] == ["a"]
+    assert drained[0]["text"] == "caffè"
+
+
 def test_discovery_newest_by_mtime(tmp_path):
     older = tmp_path / "run-old"
     newer = tmp_path / "run-new"
@@ -74,6 +123,27 @@ def test_discovery_ignores_non_run_dirs(tmp_path):
     (tmp_path / "real" / "config.json").write_text("{}", encoding="utf-8")
     names = [r.name for r in list_runs(tmp_path)]
     assert names == ["real"]
+
+
+def test_discovery_active_reflects_lock_staleness(tmp_path):
+    """`active` uses the same pid-liveness check as the stream's status
+    events: a crashed run (dead-pid lock) is not reported live."""
+    live = tmp_path / "run-live"
+    stale = tmp_path / "run-stale"
+    unlocked = tmp_path / "run-done"
+    for d in (live, stale, unlocked):
+        d.mkdir()
+        (d / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
+
+    (live / ".lock").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()  # reaped → the pid no longer names a running process
+    (stale / ".lock").write_text(f"{proc.pid}\n", encoding="utf-8")
+
+    by_name = {r.name: r for r in list_runs(tmp_path)}
+    assert by_name["run-live"].active is True
+    assert by_name["run-stale"].active is False
+    assert by_name["run-done"].active is False
 
 
 def test_config_event_layout(tmp_path):

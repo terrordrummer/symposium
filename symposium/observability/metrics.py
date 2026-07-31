@@ -20,6 +20,7 @@ import json
 import os
 import tempfile
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
@@ -114,6 +115,11 @@ class ObservabilityMetrics(BaseModel):
 
 _ROUND_COST_DECIMALS = 6
 
+# Absolute tolerance for the cumulative-cost parity check: one unit in the
+# last reported decimal. Exact equality of rounded floats would reject a
+# legitimate artifact whose raw sum sits on a rounding boundary.
+_COST_PARITY_TOLERANCE = 1e-6
+
 
 def _round_cost(x: float) -> float:
     return round(x, _ROUND_COST_DECIMALS)
@@ -127,8 +133,6 @@ def _parse_ts(ts: str) -> float:
     `datetime.fromisoformat` after normalizing the `Z` so the parsing
     matches the persisted §5.4 timestamp format.
     """
-    from datetime import datetime
-
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     return datetime.fromisoformat(ts).timestamp()
@@ -365,12 +369,14 @@ def compute_metrics(artifact: Artifact) -> ObservabilityMetrics:
     )
 
     # ---- Last: cumulative-usage parity invariant (§7.9 cross-check) -----
+    # Token counts are integers and must match exactly; the cost is a float
+    # sum, so it gets an absolute tolerance rather than rounded equality.
     auth = artifact.cumulative_usage
     if (
         cum["prompt_tokens"] != auth.prompt_tokens
         or cum["completion_tokens"] != auth.completion_tokens
         or cum["total_tokens"] != auth.total_tokens
-        or _round_cost(cum_cost) != _round_cost(auth.cost_usd)
+        or abs(cum_cost - auth.cost_usd) > _COST_PARITY_TOLERANCE
     ):
         raise MetricsConsistencyError(
             "cumulative_usage rollup disagrees with Artifact.cumulative_usage: "
@@ -443,15 +449,18 @@ def _derive_deferred_queue_max(
     sorted_rounds = sorted(rounds_seen)
     for idx, r in enumerate(sorted_rounds):
         # Drain at round open (skip the first deliberation round — the
-        # queue is empty before any primary_turn fires). The runtime cap
-        # `max_deferred_drains_per_round` is authoritative — when it is
-        # 0 no drain occurs, when it is N up to N items leave the queue.
-        # Observed cross-round drains in the transcript serve as a cross-
-        # check: never over-drain beyond the runtime cap or the queue size.
-        if idx > 0 and queue > 0 and max_drains_per_round > 0:
+        # queue is empty before any primary_turn fires). Observed cross-
+        # round drains are transcript evidence and win outright: honour
+        # them up to the queue contents, even past the configured cap.
+        # Only when the round shows no drains do we fall back to
+        # simulating the runtime cap (`max_deferred_drains_per_round`,
+        # no drain at all when it is 0). Never drain below empty.
+        if idx > 0 and queue > 0:
             drains_observed = cross_round_drains_by_round.get(r, 0)
-            target = drains_observed if drains_observed else max_drains_per_round
-            drains = min(queue, max_drains_per_round, target)
+            if drains_observed:
+                drains = min(queue, drains_observed)
+            else:
+                drains = min(queue, max_drains_per_round)
             queue -= drains
         for primary_id in primaries_per_round[r]:
             meta = primary_meta[primary_id]
@@ -495,6 +504,16 @@ def _atomic_write_text(path: Path, text: str) -> None:
             except OSError:
                 pass
         os.replace(tmp_path, path)
+        # Fsync the parent directory so the rename is durable (same
+        # pattern as the §7.4 storage writer).
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, AttributeError):
+            pass  # not supported on Windows or some filesystems
     except Exception:
         try:
             os.unlink(tmp_path)

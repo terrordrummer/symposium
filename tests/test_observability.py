@@ -16,6 +16,7 @@ from symposium.observability import (
     compute_metrics,
     write_metrics,
 )
+from symposium.observability.metrics import _derive_deferred_queue_max
 from symposium.providers import FakeProvider
 from symposium.scheduler import run_session
 
@@ -107,6 +108,28 @@ def test_cumulative_usage_consistency_invariant_fires():
     raw["cumulative_usage"]["total_tokens"] += 1  # off by 1
     artifact = Artifact.model_validate(raw)
 
+    with pytest.raises(MetricsConsistencyError) as excinfo:
+        compute_metrics(artifact)
+    assert "cumulative_usage" in str(excinfo.value)
+
+
+def test_cumulative_cost_rounding_boundary_tolerated():
+    """A sub-tolerance cost delta (a raw sum sitting on a rounding boundary)
+    must NOT trip the parity invariant — the check uses abs(diff) <= 1e-6,
+    not exact equality of rounded floats."""
+    raw = json.loads(WORKED_PATH.read_text())
+    raw["cumulative_usage"]["cost_usd"] += 4e-7  # within tolerance
+    artifact = Artifact.model_validate(raw)
+    metrics = compute_metrics(artifact)  # no MetricsConsistencyError
+    assert metrics.cost_cumulative.cost_usd == pytest.approx(
+        artifact.cumulative_usage.cost_usd, abs=1e-6
+    )
+
+
+def test_cumulative_cost_divergence_beyond_tolerance_raises():
+    raw = json.loads(WORKED_PATH.read_text())
+    raw["cumulative_usage"]["cost_usd"] += 1e-4  # well past tolerance
+    artifact = Artifact.model_validate(raw)
     with pytest.raises(MetricsConsistencyError) as excinfo:
         compute_metrics(artifact)
     assert "cumulative_usage" in str(excinfo.value)
@@ -334,6 +357,43 @@ def test_deferred_queue_length_max_with_dropped_annotations():
     # it at round-2 open → queue = 0 entering round 3). Then enqueue 2 at
     # msg-stress → queue peaks at 2.
     assert metrics.deferred_queue_length_max == 2
+
+
+def test_deferred_drain_observed_beyond_cap_honored():
+    """Observed cross-round drains are transcript evidence: honour them up
+    to the queue contents even past `max_deferred_drains_per_round`."""
+    # round 1: p1 enqueues 3; round 2: TWO observed drains under a cap of 1,
+    # then p2 enqueues 1; round 3: no observed drains → cap fallback (1),
+    # then p3 enqueues 3.
+    queue_max = _derive_deferred_queue_max(
+        rounds_seen=[1, 2, 3],
+        primaries_per_round={1: ["p1"], 2: ["p2"], 3: ["p3"]},
+        primary_meta={
+            "p1": {"N": 3, "D": 0},
+            "p2": {"N": 1, "D": 0},
+            "p3": {"N": 3, "D": 0},
+        },
+        same_round_branches={},
+        cross_round_drains_by_round={2: 2},
+        max_drains_per_round=1,
+    )
+    # queue: 3 → drain 2 → 1 → +1 = 2 → drain 1 → 1 → +3 = 4 (the peak).
+    # Capping the observed drains at 1 would have peaked at 5 instead.
+    assert queue_max == 4
+
+
+def test_deferred_drain_observed_capped_at_queue_contents():
+    """Never drain below empty, however many drains the transcript shows."""
+    queue_max = _derive_deferred_queue_max(
+        rounds_seen=[1, 2],
+        primaries_per_round={1: ["p1"], 2: ["p2"]},
+        primary_meta={"p1": {"N": 2, "D": 0}, "p2": {"N": 1, "D": 0}},
+        same_round_branches={},
+        cross_round_drains_by_round={2: 5},  # more than the queue holds
+        max_drains_per_round=1,
+    )
+    # queue: 2 → drain min(2, 5) = 2 → 0 → +1 = 1; peak stays 2.
+    assert queue_max == 2
 
 
 # ---------------------------------------------------------------------------

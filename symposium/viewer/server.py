@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from symposium.viewer.discovery import list_runs
+from symposium.viewer.discovery import _is_stale_lock_safe, list_runs
 from symposium.viewer.streamer import EdgeResolver, config_event, message_event
 from symposium.viewer.tail import JournalTail
 
@@ -37,16 +37,22 @@ _POLL_INTERVAL = 0.4          # seconds between journal drains while live
 _HEARTBEAT_INTERVAL = 15.0    # seconds between keepalive comments
 _POST_FINISH_GRACE = 1.0      # final drain window after the run looks done
 
+# Host-header gate: loopback names are always fine; anything else must match
+# the explicitly configured bind host. Blocks DNS rebinding (a hostile page
+# resolving its own domain to 127.0.0.1 to read transcripts cross-origin).
+_LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 
-def _is_stale_lock_safe(lock_path: Path) -> bool:
-    # Reuse the writer's PID-liveness check; treat any import/parse failure
-    # as "not stale" (safe: we keep streaming rather than cut off early).
-    try:
-        from symposium.storage.writer import _is_stale_lock
 
-        return _is_stale_lock(lock_path)
-    except Exception:  # noqa: BLE001
-        return False
+def _hostname_of(host_header: str) -> str:
+    """Extract the bare lowercase hostname from a Host header value."""
+    h = host_header.strip().lower()
+    if h.startswith("["):
+        # bracketed IPv6, optional port: [::1] or [::1]:8000
+        return h[1:].split("]", 1)[0]
+    if h.count(":") == 1:
+        # host:port (a bare IPv6 address has more than one colon)
+        return h.split(":", 1)[0]
+    return h
 
 
 def _run_finished(run_dir: Path) -> bool:
@@ -61,13 +67,28 @@ def _run_finished(run_dir: Path) -> bool:
 class _Handler(BaseHTTPRequestHandler):
     # set per-server (see serve())
     runs_root: Path = Path("runs")
+    bind_host: str = "127.0.0.1"
 
     # Quieter logging — one line per request is noise for a live viewer.
     def log_message(self, *args) -> None:  # noqa: D401
         pass
 
+    # ---- host gate -----------------------------------------------------
+    def _host_allowed(self) -> bool:
+        hostname = _hostname_of(self.headers.get("Host") or "")
+        if hostname in _LOOPBACK_HOSTNAMES:
+            return True
+        return hostname == _hostname_of(self.bind_host)
+
     # ---- routing -------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802 (stdlib signature)
+        if not self._host_allowed():
+            # 403 with no body: an unexpected Host means the request did not
+            # come through a name we serve — give it nothing to read.
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         parsed = urlparse(self.path)
         route = parsed.path
         try:
@@ -109,8 +130,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---- /api/runs -----------------------------------------------------
     def _serve_runs(self) -> None:
-        runs = [asdict(r) for r in list_runs(self.runs_root)]
-        body = json.dumps({"runs_root": str(self.runs_root.resolve()), "runs": runs}).encode()
+        # Run entries carry the directory NAME as their id — never the
+        # absolute filesystem path. The frontend round-trips it opaquely
+        # into ?run= and _resolve_run anchors it under runs_root.
+        runs = []
+        for r in list_runs(self.runs_root):
+            entry = asdict(r)
+            entry.pop("path", None)
+            runs.append(entry)
+        body = json.dumps({"runs": runs}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -237,15 +265,18 @@ def serve(
     """
     runs_root = Path(runs_root)
 
-    handler = type("_BoundHandler", (_Handler,), {"runs_root": runs_root})
+    handler = type(
+        "_BoundHandler", (_Handler,), {"runs_root": runs_root, "bind_host": host}
+    )
     httpd = ThreadingHTTPServer((host, port), handler)
     actual_port = httpd.server_address[1]
     url = f"http://{host}:{actual_port}/"
     if run:
-        # The page reads ?run= and pins it (skips newest-follow).
+        # The page reads ?run= and pins it (skips newest-follow). Pin by
+        # directory name — _resolve_run anchors names under runs_root.
         from urllib.parse import quote
 
-        url += f"?run={quote(str(Path(run).resolve()))}"
+        url += f"?run={quote(Path(run).name)}"
 
     print(f"symposium watch — serving {runs_root.resolve()}")
     print(f"  open: {url}")
