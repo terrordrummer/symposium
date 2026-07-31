@@ -72,6 +72,7 @@ Further open clarifications:
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 from contextlib import contextmanager
@@ -489,9 +490,15 @@ def execution_replay(
     # Clamp so the derived id stays within the §7.1 64-char session_id limit
     # even when the original id already uses most of it (a 57+-char original
     # would otherwise push "<sid>-replay" past the limit and raise a raw
-    # ValueError after all conditions passed).
+    # ValueError after all conditions passed). A plain prefix truncation
+    # would map two long ids sharing a prefix onto the same replay dir, so
+    # the clamped form embeds a digest of the full id to keep it unique.
     max_stem = 64 - len(REPLAY_SUFFIX)
-    fresh_session_id = f"{config.session_id[:max_stem]}{REPLAY_SUFFIX}"
+    stem = config.session_id
+    if len(stem) > max_stem:
+        digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:8]
+        stem = f"{stem[: max_stem - 9]}-{digest}"
+    fresh_session_id = f"{stem}{REPLAY_SUFFIX}"
     validate_session_id(fresh_session_id)  # ValueError → generic error path
     fresh_config = config.model_copy(update={"session_id": fresh_session_id})
 

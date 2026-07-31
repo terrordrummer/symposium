@@ -198,9 +198,9 @@ def test_stale_lock_break_rechecks_content_before_unlink(
 # ---------------------------------------------------------------------------
 
 
-def test_atomic_writes_use_umask_consistent_permissions(tmp_path, example_config):
-    """mkstemp's 0600 must not survive os.replace: manifest/config/artifact
-    should carry the same umask-derived mode as the journal."""
+def test_run_files_are_private_to_the_owner(tmp_path, example_config):
+    """Every persisted run file carries full deliberation content, so all of
+    them — journal included — must be 0600 regardless of the process umask."""
     rd = RunDirectory.for_session(tmp_path, example_config.session_id)
     w = RunWriter(rd)
     w.start(example_config, now_utc_iso())
@@ -208,11 +208,6 @@ def test_atomic_writes_use_umask_consistent_permissions(tmp_path, example_config
     w.append_message(msg)
     w.finalize(_termination_artifact(example_config, [msg]))
 
-    umask = os.umask(0)
-    os.umask(umask)
-    expected = 0o666 & ~umask
-    journal_mode = (rd.base / "transcript.jsonl").stat().st_mode & 0o777
-    assert journal_mode == expected
-    for name in ("manifest.json", "config.json", "artifact.json"):
+    for name in ("transcript.jsonl", "manifest.json", "config.json", "artifact.json"):
         mode = (rd.base / name).stat().st_mode & 0o777
-        assert mode == expected, f"{name} mode {oct(mode)} != {oct(expected)}"
+        assert mode == 0o600, f"{name} mode {oct(mode)} != 0o600"

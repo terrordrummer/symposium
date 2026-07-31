@@ -161,6 +161,13 @@ class RunWriter:
         self._journal_fp = open(
             self.run_dir.journal_path, "w", encoding="utf-8", buffering=1
         )
+        # Match the 0600 mode of the atomically written files: the journal
+        # carries the same deliberation content and must not be more
+        # permissive than the artifact.
+        try:
+            os.chmod(self.run_dir.journal_path, 0o600)
+        except OSError:
+            pass
 
     def append_message(self, msg: Message) -> None:
         if self._journal_fp is None:
@@ -356,16 +363,10 @@ def _atomic_write_text(path: Path, text: str) -> None:
             except OSError:
                 pass  # fsync not supported (e.g. some Windows / shared FS)
         os.replace(tmp_path, path)
-        # mkstemp creates the tempfile 0600 and os.replace carries that
-        # mode over — which would leave artifact/config/manifest stricter
-        # than the journal (opened with the process umask). Normalize to
-        # the umask-consistent default for regular files.
-        try:
-            umask = os.umask(0)
-            os.umask(umask)
-            os.chmod(path, 0o666 & ~umask)
-        except OSError:
-            pass
+        # mkstemp creates the tempfile 0600 and os.replace carries that mode
+        # over. Keep it: run files hold full deliberation content, so they
+        # stay private to the owning user (the journal is tightened to match
+        # when it is opened).
         # Fsync the parent directory so the rename is durable.
         try:
             dir_fd = os.open(str(path.parent), os.O_RDONLY)

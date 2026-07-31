@@ -166,3 +166,20 @@ def test_replay_session_id_clamped_to_64_chars(tmp_path, example_config, example
     assert len(fresh_sid) <= 64
     assert fresh_sid.endswith("-replay")
     assert result.digest_matches
+
+
+def test_clamped_replay_ids_do_not_collide(tmp_path, example_config, example_script):
+    """Two long session ids sharing a 57-char prefix must derive distinct
+    replay ids: plain prefix truncation would replay both into the same
+    directory, silently mixing two runs' outputs."""
+    sids = ["y" * 63 + "a", "y" * 63 + "b"]
+    fresh = []
+    for sid in sids:
+        config = example_config.model_copy(update={"session_id": sid})
+        run_dir = _make_original_run(tmp_path / sid[-1], config, example_script)
+        result = execution_replay(
+            run_dir, providers={"default": FakeProvider(script=example_script)}
+        )
+        fresh.append(result.fresh_artifact.config.session_id)
+    assert fresh[0] != fresh[1]
+    assert all(len(s) <= 64 and s.endswith("-replay") for s in fresh)
