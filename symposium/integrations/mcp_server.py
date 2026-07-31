@@ -77,7 +77,6 @@ from symposium.models import (
     SelectorConfig,
 )
 from symposium.integrations.persona_factory import (
-    PersonaGenerationError,
     generate_persona as _generate_persona,
     make_cli_persona_caller,
 )
@@ -161,8 +160,41 @@ mcp = FastMCP("symposium")
 # ---------------------------------------------------------------------------
 
 
+async def _notify_info(ctx: Context, line: str) -> bool:
+    """Push one `ctx.info` line; False when the transport refused it.
+
+    A client that disconnected mid-run makes every notification fail the
+    same way. Callers use the False return to stop streaming while still
+    consuming the event queue, so the final result (with its `run_dir`)
+    is delivered instead of an opaque transport error.
+    """
+    try:
+        await ctx.info(line)
+        return True
+    except Exception:  # noqa: BLE001 — notifications are best-effort
+        return False
+
+
+def _lazy_cli_persona_caller():
+    """Build the CLI persona caller on first USE, not at tool entry.
+
+    Adaptive runs that never generate a persona (no early-start experts,
+    `max_expansions=0`, or a synthesis on the first session) must not
+    fail upfront on a host without the `claude` / `codex` CLIs — CLI
+    detection is deferred until a generation is actually requested.
+    """
+    box: List[Any] = []
+
+    def _caller(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        if not box:
+            box.append(make_cli_persona_caller())
+        return box[0](prompt, schema)
+
+    return _caller
+
+
 @mcp.tool(name="deliberate_muted")
-def deliberate(
+async def deliberate(
     problem: str,
     *,
     panel: Optional[List[str]] = None,
@@ -207,8 +239,9 @@ def deliberate(
         model: provider model string. Defaults per provider (claude-cli:
             "opus"; codex-cli: the CLI's own default; Anthropic: the
             example-config model; OpenAI: a sane default; fake:
-            "fake-deterministic"). Ignored under "cli-auto" (the router
-            stamps a model per chosen CLI).
+            "fake-deterministic"). Under "cli-auto" the value is stamped
+            on the claude-routed agents; codex-routed agents keep the
+            codex default.
         selector_strategy: §4.1 selector — "fixed" (default), "rules"
             (deterministic persona-metadata match, no provider call), or
             "llm" (one bounded provider call; needs `selector_fake_script_path`
@@ -220,7 +253,7 @@ def deliberate(
             reports cost=0 (subscription, not metered), and Claude's
             `cost_usd` is API-equivalent reference, not a bill. The real
             hard caps under `cli-auto` are `max_wallclock_seconds`
-            (default 1800s) and your subscription rate-limit window.
+            (default 3600s) and your subscription rate-limit window.
             Lower the token/cost caps explicitly when forcing
             `provider="anthropic"` / `"openai"` where every token is a
             billable charge.
@@ -240,34 +273,42 @@ def deliberate(
         error. On a bad argument / missing credential / provider failure:
         ``{"error": "<kind>: <message>"}`` — the transport never crashes.
     """
-    try:
-        config, providers, selector_providers, run_dir, panel_ids = _prepare(
-            problem=problem,
-            panel=panel,
-            coordinator=coordinator,
-            provider=provider,
-            model=model,
-            selector_strategy=selector_strategy,
-            max_rounds=max_rounds,
-            max_total_tokens=max_total_tokens,
-            max_total_cost_usd=max_total_cost_usd,
-            max_wallclock_seconds=max_wallclock_seconds,
-            per_agent_token_budget=per_agent_token_budget,
-            fake_script_path=fake_script_path,
-            selector_fake_script_path=selector_fake_script_path,
-            output_dir=output_dir,
-        )
-        artifact = run_session(
-            config,
-            providers,
-            runs_root=output_dir,
-            selector_providers=selector_providers,
-        )
-        return _build_result(artifact, run_dir, panel_ids)
-    except (UnknownProviderError, MissingCredentialsError) as exc:
-        return _error(exc)
-    except Exception as exc:  # noqa: BLE001 — every failure is a structured result
-        return _error(exc)
+    # The whole blocking body runs off-loop: the SDK executes the tool
+    # coroutine on the event loop, and a muted deliberation can hold it
+    # for up to max_wallclock_seconds — during which the server could not
+    # answer get_run_status / get_version / pings (the historical "server
+    # looks dead" failure).
+    def _run() -> Dict[str, Any]:
+        try:
+            config, providers, selector_providers, run_dir, panel_ids = _prepare(
+                problem=problem,
+                panel=panel,
+                coordinator=coordinator,
+                provider=provider,
+                model=model,
+                selector_strategy=selector_strategy,
+                max_rounds=max_rounds,
+                max_total_tokens=max_total_tokens,
+                max_total_cost_usd=max_total_cost_usd,
+                max_wallclock_seconds=max_wallclock_seconds,
+                per_agent_token_budget=per_agent_token_budget,
+                fake_script_path=fake_script_path,
+                selector_fake_script_path=selector_fake_script_path,
+                output_dir=output_dir,
+            )
+            artifact = run_session(
+                config,
+                providers,
+                runs_root=output_dir,
+                selector_providers=selector_providers,
+            )
+            return _build_result(artifact, run_dir, panel_ids)
+        except (UnknownProviderError, MissingCredentialsError) as exc:
+            return _error(exc)
+        except Exception as exc:  # noqa: BLE001 — every failure is a structured result
+            return _error(exc)
+
+    return await asyncio.to_thread(_run)
 
 
 @mcp.tool(name="deliberate")
@@ -377,6 +418,11 @@ async def deliberate_streaming(
         except queue.Empty:
             return _SENTINEL_EMPTY
 
+    # Flips to False on the first failed notification (client gone):
+    # streaming stops but the queue keeps draining so the producer's
+    # final result is still returned.
+    streaming = True
+
     try:
         while True:
             ev = await asyncio.to_thread(_blocking_get_with_timeout)
@@ -389,21 +435,31 @@ async def deliberate_streaming(
             if ev is _DONE:
                 break
             kind = ev.get("event")
-            if kind == "message":
-                await ctx.info(ev["line"])
-                try:
-                    # Route the turn preview into the progress `message` too:
-                    # some MCP clients (e.g. Claude Code) render the progress
-                    # message inline next to the counter but collapse/hide the
-                    # `ctx.info` log notifications — so without this the live
-                    # text is invisible and only the bare tick ("Processing… N")
-                    # shows. `ev["line"]` is already a bounded (~280-char)
-                    # preview, safe to send as a one-line progress message.
-                    await ctx.report_progress(
-                        progress=float(ev["index"]), total=None, message=ev["line"]
+            if kind == "run_started":
+                # Disclose the run_dir as soon as it is known, so the
+                # client can poll get_run_status without waiting for the
+                # final result.
+                if streaming:
+                    streaming = await _notify_info(
+                        ctx, f"[run_started] run_dir={ev['run_dir']}"
                     )
-                except Exception:  # noqa: BLE001 — progress is best-effort
-                    pass
+            elif kind == "message":
+                if streaming:
+                    streaming = await _notify_info(ctx, ev["line"])
+                if streaming:
+                    try:
+                        # Route the turn preview into the progress `message` too:
+                        # some MCP clients (e.g. Claude Code) render the progress
+                        # message inline next to the counter but collapse/hide the
+                        # `ctx.info` log notifications — so without this the live
+                        # text is invisible and only the bare tick ("Processing… N")
+                        # shows. `ev["line"]` is already a bounded (~280-char)
+                        # preview, safe to send as a one-line progress message.
+                        await ctx.report_progress(
+                            progress=float(ev["index"]), total=None, message=ev["line"]
+                        )
+                    except Exception:  # noqa: BLE001 — progress is best-effort
+                        pass
             elif kind == "result":
                 final = ev["result"]
             elif kind == "error":
@@ -417,7 +473,11 @@ async def deliberate_streaming(
         raise
     finally:
         stop_event.set()
-        worker.join(timeout=_STREAM_JOIN_TIMEOUT_SECONDS)
+        # `join` can park for the full timeout while the producer sits on
+        # a full queue — run it off-loop so the server keeps answering.
+        # On cancellation a fresh CancelledError from this await simply
+        # continues the unwind; the daemon worker exits on its own.
+        await asyncio.to_thread(worker.join, _STREAM_JOIN_TIMEOUT_SECONDS)
 
     return final if final is not None else {
         "error": "RuntimeError: streaming deliberation produced no result"
@@ -770,7 +830,7 @@ def get_version() -> Dict[str, Any]:
 
 
 @mcp.tool()
-def generate_persona(
+async def generate_persona(
     need: str, *, persona_class: str = "domain", prefer_cli: str = "claude"
 ) -> Dict[str, Any]:
     """Design a new expert `Persona` for a capability gap and return it.
@@ -781,16 +841,32 @@ def generate_persona(
     ``{"persona": <persona dict>}`` or ``{"error": ...}``. The returned
     persona can be used as a `panel` member or fed to `deliberate_adaptive`.
     """
-    try:
-        caller = make_cli_persona_caller(prefer=prefer_cli)
-        persona = _generate_persona(need, caller=caller, persona_class=persona_class)
-        return {"persona": persona.model_dump(mode="json", exclude_none=True)}
-    except Exception as exc:  # noqa: BLE001 — structured result, never crash
-        return _error(exc)
+    # Off-loop: the CLI call takes up to two minutes; running it on the
+    # event loop would freeze every other tool for the duration.
+    def _run() -> Dict[str, Any]:
+        try:
+            if not isinstance(need, str) or not need.strip():
+                raise ValueError("need must be a non-empty string")
+            if len(need) > _MAX_NEED_LENGTH_CHARS:
+                raise ValueError(
+                    f"need exceeds {_MAX_NEED_LENGTH_CHARS} chars (got {len(need)})"
+                )
+            prefer = prefer_cli.strip().lower() if isinstance(prefer_cli, str) else ""
+            if prefer not in ("claude", "codex"):
+                raise ValueError(
+                    f'prefer_cli must be "claude" or "codex", got {prefer_cli!r}'
+                )
+            caller = make_cli_persona_caller(prefer=prefer)
+            persona = _generate_persona(need, caller=caller, persona_class=persona_class)
+            return {"persona": persona.model_dump(mode="json", exclude_none=True)}
+        except Exception as exc:  # noqa: BLE001 — structured result, never crash
+            return _error(exc)
+
+    return await asyncio.to_thread(_run)
 
 
 @mcp.tool(name="deliberate_adaptive_muted")
-def deliberate_adaptive(
+async def deliberate_adaptive(
     problem: str,
     *,
     panel: Optional[List[str]] = None,
@@ -828,27 +904,31 @@ def deliberate_adaptive(
     phase, and `panel_final` is the panel after all expansions. On a setup
     failure returns ``{"error": ...}``.
     """
-    try:
-        _validate_experts_input(experts)
-        # Clamp `max_expansions` to a server-side ceiling. Without this, a
-        # client could request hundreds of cascading sessions, each
-        # provider-call and persona-generation-call heavy. We apply a hard
-        # cap; the caller's value is honored when smaller.
-        effective_expansions = min(int(max_expansions), _MAX_RUNTIME_EXPANSIONS)
-        if effective_expansions < 0:
-            effective_expansions = 0
-        caller = make_cli_persona_caller()
-        return _run_adaptive(
-            problem=problem, panel=panel, coordinator=coordinator, provider=provider,
-            experts=experts, max_expansions=effective_expansions, max_rounds=max_rounds,
-            max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
-            max_wallclock_seconds=max_wallclock_seconds,
-            per_agent_token_budget=per_agent_token_budget,
-            output_dir=output_dir,
-            persona_caller=caller,
-        )
-    except Exception as exc:  # noqa: BLE001 — structured result, never crash
-        return _error(exc)
+    # Off-loop for the same reason as `deliberate_muted`: an adaptive run
+    # spans multiple sessions and would otherwise hold the event loop.
+    def _run() -> Dict[str, Any]:
+        try:
+            _validate_experts_input(experts)
+            # Clamp `max_expansions` to a server-side ceiling. Without this, a
+            # client could request hundreds of cascading sessions, each
+            # provider-call and persona-generation-call heavy. We apply a hard
+            # cap; the caller's value is honored when smaller.
+            effective_expansions = min(int(max_expansions), _MAX_RUNTIME_EXPANSIONS)
+            if effective_expansions < 0:
+                effective_expansions = 0
+            return _run_adaptive(
+                problem=problem, panel=panel, coordinator=coordinator, provider=provider,
+                experts=experts, max_expansions=effective_expansions, max_rounds=max_rounds,
+                max_total_tokens=max_total_tokens, max_total_cost_usd=max_total_cost_usd,
+                max_wallclock_seconds=max_wallclock_seconds,
+                per_agent_token_budget=per_agent_token_budget,
+                output_dir=output_dir,
+                persona_caller=_lazy_cli_persona_caller(),
+            )
+        except Exception as exc:  # noqa: BLE001 — structured result, never crash
+            return _error(exc)
+
+    return await asyncio.to_thread(_run)
 
 
 @mcp.tool(name="deliberate_adaptive")
@@ -894,10 +974,14 @@ async def deliberate_adaptive_streaming(
     stop_event = threading.Event()
 
     # Clamp max_expansions to the server-side ceiling (same policy as
-    # deliberate_adaptive). Negatives → 0.
-    effective_expansions = min(int(max_expansions), _MAX_RUNTIME_EXPANSIONS)
-    if effective_expansions < 0:
-        effective_expansions = 0
+    # deliberate_adaptive). Negatives → 0. Garbage input (a non-numeric
+    # string) must yield a structured error, same as the muted twin.
+    try:
+        effective_expansions = min(int(max_expansions), _MAX_RUNTIME_EXPANSIONS)
+        if effective_expansions < 0:
+            effective_expansions = 0
+    except Exception as exc:  # noqa: BLE001 — structured result, never crash
+        return _error(exc)
 
     def _producer() -> None:
         try:
@@ -945,6 +1029,11 @@ async def deliberate_adaptive_streaming(
         except queue.Empty:
             return _SENTINEL_EMPTY
 
+    # Same policy as `deliberate_streaming`: the first failed notification
+    # stops streaming, but the queue keeps draining so the final result
+    # (with its run_dirs) is still returned.
+    streaming = True
+
     try:
         while True:
             ev = await asyncio.to_thread(_blocking_get_with_timeout)
@@ -957,33 +1046,41 @@ async def deliberate_adaptive_streaming(
                 break
             kind = ev.get("event")
             if kind == "message":
-                await ctx.info(ev["line"])
-                try:
-                    # Route the turn preview into the progress `message` too:
-                    # some MCP clients (e.g. Claude Code) render the progress
-                    # message inline next to the counter but collapse/hide the
-                    # `ctx.info` log notifications — so without this the live
-                    # text is invisible and only the bare tick ("Processing… N")
-                    # shows. `ev["line"]` is already a bounded (~280-char)
-                    # preview, safe to send as a one-line progress message.
-                    await ctx.report_progress(
-                        progress=float(ev["index"]), total=None, message=ev["line"]
-                    )
-                except Exception:  # noqa: BLE001 — progress is best-effort
-                    pass
+                if streaming:
+                    streaming = await _notify_info(ctx, ev["line"])
+                if streaming:
+                    try:
+                        # Route the turn preview into the progress `message` too:
+                        # some MCP clients (e.g. Claude Code) render the progress
+                        # message inline next to the counter but collapse/hide the
+                        # `ctx.info` log notifications — so without this the live
+                        # text is invisible and only the bare tick ("Processing… N")
+                        # shows. `ev["line"]` is already a bounded (~280-char)
+                        # preview, safe to send as a one-line progress message.
+                        await ctx.report_progress(
+                            progress=float(ev["index"]), total=None, message=ev["line"]
+                        )
+                    except Exception:  # noqa: BLE001 — progress is best-effort
+                        pass
             elif kind == "agent_generated":
-                await ctx.info(
-                    f"[+agent] {ev['id']} ({ev['phase']}) — need: {ev['need']}"
-                )
+                if streaming:
+                    streaming = await _notify_info(
+                        ctx, f"[+agent] {ev['id']} ({ev['phase']}) — need: {ev['need']}"
+                    )
             elif kind == "session_start":
-                await ctx.info(
-                    f"[session #{ev['session_index']} start] panel="
-                    f"{', '.join(ev['panel'])}"
-                )
+                if streaming:
+                    streaming = await _notify_info(
+                        ctx,
+                        f"[session #{ev['session_index']} start] "
+                        f"run_dir={ev.get('run_dir')} panel="
+                        f"{', '.join(ev['panel'])}",
+                    )
             elif kind == "session_end":
-                await ctx.info(
-                    f"[session #{ev['session_index']} end] outcome={ev['outcome']}"
-                )
+                if streaming:
+                    streaming = await _notify_info(
+                        ctx,
+                        f"[session #{ev['session_index']} end] outcome={ev['outcome']}",
+                    )
             elif kind == "result":
                 final = ev["result"]
             elif kind == "error":
@@ -993,7 +1090,8 @@ async def deliberate_adaptive_streaming(
         raise
     finally:
         stop_event.set()
-        worker.join(timeout=_STREAM_JOIN_TIMEOUT_SECONDS)
+        # Off-loop join, same rationale as `deliberate_streaming`.
+        await asyncio.to_thread(worker.join, _STREAM_JOIN_TIMEOUT_SECONDS)
 
     return final if final is not None else {
         "error": "RuntimeError: adaptive streaming produced no result"
@@ -1082,14 +1180,22 @@ def _run_adaptive(
     expansions = 0
     while True:
         cfg = config.model_copy(update={"session_id": f"mcp-adaptive-{uuid.uuid4().hex}"})
-        artifact, result = runner(cfg)
+        try:
+            artifact, result = runner(cfg)
+        except Exception as exc:  # noqa: BLE001 — salvage the completed sessions
+            # A failure in session N must not orphan sessions 1..N-1: they
+            # are persisted on disk and the caller needs their run_dirs.
+            return _partial_adaptive_result(exc, sessions, generated, expansions, config)
         sessions.append(result)
         if artifact.outcome.kind == "synthesis":
             break
         need = _pending_need(artifact)
         if need is None or expansions >= max_expansions:
             break
-        persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+        try:
+            persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+        except Exception as exc:  # noqa: BLE001 — same salvage as a session failure
+            return _partial_adaptive_result(exc, sessions, generated, expansions, config)
         config = _add_persona(config, persona, provider=add_provider, model=add_model)
         existing.add(persona.id)
         generated.append({"id": persona.id, "need": need, "phase": "runtime"})
@@ -1098,6 +1204,24 @@ def _run_adaptive(
 
     return {
         "final": sessions[-1],
+        "sessions": sessions,
+        "generated_agents": generated,
+        "expansions": expansions,
+        "panel_final": [a.id for a in config.agents],
+    }
+
+
+def _partial_adaptive_result(
+    exc: Exception,
+    sessions: List[Dict[str, Any]],
+    generated: List[Dict[str, Any]],
+    expansions: int,
+    config: Config,
+) -> Dict[str, Any]:
+    """Adaptive aggregate for a mid-run failure: error + what completed."""
+    return {
+        "error": _error(exc)["error"],
+        "final": sessions[-1] if sessions else None,
         "sessions": sessions,
         "generated_agents": generated,
         "expansions": expansions,
@@ -1143,7 +1267,9 @@ def stream_adaptive(
     never spawn CLIs or real provider calls.
     """
     if persona_caller is None:
-        persona_caller = make_cli_persona_caller()
+        # Lazy: CLI detection happens on the first generation, so an
+        # adaptive run that never expands works on a host without CLIs.
+        persona_caller = _lazy_cli_persona_caller()
     if stream_one is None:
         stream_one = lambda cfg: _default_adaptive_stream_one(  # noqa: E731
             cfg, provider, output_dir
@@ -1201,6 +1327,9 @@ def stream_adaptive(
             "event": "session_start",
             "session_index": len(sessions) + 1,
             "session_id": cfg.session_id,
+            # Disclosed upfront so a client can poll get_run_status on the
+            # session while it is still running.
+            "run_dir": str(Path(output_dir) / cfg.session_id),
             "panel": [a.id for a in cfg.agents],
         }
 
@@ -1267,6 +1396,8 @@ def _default_adaptive_stream_one(cfg: Config, provider: str, output_dir: str) ->
     + a final `result` + an internal `__artifact` so the adaptive loop can
     inspect the outcome).
     """
+    from symposium.viewer.tail import JournalTail
+
     if provider == "cli-auto":
         from symposium.integrations.cli_routing import route_cli_providers
 
@@ -1288,7 +1419,7 @@ def _default_adaptive_stream_one(cfg: Config, provider: str, output_dir: str) ->
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
 
-    tail = _JournalTail(journal)
+    tail = JournalTail(journal)
     index = 0
     while worker.is_alive():
         for msg in tail.drain():
@@ -1327,11 +1458,16 @@ def _pending_need(artifact: Artifact) -> Optional[str]:
     if outcome.kind != "termination":
         return None
     ta = outcome.termination_artifact
+    need: Optional[str] = None
     if ta.reason == "user_input_required" and ta.pending_user_input_request is not None:
-        return ta.pending_user_input_request.question
-    if ta.reason == "external_research_required" and ta.pending_external_research_request is not None:
-        return ta.pending_external_research_request.query
-    return None
+        need = ta.pending_user_input_request.question
+    elif ta.reason == "external_research_required" and ta.pending_external_research_request is not None:
+        need = ta.pending_external_research_request.query
+    if need is not None and len(need) > _MAX_NEED_LENGTH_CHARS:
+        # LLM-authored text feeds the persona generator: bound it the same
+        # way caller-supplied needs are bounded.
+        need = need[:_MAX_NEED_LENGTH_CHARS]
+    return need
 
 
 def _augment_problem(config: Config, *, prior: Dict[str, Any], need: str) -> Config:
@@ -1428,6 +1564,15 @@ def stream_deliberation(
         yield {"event": "error", "error": _error(exc)["error"]}
         return
 
+    # Disclose the run_dir before the first turn: a client that loses the
+    # stream (or wants richer polling) can immediately switch to
+    # get_run_status instead of waiting for the final result.
+    yield {
+        "event": "run_started",
+        "run_dir": str(run_dir),
+        "session_id": config.session_id,
+    }
+
     journal = run_dir / "transcript.jsonl"
     result_box: Dict[str, Artifact] = {}
     error_box: Dict[str, Exception] = {}
@@ -1446,7 +1591,14 @@ def stream_deliberation(
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
 
-    tail = _JournalTail(journal)
+    # Single source of truth for tailing the journal lives in the read-only
+    # viewer package; the streaming path re-uses it so the two consumers
+    # (MCP streaming + `symposium watch`) cannot drift on truncated-line
+    # handling. Imported here (not at module level) so a viewer import
+    # failure cannot take down every MCP tool with it.
+    from symposium.viewer.tail import JournalTail
+
+    tail = JournalTail(journal)
     index = 0
     while worker.is_alive():
         for msg in tail.drain():
@@ -1467,12 +1619,6 @@ def stream_deliberation(
         yield {"event": "error", "error": "RuntimeError: run_session produced no artifact"}
         return
     yield {"event": "result", "result": _build_result(artifact, run_dir, panel_ids)}
-
-
-# Single source of truth for tailing the journal lives in the read-only
-# viewer package; the streaming path here re-uses it so the two consumers
-# (MCP streaming + `symposium watch`) cannot drift on truncated-line handling.
-from symposium.viewer.tail import JournalTail as _JournalTail  # noqa: E402
 
 
 def _message_event(index: int, msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1573,7 +1719,7 @@ def _prepare(
         # provider id — build with a concrete placeholder the router then
         # rewrites per agent. Any other value is the real provider id.
         provider="claude-cli" if provider == "cli-auto" else provider,
-        model=("opus" if provider == "cli-auto" else resolved_model),
+        model=resolved_model,
         selector_strategy=selector_strategy,
         max_rounds=max_rounds,
         max_total_tokens=max_total_tokens,
@@ -1588,7 +1734,12 @@ def _prepare(
     if provider == "cli-auto":
         from symposium.integrations.cli_routing import route_cli_providers
 
-        routed_config, providers = route_cli_providers(config)
+        # Honor an explicit `model` on the claude-routed agents (the codex
+        # default stays: model strings are CLI-specific). With no `model`,
+        # `resolved_model` is the cli-auto default ("opus") — unchanged.
+        routed_config, providers = route_cli_providers(
+            config, claude_model=resolved_model
+        )
         run_dir = Path(output_dir) / session_id
         return routed_config, providers, None, run_dir, panel_ids
 

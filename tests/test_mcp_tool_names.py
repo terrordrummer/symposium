@@ -42,8 +42,8 @@ def test_no_legacy_streaming_tool_names():
 
 
 def test_streaming_defaults_inject_context_but_muted_do_not():
-    """The streaming default tools are async and take an injected `ctx`;
-    the muted tools are plain sync functions with no `ctx` param."""
+    """The streaming default tools take an injected `ctx`; the muted tools
+    have no `ctx` param (they push no events)."""
     import inspect
 
     assert "ctx" in inspect.signature(mcp_mod.deliberate_streaming).parameters
@@ -52,3 +52,24 @@ def test_streaming_defaults_inject_context_but_muted_do_not():
     ).parameters
     assert "ctx" not in inspect.signature(mcp_mod.deliberate).parameters
     assert "ctx" not in inspect.signature(mcp_mod.deliberate_adaptive).parameters
+
+
+def test_every_deliberation_tool_is_async():
+    """ALL deliberate* tools plus generate_persona MUST be coroutine
+    functions: FastMCP executes a sync tool directly on the event loop,
+    so a muted deliberation (up to an hour) would freeze the whole
+    server — no get_run_status, no get_version, no pings — until it
+    returned. The async bodies push the blocking work off-loop via
+    `asyncio.to_thread`."""
+    import inspect
+
+    for fn in (
+        mcp_mod.deliberate,
+        mcp_mod.deliberate_streaming,
+        mcp_mod.deliberate_adaptive,
+        mcp_mod.deliberate_adaptive_streaming,
+        mcp_mod.generate_persona,
+    ):
+        assert inspect.iscoroutinefunction(fn), (
+            f"{fn.__name__} must be async — a sync tool blocks the event loop"
+        )

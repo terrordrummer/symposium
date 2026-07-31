@@ -213,9 +213,14 @@ def replay_cmd(run_dir: Path) -> None:
 def validate_cmd(artifact_path: Path) -> None:
     """Validate an artifact.json against the v1.0.0 Artifact schema."""
     from jsonschema import Draft202012Validator
-    schemas_dir = (
-        Path(__file__).resolve().parents[2] / "docs" / "schemas" / "v1.0.0"
-    )
+    schemas_dir = _find_schemas_dir()
+    if schemas_dir is None:
+        click.echo(
+            "ERROR: v1.0.0 JSON Schemas not found (neither packaged under "
+            "symposium/schemas/ nor in the repo's docs/schemas/).",
+            err=True,
+        )
+        sys.exit(1)
     registry = _load_registry(schemas_dir)
     artifact_schema = json.loads((schemas_dir / "artifact.schema.json").read_text())
     validator = Draft202012Validator(artifact_schema, registry=registry)
@@ -432,6 +437,29 @@ def _read_yaml_or_json(path: Path):
     if path.suffix.lower() in (".yaml", ".yml"):
         return yaml.safe_load(text)
     return json.loads(text)
+
+
+def _find_schemas_dir() -> Optional[Path]:
+    """Locate the v1.0.0 JSON Schemas: packaged data first, then the repo.
+
+    Wheel installs carry the schemas as package data under
+    ``symposium/schemas/v1.0.0/``; editable installs and source checkouts
+    fall back to ``docs/schemas/v1.0.0`` relative to the repo root. Returns
+    None when neither exists (the caller emits a clean error instead of a
+    FileNotFoundError traceback).
+    """
+    try:
+        from importlib.resources import files
+
+        packaged = Path(str(files("symposium") / "schemas" / "v1.0.0"))
+        if packaged.is_dir():
+            return packaged
+    except Exception:  # noqa: BLE001 — fall through to the repo layout
+        pass
+    repo = Path(__file__).resolve().parents[2] / "docs" / "schemas" / "v1.0.0"
+    if repo.is_dir():
+        return repo
+    return None
 
 
 def _load_registry(schemas_dir: Path):

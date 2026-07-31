@@ -42,12 +42,12 @@ def script_path(repo_root) -> str:
 
 def test_deliberate_fake_synthesis(tmp_path, script_path):
     """provider=fake + walking-skeleton → synthesis with a non-empty answer."""
-    result = deliberate(
+    result = asyncio.run(deliberate(
         "Should we adopt a structured deliberation protocol?",
         provider="fake",
         fake_script_path=script_path,
         output_dir=str(tmp_path),
-    )
+    ))
     assert "error" not in result, result
     assert result["outcome"] == "synthesis"
     assert isinstance(result["synthesis_answer"], str) and result["synthesis_answer"]
@@ -66,13 +66,13 @@ def test_deliberate_fake_synthesis(tmp_path, script_path):
 
 def test_deliberate_rules_selector_synthesis(tmp_path, script_path):
     """selector_strategy=rules still reaches a valid synthesis (full panel)."""
-    result = deliberate(
+    result = asyncio.run(deliberate(
         _ALL_SCOPES_PROBLEM,
         provider="fake",
         selector_strategy="rules",
         fake_script_path=script_path,
         output_dir=str(tmp_path),
-    )
+    ))
     assert "error" not in result, result
     assert result["outcome"] == "synthesis"
     assert result["synthesis_answer"]
@@ -88,13 +88,13 @@ def test_deliberate_rules_selector_synthesis(tmp_path, script_path):
 
 def test_deliberate_budget_termination(tmp_path, script_path):
     """A budget cap yields a termination *result*, not an exception."""
-    result = deliberate(
+    result = asyncio.run(deliberate(
         "Should we adopt a structured deliberation protocol?",
         provider="fake",
         fake_script_path=script_path,
         max_rounds=1,  # round 1 = continue → round 2 open trips the cap
         output_dir=str(tmp_path),
-    )
+    ))
     assert "error" not in result, result
     assert result["outcome"] == "termination"
     assert result["termination_reason"] == "budget_exceeded"
@@ -103,12 +103,12 @@ def test_deliberate_budget_termination(tmp_path, script_path):
 
 def test_get_run_summary_reports_replay_ok(tmp_path, script_path):
     """get_run_summary recomputes metrics + verifies the §7.5 replay."""
-    run = deliberate(
+    run = asyncio.run(deliberate(
         "Should we adopt a structured deliberation protocol?",
         provider="fake",
         fake_script_path=script_path,
         output_dir=str(tmp_path),
-    )
+    ))
     assert "error" not in run, run
 
     summary = get_run_summary(run["run_dir"])
@@ -219,22 +219,22 @@ def test_list_personas_returns_six_builtins():
 def test_invalid_argument_returns_structured_error(tmp_path, script_path):
     """Bad arguments return a structured error, never crash the transport."""
     # Unknown persona id.
-    unknown = deliberate(
+    unknown = asyncio.run(deliberate(
         "anything",
         provider="fake",
         panel=["not-a-real-persona"],
         fake_script_path=script_path,
         output_dir=str(tmp_path),
-    )
+    ))
     assert "error" in unknown
     assert "not-a-real-persona" in unknown["error"]
 
     # provider="fake" without a script.
-    missing_script = deliberate(
+    missing_script = asyncio.run(deliberate(
         "anything",
         provider="fake",
         output_dir=str(tmp_path),
-    )
+    ))
     assert "error" in missing_script
     assert "fake_script_path" in missing_script["error"]
 
@@ -281,6 +281,12 @@ def test_stream_deliberation_emits_messages_then_result(tmp_path, script_path):
     assert kinds.count("result") == 1
     assert kinds[-1] == "result"
     assert "error" not in kinds
+
+    # The run_dir is disclosed up-front (before the first turn) so a
+    # client can poll get_run_status on a still-running deliberation.
+    assert kinds[0] == "run_started"
+    assert events[0]["run_dir"]
+    assert events[0]["run_dir"] == events[-1]["result"]["run_dir"]
 
     messages = [e for e in events if e["event"] == "message"]
     # indices are 1-based and contiguous, in transcript order
@@ -351,8 +357,11 @@ def test_deliberate_streaming_forwards_each_turn_to_context(tmp_path, script_pat
     assert "error" not in result, result
     assert result["outcome"] == "synthesis"
     assert result["synthesis_answer"]
-    # One log line per transcript message (14), with progress ticks alongside.
-    assert len(ctx.logs) == 14
+    # One run_started disclosure + one log line per transcript message (14),
+    # with progress ticks alongside the messages.
+    assert len(ctx.logs) == 15
+    assert ctx.logs[0].startswith("[run_started] run_dir=")
+    assert result["run_dir"] in ctx.logs[0]
     assert ctx.logs[-1].startswith("[r2")
     assert len(ctx.progress) == 14
     assert ctx.progress == sorted(ctx.progress)  # monotonic
@@ -360,7 +369,7 @@ def test_deliberate_streaming_forwards_each_turn_to_context(tmp_path, script_pat
     # clients render that inline but hide the `ctx.info` log notifications).
     assert len(ctx.progress_messages) == 14
     assert all(m for m in ctx.progress_messages)  # every tick carries a preview
-    assert ctx.progress_messages == ctx.logs  # same preview on both channels
+    assert ctx.progress_messages == ctx.logs[1:]  # same preview on both channels
 
 
 def test_stream_adaptive_no_expansion_one_session(tmp_path):
@@ -402,6 +411,8 @@ def test_stream_adaptive_no_expansion_one_session(tmp_path):
 
     kinds = [e["event"] for e in events]
     assert kinds[0] == "session_start"
+    # session_start discloses the run_dir upfront (polling-friendly).
+    assert events[0]["run_dir"].startswith(str(tmp_path))
     assert kinds.count("message") == 3
     assert "session_end" in kinds
     assert kinds[-1] == "result"
@@ -562,12 +573,12 @@ def test_artifact_carries_last_provider_failure_end_to_end(tmp_path, repo_root):
 
     from symposium.integrations.mcp_server import deliberate
 
-    result = deliberate(
+    result = asyncio.run(deliberate(
         "trigger codex failure",
         provider="fake",
         fake_script_path=str(script_path),
         output_dir=str(tmp_path / "runs"),
-    )
+    ))
 
     assert "error" not in result, result
     assert result["outcome"] == "termination"
@@ -797,3 +808,412 @@ def test_get_run_status_next_index_anchors_to_last_returned(tmp_path):
     s2 = get_run_status(str(rd), since_index=10)
     assert s2["messages"] == []
     assert s2["next_index"] == 10
+
+
+# ---------------------------------------------------------------------------
+# Event-loop responsiveness, notification guards, input bounds
+# ---------------------------------------------------------------------------
+
+
+_VALID_PERSONA = {
+    "persona_class": "domain", "id": "dba",
+    "reasoning_scope": "database tuning",
+    "reasoning_style": "measure-first",
+    "behavioral_constraints": ["quote the query plan"],
+    "failure_modes": ["index cargo-culting"],
+    "domain_scope": ["databases"],
+    "forbidden_domains": ["ui design"],
+    "must_delegate": {"legal compliance": "a legal expert"},
+}
+
+
+def test_muted_deliberate_leaves_event_loop_responsive(tmp_path, script_path, monkeypatch):
+    """While a muted deliberation is in flight the server MUST still answer
+    other tools. Pre-fix, the muted tools were plain sync functions and the
+    SDK executed them directly on the event loop — a long run froze
+    get_run_status / get_version / pings for its whole duration (the
+    historical "server looks dead / stale" failure).
+
+    The gate parks `run_session` in its worker thread until released, so
+    the test can prove get_version / get_run_status answer *through the
+    server* while the deliberation is provably still running.
+    """
+    import threading
+
+    import symposium.integrations.mcp_server as mcp_mod
+
+    started = threading.Event()
+    release = threading.Event()
+    real_run_session = mcp_mod.run_session
+
+    def gated_run_session(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=30.0), "test gate never released"
+        return real_run_session(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_mod, "run_session", gated_run_session)
+
+    async def scenario():
+        task = asyncio.create_task(deliberate(
+            "Should we adopt a structured deliberation protocol?",
+            provider="fake",
+            fake_script_path=script_path,
+            output_dir=str(tmp_path),
+        ))
+        # Wait (off-loop) until the deliberation body is parked inside
+        # run_session — i.e. the muted tool is genuinely mid-flight.
+        assert await asyncio.to_thread(started.wait, 30.0)
+        assert not task.done()
+
+        version = await asyncio.wait_for(
+            mcp_mod.mcp.call_tool("get_version", {}), timeout=10.0
+        )
+        assert version, "get_version did not answer during a muted run"
+        status = await asyncio.wait_for(
+            mcp_mod.mcp.call_tool(
+                "get_run_status", {"run_dir": str(tmp_path / "missing")}
+            ),
+            timeout=10.0,
+        )
+        assert status, "get_run_status did not answer during a muted run"
+        assert not task.done(), "deliberation finished before the gate opened"
+
+        release.set()
+        return await asyncio.wait_for(task, timeout=30.0)
+
+    result = asyncio.run(scenario())
+    assert "error" not in result, result
+    assert result["outcome"] == "synthesis"
+
+
+class _FlakyCtx(_FakeCtx):
+    """Ctx whose notifications start failing after `fail_after` infos —
+    models a client that disconnected mid-run."""
+
+    def __init__(self, fail_after: int) -> None:
+        super().__init__()
+        self._fail_after = fail_after
+
+    async def info(self, message: str, **extra) -> None:
+        if len(self.logs) >= self._fail_after:
+            raise ConnectionError("client went away")
+        await super().info(message, **extra)
+
+
+def test_deliberate_streaming_survives_notification_failure(tmp_path, script_path):
+    """A ctx.info failure mid-stream MUST NOT surface as an opaque MCP
+    error: streaming stops, the queue keeps draining, and the final
+    result (with its run_dir) is still returned.
+    """
+    ctx = _FlakyCtx(fail_after=3)
+    result = asyncio.run(
+        deliberate_streaming(
+            "Should we adopt a structured deliberation protocol?",
+            provider="fake",
+            fake_script_path=script_path,
+            output_dir=str(tmp_path),
+            ctx=ctx,
+        )
+    )
+    assert "error" not in result, result
+    assert result["outcome"] == "synthesis"
+    assert result["run_dir"]
+    # Streaming stopped at the first refused notification…
+    assert len(ctx.logs) == 3
+    # …and no further progress ticks were attempted either.
+    assert len(ctx.progress) <= 3
+
+
+def test_adaptive_streaming_survives_notification_failure(tmp_path, monkeypatch):
+    """Same guard on the adaptive tool: every ctx.info (agent_generated /
+    session_start / session_end / message) is best-effort; the aggregate
+    result is returned even when the very first notification fails.
+    """
+    import symposium.integrations.mcp_server as mcp_mod
+
+    final = {
+        "final": {"outcome": "synthesis", "synthesis_answer": "ok"},
+        "sessions": [{"outcome": "synthesis"}],
+        "generated_agents": [],
+        "expansions": 0,
+        "panel_final": ["logician"],
+    }
+
+    def fake_stream_adaptive(problem, **kwargs):
+        yield {"event": "session_start", "session_index": 1, "session_id": "s1",
+               "run_dir": str(tmp_path / "s1"), "panel": ["logician"]}
+        yield {"event": "message", "index": 1, "line": "msg 1", "message": {}}
+        yield {"event": "message", "index": 2, "line": "msg 2", "message": {}}
+        yield {"event": "session_end", "session_index": 1, "session_id": "s1",
+               "outcome": "synthesis"}
+        yield {"event": "result", "result": final}
+
+    monkeypatch.setattr(mcp_mod, "stream_adaptive", fake_stream_adaptive)
+
+    ctx = _FlakyCtx(fail_after=1)
+    result = asyncio.run(mcp_mod.deliberate_adaptive_streaming("p", ctx=ctx))
+    assert result == final
+    assert len(ctx.logs) == 1  # streaming stopped after the refused info
+
+
+def test_generate_persona_rejects_oversized_need():
+    from symposium.integrations.mcp_server import (
+        _MAX_NEED_LENGTH_CHARS,
+        generate_persona,
+    )
+
+    result = asyncio.run(
+        generate_persona("x" * (_MAX_NEED_LENGTH_CHARS + 1))
+    )
+    assert "error" in result
+    assert str(_MAX_NEED_LENGTH_CHARS) in result["error"]
+
+
+def test_generate_persona_rejects_empty_need():
+    from symposium.integrations.mcp_server import generate_persona
+
+    result = asyncio.run(generate_persona("   "))
+    assert "error" in result
+    assert "non-empty" in result["error"]
+
+
+def test_generate_persona_rejects_unknown_prefer_cli():
+    from symposium.integrations.mcp_server import generate_persona
+
+    result = asyncio.run(generate_persona("need a dba", prefer_cli="gemini"))
+    assert "error" in result
+    assert "prefer_cli" in result["error"]
+
+
+def test_generate_persona_normalizes_prefer_cli_case(monkeypatch):
+    """prefer_cli="Claude" MUST keep the claude preference, not silently
+    flip to codex (the pre-fix behavior of the exact-match check)."""
+    import symposium.integrations.mcp_server as mcp_mod
+
+    seen = {}
+
+    def fake_make_caller(*, prefer):
+        seen["prefer"] = prefer
+        return lambda prompt, schema: dict(_VALID_PERSONA)
+
+    monkeypatch.setattr(mcp_mod, "make_cli_persona_caller", fake_make_caller)
+
+    result = asyncio.run(
+        mcp_mod.generate_persona("need a dba", prefer_cli="Claude")
+    )
+    assert "error" not in result, result
+    assert seen["prefer"] == "claude"
+    assert result["persona"]["id"] == "dba"
+
+
+def test_pending_need_is_truncated_to_the_cap():
+    """LLM-authored expansion needs feed the persona generator; they get
+    the same length bound as caller-supplied needs."""
+    import types
+
+    from symposium.integrations.mcp_server import (
+        _MAX_NEED_LENGTH_CHARS,
+        _pending_need,
+    )
+
+    long_q = "q" * (_MAX_NEED_LENGTH_CHARS + 500)
+    ta = types.SimpleNamespace(
+        reason="user_input_required",
+        pending_user_input_request=types.SimpleNamespace(question=long_q),
+        pending_external_research_request=None,
+    )
+    artifact = types.SimpleNamespace(
+        outcome=types.SimpleNamespace(kind="termination", termination_artifact=ta)
+    )
+    need = _pending_need(artifact)
+    assert need is not None
+    assert len(need) == _MAX_NEED_LENGTH_CHARS
+
+
+def test_adaptive_failure_returns_partial_sessions(tmp_path):
+    """A failure in session N MUST NOT discard sessions 1..N-1: they are
+    persisted on disk and the caller needs their run_dirs. The aggregate
+    carries the error alongside everything that completed.
+    """
+    import types
+
+    from symposium.integrations.mcp_server import _run_adaptive
+
+    ta = types.SimpleNamespace(
+        reason="user_input_required",
+        pending_user_input_request=types.SimpleNamespace(
+            question="need a cryptographer"
+        ),
+        pending_external_research_request=None,
+    )
+    termination = types.SimpleNamespace(
+        outcome=types.SimpleNamespace(kind="termination", termination_artifact=ta)
+    )
+    s1_result = {
+        "outcome": "termination",
+        "termination_reason": "user_input_required",
+        "run_dir": str(tmp_path / "s1"),
+    }
+
+    calls = {"n": 0}
+
+    def runner(cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return termination, s1_result
+        raise RuntimeError("provider exploded")
+
+    out = _run_adaptive(
+        problem="p", panel=["logician"], coordinator="coordinator",
+        provider="fake", experts=None, max_expansions=2, max_rounds=2,
+        max_total_tokens=1000, max_total_cost_usd=1.0,
+        max_wallclock_seconds=10, output_dir=str(tmp_path),
+        persona_caller=lambda prompt, schema: dict(_VALID_PERSONA),
+        run_one=runner,
+    )
+    assert "error" in out
+    assert "provider exploded" in out["error"]
+    # Session 1 (and its run_dir) survives the session-2 failure.
+    assert out["sessions"] == [s1_result]
+    assert out["final"] == s1_result
+    assert [g["id"] for g in out["generated_agents"]] == ["dba"]
+    assert out["expansions"] == 1
+
+
+def test_cli_auto_threads_model_to_claude_routing(tmp_path, monkeypatch):
+    """provider="cli-auto" + model="sonnet" MUST reach the router as
+    claude_model="sonnet" (pre-fix the model was silently dropped and
+    "opus" stamped unconditionally). No model → the "opus" default."""
+    import symposium.integrations.cli_routing as cli_routing
+    from symposium.integrations.mcp_server import _prepare
+
+    seen = {}
+
+    def fake_route(config, **kwargs):
+        seen["claude_model"] = kwargs.get("claude_model")
+        return config, {"default": object()}
+
+    monkeypatch.setattr(cli_routing, "route_cli_providers", fake_route)
+
+    common = dict(
+        problem="p", panel=None, coordinator="coordinator", provider="cli-auto",
+        selector_strategy="fixed", max_rounds=1, max_total_tokens=1000,
+        max_total_cost_usd=1.0, max_wallclock_seconds=10,
+        fake_script_path=None, selector_fake_script_path=None,
+        output_dir=str(tmp_path),
+    )
+
+    config, _, _, _, _ = _prepare(model="sonnet", **common)
+    assert seen["claude_model"] == "sonnet"
+    assert {a.model for a in config.agents} == {"sonnet"}
+
+    _prepare(model=None, **common)
+    assert seen["claude_model"] == "opus"
+
+
+def test_stream_adaptive_defers_cli_detection_until_first_generation(tmp_path, monkeypatch):
+    """An adaptive run that never generates a persona MUST NOT probe the
+    CLIs at all — pre-fix the caller was built eagerly at tool entry, so
+    max_expansions=0 on a host without claude/codex failed upfront."""
+    from unittest.mock import MagicMock
+
+    import symposium.integrations.mcp_server as mcp_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no CLI installed")
+
+    monkeypatch.setattr(mcp_mod, "make_cli_persona_caller", boom)
+
+    fake_artifact = MagicMock()
+    fake_artifact.outcome.kind = "synthesis"
+    session_result = {"outcome": "synthesis", "synthesis_answer": "ok"}
+
+    def fake_stream_one(_cfg):
+        yield {"event": "message", "index": 1, "line": "msg 1", "message": {}}
+        yield {"event": "__artifact", "artifact": fake_artifact}
+        yield {"event": "result", "result": session_result}
+
+    events = list(
+        mcp_mod.stream_adaptive(
+            "Why?", output_dir=str(tmp_path), stream_one=fake_stream_one
+        )
+    )
+    kinds = [e["event"] for e in events]
+    assert "error" not in kinds
+    assert kinds[-1] == "result"
+
+
+def test_adaptive_muted_defers_cli_detection(monkeypatch):
+    """Same laziness on the muted tool: the persona caller handed to
+    `_run_adaptive` only touches the CLIs when actually invoked."""
+    import symposium.integrations.mcp_server as mcp_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no CLI installed")
+
+    monkeypatch.setattr(mcp_mod, "make_cli_persona_caller", boom)
+
+    canned = {"final": {"outcome": "synthesis"}, "sessions": [],
+              "generated_agents": [], "expansions": 0, "panel_final": []}
+    seen = {}
+
+    def fake_run_adaptive(**kwargs):
+        seen["persona_caller"] = kwargs["persona_caller"]
+        return canned
+
+    monkeypatch.setattr(mcp_mod, "_run_adaptive", fake_run_adaptive)
+
+    result = asyncio.run(mcp_mod.deliberate_adaptive("p", max_expansions=0))
+    assert result == canned
+    # CLI detection is deferred to the caller's first use.
+    with pytest.raises(RuntimeError, match="no CLI installed"):
+        seen["persona_caller"]("prompt", {})
+
+
+def test_adaptive_garbage_max_expansions_is_a_structured_error():
+    """A non-numeric max_expansions must yield {"error": ...} on BOTH
+    adaptive variants (the streaming twin used to clamp outside the try,
+    leaking a raw exception through the transport)."""
+    import symposium.integrations.mcp_server as mcp_mod
+
+    muted = asyncio.run(mcp_mod.deliberate_adaptive("p", max_expansions="lots"))
+    assert "error" in muted
+
+    streamed = asyncio.run(
+        mcp_mod.deliberate_adaptive_streaming(
+            "p", max_expansions="lots", ctx=_FakeCtx()
+        )
+    )
+    assert "error" in streamed
+
+
+def test_wallclock_docstrings_match_the_real_default():
+    """The muted deliberate docstring used to claim an 1800s cli-auto
+    wallclock default while the signature default is 3600."""
+    import inspect
+
+    import symposium.integrations.mcp_server as mcp_mod
+
+    default = inspect.signature(mcp_mod.deliberate).parameters[
+        "max_wallclock_seconds"
+    ].default
+    doc = mcp_mod.deliberate.__doc__ or ""
+    assert "1800s" not in doc
+    assert f"{default}s" in doc
+
+
+def test_viewer_import_is_function_local():
+    """A viewer import failure must not break every MCP tool at import
+    time: no module-level import from symposium.viewer."""
+    import ast
+    from pathlib import Path as _Path
+
+    import symposium.integrations.mcp_server as mcp_mod
+
+    tree = ast.parse(_Path(mcp_mod.__file__).read_text())
+    offenders = [
+        node for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("symposium.viewer")
+    ]
+    assert offenders == []
