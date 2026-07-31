@@ -36,7 +36,9 @@ def test_turn_index_monotonic_per_round(example_config, example_script):
             continue
         by_round.setdefault(m.round, []).append(m.turn_index)
     for r, idxs in by_round.items():
-        assert idxs == sorted(idxs), f"round {r}: turn_index not monotonic: {idxs}"
+        assert all(a < b for a, b in zip(idxs, idxs[1:])), (
+            f"round {r}: turn_index not strictly increasing: {idxs}"
+        )
 
 
 def test_problem_statement_is_first_and_round_zero(example_config, example_script):

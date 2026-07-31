@@ -243,11 +243,12 @@ def test_soft_deadline_reserves_synthesis_instead_of_opening_a_turn(monkeypatch)
     than spending the last seconds on another panel/coordinator turn and
     terminating empty.
 
-    Wall-clock is driven by a fake clock advanced per provider call. Reserve =
-    120s, min turn = 30s, so the soft deadline trips when remaining <= 150s.
-    Budget = 400s, each turn = 100s. The clock lazily anchors to the real
-    monotonic value Session captured at creation (its default_factory binds
-    the original function, so a plain patch wouldn't move the start point).
+    Wall-clock is driven by a fake clock advanced per provider call. Budget =
+    400s, so the scaled reserve is min(120, 0.25*400) = 100s; with the 30s
+    min turn the soft deadline trips when remaining <= 130s. Each turn =
+    100s. The clock lazily anchors to the real monotonic value Session
+    captured at creation (its default_factory binds the original function,
+    so a plain patch wouldn't move the start point).
     """
     real_monotonic = loop_mod.time.monotonic
     state = {"base": None, "elapsed": 0.0}
@@ -265,7 +266,7 @@ def test_soft_deadline_reserves_synthesis_instead_of_opening_a_turn(monkeypatch)
     # Invocation order with a 1-member panel:
     #   r1: logician turn, coordinator verdict(continue)
     #   r2: logician turn, then the soft deadline trips at the coordinator
-    #       gate (remaining 100s <= 150s) -> salvage synthesis (no r2 verdict).
+    #       gate (remaining 100s <= 130s) -> salvage synthesis (no r2 verdict).
     script = _script(
         [
             _turn("logician", "r1"),
@@ -361,9 +362,10 @@ def test_retries_do_not_consume_synthesis_reserve(monkeypatch):
     leaving room for the salvage synthesis — rather than burning the full retry
     budget past the reserve.
 
-    Budget=300s, reserve=120s, min_turn=30s -> soft deadline at remaining<=150s.
-    Each provider call advances the clock 60s. retry budget defaults to 2 (=> up
-    to 3 critic attempts without the fix).
+    Budget=480s, reserve=120s (the scaled reserve hits its ceiling at 480s),
+    min_turn=30s -> soft deadline at remaining<=150s. Each provider call
+    advances the clock 120s. retry budget defaults to 2 (=> up to 3 critic
+    attempts without the fix).
     """
     real_monotonic = loop_mod.time.monotonic
     state = {"base": None, "elapsed": 0.0}
@@ -375,20 +377,75 @@ def test_retries_do_not_consume_synthesis_reserve(monkeypatch):
 
     monkeypatch.setattr(loop_mod.time, "monotonic", fake_monotonic)
     # Keep backoff sleeps out of real wall-clock for the retriable path.
-    monkeypatch.setattr(loop_mod.time, "sleep", lambda *_: None)
+    # NOTE: patching `loop_mod.time.sleep` would be ineffective here —
+    # `_invoke_with_retry` bound `sleep=time.sleep` as a default at def time,
+    # so the module-level patch never reaches it and the backoffs would run
+    # for real. Zeroing the computed delay is what actually removes the wait.
+    monkeypatch.setattr(loop_mod, "_backoff_delay", lambda *a, **k: 0.0)
 
     config = _make_config(
         max_rounds=4,
-        max_wallclock_seconds=300,
+        max_wallclock_seconds=480,
         synthesize_on_terminate=True,
         panel=("logician", "critic"),
     )
-    provider = _RoleProvider(state, per_turn=60.0)
+    provider = _RoleProvider(state, per_turn=120.0)
     art = run_session(config, {"default": provider})
 
-    # logician (60->240 remaining) succeeds; critic attempt #1 (->180) and #2
+    # logician (120->360 remaining) succeeds; critic attempt #1 (->240) and #2
     # (->120) fail, then the deadline guard stops further retries (would have
     # been a 3rd attempt without the fix). Salvage synthesis then runs.
     assert provider.calls.get("critic") == 2, provider.calls
     assert art.outcome.kind == "synthesis"
     assert art.canonical_transcript[-1].type == "synthesis"
+
+
+# ---------------------------------------------------------------------------
+# the synthesis reserve scales down with small wall-clock budgets
+# ---------------------------------------------------------------------------
+
+
+def test_small_wallclock_budget_still_deliberates():
+    """Regression: with the fixed 120s reserve, any budget <= 150s tripped the
+    soft deadline at the very first round-open, and `_has_substantive_turn`
+    then blocked the salvage over the empty transcript — zero deliberation.
+    The reserve now scales to a quarter of the budget (120s budget -> 30s
+    reserve, deadline at remaining <= 60s), so the first round opens
+    normally and the run completes."""
+    config = _make_config(
+        max_rounds=2, max_wallclock_seconds=120, synthesize_on_terminate=True
+    )
+    script = _script(
+        [
+            _turn("logician", "small-budget analysis"),
+            _verdict("finalize", rationale="converged"),
+            _synthesis("answer under a small budget"),
+        ]
+    )
+    art = run_session(config, {"default": FakeProvider(script=script)})
+
+    assert any(m.type == "primary_turn" for m in art.canonical_transcript)
+    assert art.outcome.kind == "synthesis"
+
+
+# ---------------------------------------------------------------------------
+# final_round accounting at a round-open breach
+# ---------------------------------------------------------------------------
+
+
+def test_round_open_breach_reports_previous_round_as_final():
+    """A breach at the open of round N+1 (no turns held in it) must report
+    final_round = N. Here the soft deadline trips at the very first
+    round-open (budget 40s <= 0.25*40 + 30), so no round ever held a turn
+    and final_round must be 0 — pre-fix it reported 1."""
+    config = _make_config(
+        max_rounds=4, max_wallclock_seconds=40, synthesize_on_terminate=True
+    )
+    script = _script([_turn("logician", "never invoked")])
+    art = run_session(config, {"default": FakeProvider(script=script)})
+
+    assert art.outcome.kind == "termination"
+    term = art.outcome.termination_artifact
+    assert term.reason == "timeout"
+    assert term.final_round == 0
+    assert not any(m.type in ("primary_turn", "branch_turn") for m in art.canonical_transcript)

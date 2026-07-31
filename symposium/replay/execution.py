@@ -78,7 +78,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Mapping, Optional, Union
+from typing import Callable, Dict, Iterator, List, Mapping, Optional
 
 from symposium.models import Artifact, Config, Persona, RunManifest
 from symposium.providers.base import ProviderAdapter
@@ -416,24 +416,34 @@ def execution_replay(
     # --- #8 wallclock -------------------------------------------------------
     # Decide the message-timestamp source. fixed_clock overrides; otherwise we
     # replay the recorded timestamps (a §7.6 #8 "fixed clock source for
-    # replay"). A live provider with no fixed_clock cannot be pinned (its fresh
-    # content would not match the recording anyway) → abort.
+    # replay"). Either way the condition is only PARTIALLY pinned: the
+    # runtime's cap / soft-deadline decisions read the live `time.monotonic`,
+    # which no clock source reaches — so the budget-decision half is recorded
+    # as an assumption with a warning (a wallclock-terminated original cannot
+    # be replay-matched). A live provider with no fixed_clock cannot be
+    # pinned at all (its fresh content would not match the recording anyway)
+    # → abort.
     if fixed_clock is not None:
         clock_source: Callable[[], str] = _fixed_clock_source(fixed_clock)
-        conditions_checked.append("wallclock")
+        conditions_checked.append("wallclock")  # message-timestamp half pinned
     elif all_fake:
         clock_source = _recorded_clock_source(original_artifact)
         warnings.append(
             "wallclock: no explicit fixed_clock; message timestamps are replayed from the "
             "recorded transcript (§7.6 #8 fixed clock source). Pass fixed_clock to override"
         )
-        conditions_checked.append("wallclock")
     else:
         raise PinningViolation(
             "wallclock",
             "live-provider replay requires a fixed_clock to pin message timestamps and retry "
             "jitter (§7.6 #8); none was supplied",
         )
+    warnings.append(
+        "wallclock: hard-cap and soft-deadline decisions read the live monotonic clock "
+        "and are NOT pinned (§7.6 #8, budget-decision half); a run terminated by the "
+        "wall-clock cap cannot be replay-matched"
+    )
+    conditions_assumed.append("wallclock")  # budget-decision half
 
     # --- #9 persona ---------------------------------------------------------
     if persona_hashes is not None:
@@ -476,7 +486,12 @@ def execution_replay(
         fresh_runs_root = run_dir.parent
     fresh_runs_root = Path(fresh_runs_root)
 
-    fresh_session_id = f"{config.session_id}{REPLAY_SUFFIX}"
+    # Clamp so the derived id stays within the §7.1 64-char session_id limit
+    # even when the original id already uses most of it (a 57+-char original
+    # would otherwise push "<sid>-replay" past the limit and raise a raw
+    # ValueError after all conditions passed).
+    max_stem = 64 - len(REPLAY_SUFFIX)
+    fresh_session_id = f"{config.session_id[:max_stem]}{REPLAY_SUFFIX}"
     validate_session_id(fresh_session_id)  # ValueError → generic error path
     fresh_config = config.model_copy(update={"session_id": fresh_session_id})
 

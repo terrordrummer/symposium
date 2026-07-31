@@ -37,6 +37,9 @@ _BACKOFF_JITTER = 0.25
 # wallclock − this reserve. Without the reserve, the last panel turn would
 # eat the whole clock and the salvage synthesis would have no window — the
 # exact "wired the flag but it never produces output" trap.
+# This constant is a CEILING: the effective reserve is scaled to the budget
+# by `_synthesis_reserve_seconds` so small wall-clock budgets still open
+# turns at all (see that helper).
 _SYNTHESIS_RESERVE_SECONDS = 120.0
 
 # Floor on the budget a normal turn must have before we open it. If less than
@@ -63,15 +66,21 @@ def _backoff_delay(
     same seed (derived from session_id), replays produce the same jitter
     sequence — keeping backoff sleeps out of the §7.6 replay-divergence
     surface (otherwise an unrelated retry could push wallclock past a cap
-    and flip a termination decision between runs).
+    and flip a termination decision between runs). It is REQUIRED whenever
+    jitter is computed: a fallback to the process-global `random` module
+    would leak unseeded nondeterminism into that surface. Only the
+    `retry_after` early return may be reached without one.
     """
     if retry_after is not None and retry_after >= 0:
         return min(float(retry_after), _BACKOFF_MAX_SECONDS)
+    if rng is None:
+        raise TypeError("_backoff_delay requires a session-bound rng for jitter")
     raw = _BACKOFF_BASE_SECONDS * (2 ** (max(attempt_idx, 1) - 1))
     bounded = min(raw, _BACKOFF_MAX_SECONDS)
-    source = rng if rng is not None else random
-    jitter = 1.0 + source.uniform(-_BACKOFF_JITTER, _BACKOFF_JITTER)
+    jitter = 1.0 + rng.uniform(-_BACKOFF_JITTER, _BACKOFF_JITTER)
     return max(bounded * jitter, 0.0)
+
+from pydantic import ValidationError
 
 from symposium.models import (
     AgentConfig,
@@ -233,13 +242,30 @@ def _remaining_wallclock_seconds(session: Session) -> float:
     return session.config.budget.max_wallclock_seconds - elapsed
 
 
+def _synthesis_reserve_seconds(session: Session) -> float:
+    """Effective synthesis reserve for this session's wall-clock budget.
+
+    `_SYNTHESIS_RESERVE_SECONDS` is a ceiling: with a small budget, a fixed
+    120s reserve (+ the 30s min-turn floor) would trip the soft deadline at
+    the very first round-open, and `_has_substantive_turn` would then block
+    the salvage over the empty transcript — zero deliberation. Scaling the
+    reserve to a quarter of the budget keeps small runs deliberating;
+    budgets of 480s and above get the full fixed reserve, so behavior for
+    normal-sized runs is unchanged.
+    """
+    return min(
+        _SYNTHESIS_RESERVE_SECONDS,
+        0.25 * session.config.budget.max_wallclock_seconds,
+    )
+
+
 def _budget_gate(session: Session) -> Optional[str]:
     """Combined cap check for the points where a new turn may be opened.
 
     Returns a termination reason, or None to proceed. Layers a *soft*
     wall-clock deadline on top of `check_hard_caps`: when
     `runtime.synthesize_on_terminate` is set, we stop opening new turns once
-    less than `_SYNTHESIS_RESERVE_SECONDS + _MIN_TURN_TIMEOUT_SECONDS`
+    less than `_synthesis_reserve_seconds + _MIN_TURN_TIMEOUT_SECONDS`
     remains, so the reserved window survives for a salvage synthesis. When
     the flag is off, behavior is unchanged (hard caps only) — the soft
     deadline would otherwise cut deliberation short for no benefit.
@@ -249,7 +275,7 @@ def _budget_gate(session: Session) -> Optional[str]:
         return hard
     if session.config.runtime.synthesize_on_terminate:
         remaining = _remaining_wallclock_seconds(session)
-        if remaining <= _SYNTHESIS_RESERVE_SECONDS + _MIN_TURN_TIMEOUT_SECONDS:
+        if remaining <= _synthesis_reserve_seconds(session) + _MIN_TURN_TIMEOUT_SECONDS:
             return "timeout"
     return None
 
@@ -264,7 +290,7 @@ def _turn_timeout(session: Session) -> Optional[float]:
     """
     if not session.config.runtime.synthesize_on_terminate:
         return None
-    budget = _remaining_wallclock_seconds(session) - _SYNTHESIS_RESERVE_SECONDS
+    budget = _remaining_wallclock_seconds(session) - _synthesis_reserve_seconds(session)
     return max(budget, _MIN_TURN_TIMEOUT_SECONDS)
 
 
@@ -280,7 +306,7 @@ def _synthesis_timeout(session: Session) -> Optional[float]:
     # past) the hard cap still deserves a usable window — overrunning the
     # wall-clock by up to the reserve to actually produce an answer is the
     # whole point of synthesize_on_terminate.
-    return max(_remaining_wallclock_seconds(session), _SYNTHESIS_RESERVE_SECONDS)
+    return max(_remaining_wallclock_seconds(session), _synthesis_reserve_seconds(session))
 
 
 def _has_substantive_turn(session: Session) -> bool:
@@ -432,9 +458,13 @@ def _build_persona_system_prompt(packet: ContextPacket, expected_output_schema: 
             "    NEXT_ACTION GUIDANCE below.\n"
             "  - `rationale`: WHY you chose that next_action, grounded in the\n"
             "    round's contributions. Required.\n"
+            "  - `confidence`: float in [0,1] — your confidence in the\n"
+            "    next_action decision. Required.\n"
             "  - `focus`: what the panel should attend to next (free-text).\n"
-            "  - `next_agents`: subset of CURRENT PANEL ids to speak next round\n"
-            "    (only valid with `continue`).\n"
+            "  - `next_agents`: ADVISORY subset of CURRENT PANEL ids you\n"
+            "    consider most relevant next round. Recorded in the verdict\n"
+            "    for audit, but it does NOT alter scheduling — every round\n"
+            "    runs the full panel.\n"
             "  - `resolved_disagreements` / `unresolved_disagreements`: list of\n"
             "    structured disagreement objects from this round.\n"
             "  - `user_input_request` / `external_research_request`: payload for\n"
@@ -487,8 +517,9 @@ def _build_persona_system_prompt(packet: ContextPacket, expected_output_schema: 
             "value:\n"
             "\n"
             "  - `continue`: panel keeps going for another round. `next_agents`\n"
-            "    selects who speaks next, but can ONLY reference panel members\n"
-            "    that are ALREADY IN THE PANEL. Phantom IDs are silently\n"
+            "    is ADVISORY ONLY: it is recorded in the verdict but does NOT\n"
+            "    alter scheduling — every round runs the FULL panel. Reference\n"
+            "    only members ALREADY IN THE PANEL. Phantom IDs are silently\n"
             "    ignored — they do NOT cause a new persona to be created.\n"
             "  - `finalize`: panel has converged; synthesis is triggered.\n"
             "    Use when no new substantive claims would emerge from another\n"
@@ -730,11 +761,12 @@ def _invoke_with_retry(
             and session.config.runtime.synthesize_on_terminate
         ):
             remaining = _remaining_wallclock_seconds(session)
-            if remaining <= _SYNTHESIS_RESERVE_SECONDS + _MIN_TURN_TIMEOUT_SECONDS:
+            reserve = _synthesis_reserve_seconds(session)
+            if remaining <= reserve + _MIN_TURN_TIMEOUT_SECONDS:
                 break
             if request.metadata and "symposium_timeout_seconds" in request.metadata:
                 request.metadata["symposium_timeout_seconds"] = max(
-                    remaining - _SYNTHESIS_RESERVE_SECONDS, _MIN_TURN_TIMEOUT_SECONDS
+                    remaining - reserve, _MIN_TURN_TIMEOUT_SECONDS
                 )
         provider = _provider_for(session, agent_id)
         # If FakeProvider: stash round/turn_index hints so match assertions work.
@@ -851,6 +883,12 @@ def run_session(
     If `runs_root` is given, the session is persisted under
     `runs_root/<session_id>/`.
     """
+    # Fail fast on ambiguous identities: `agent_by_id` returns the FIRST
+    # match, so a duplicated id would silently shadow its twin for the whole
+    # deliberation. This is a runtime check, not a Config model validator —
+    # schema-valid configs must still parse.
+    _check_agent_id_uniqueness(config)
+
     session = Session(config=config, providers=providers, rng_seed=rng_seed)
 
     writer: Optional[RunWriter] = None
@@ -861,50 +899,108 @@ def run_session(
         writer = RunWriter(rd)
         writer.start(config, session.started_at)
 
-    # 1) problem_statement message (round 0, turn_index 0). §4.1 appends it
-    #    during **init**, BEFORE the **selector** phase — so even a selector
-    #    failure persists a valid 1-message canonical_transcript.
-    problem_msg = Message(
-        id=_new_id(),
-        speaker=config.originator,
-        type="problem_statement",
-        content=config.problem_statement,
-        round=0,
-        turn_index=0,
-        branch_depth=0,
-        timestamp=now_utc_iso(),
-        usage=_zero_usage(),
-    )
-    session.transcript.append(problem_msg)
-    if writer:
-        writer.append_message(problem_msg)
-
-    # 2) §4.1 selector phase — choose the active_deliberation_panel + coordinator.
-    #    `fixed` / `rules` make no provider call; `llm` makes one bounded call
-    #    whose usage is budgeted against selector_budget and never enters
-    #    Artifact.cumulative_usage or the transcript_digest. A selector failure
-    #    terminates BEFORE round 1 opens, with the seed (problem_statement-only)
-    #    transcript.
     try:
-        selection = run_selector(config, providers=selector_providers or providers)
-    except SelectorError:
-        outcome, term = _terminate(session, writer, reason="schema_error")
+        # 1) problem_statement message (round 0, turn_index 0). §4.1 appends it
+        #    during **init**, BEFORE the **selector** phase — so even a selector
+        #    failure persists a valid 1-message canonical_transcript.
+        problem_msg = Message(
+            id=_new_id(),
+            speaker=config.originator,
+            type="problem_statement",
+            content=config.problem_statement,
+            round=0,
+            turn_index=0,
+            branch_depth=0,
+            timestamp=now_utc_iso(),
+            usage=_zero_usage(),
+        )
+        session.transcript.append(problem_msg)
+        if writer:
+            writer.append_message(problem_msg)
+
+        # 2) §4.1 selector phase — choose the active_deliberation_panel + coordinator.
+        #    `fixed` / `rules` make no provider call; `llm` makes one bounded call
+        #    whose usage is budgeted against selector_budget and never enters
+        #    Artifact.cumulative_usage or the transcript_digest. A selector failure
+        #    terminates BEFORE round 1 opens, with the seed (problem_statement-only)
+        #    transcript.
+        try:
+            selection = run_selector(config, providers=selector_providers or providers)
+        except SelectorError:
+            outcome, term = _terminate(session, writer, reason="schema_error")
+            return _emit_artifact(session, config, outcome, term, writer)
+        except SelectorBudgetExceeded:
+            outcome, term = _terminate(session, writer, reason="budget_exceeded")
+            return _emit_artifact(session, config, outcome, term, writer)
+
+        session.active_panel = list(selection.selected_agents)
+        # coordinator id is unchanged: run_selector enforces
+        # selection.coordinator_agent == config.coordinator.id.
+        if writer:
+            writer.write_selector_output(selection)
+
+        # 3) round loop
+        outcome, term = _run_rounds(session, writer)
+
+        # 4) emit artifact
         return _emit_artifact(session, config, outcome, term, writer)
-    except SelectorBudgetExceeded:
-        outcome, term = _terminate(session, writer, reason="budget_exceeded")
-        return _emit_artifact(session, config, outcome, term, writer)
+    except BaseException:
+        # Crash containment: an exception escaping the round loop (or the
+        # artifact emit) would otherwise leave the manifest `in_progress`
+        # forever, the journal fd open, and the lock released only by GC.
+        # Mark the manifest `crashed` and tear the writer down, then let the
+        # exception surface to the caller.
+        if writer is not None:
+            try:
+                writer.mark_crashed()
+            except Exception:  # noqa: BLE001 — teardown must not mask the crash
+                pass
+        raise
+    finally:
+        _shutdown_providers(providers, selector_providers)
 
-    session.active_panel = list(selection.selected_agents)
-    # coordinator id is unchanged: run_selector enforces
-    # selection.coordinator_agent == config.coordinator.id.
-    if writer:
-        writer.write_selector_output(selection)
 
-    # 3) round loop
-    outcome, term = _run_rounds(session, writer)
+def _check_agent_id_uniqueness(config: Config) -> None:
+    """Reject duplicate agent ids / panel entries before any turn runs."""
+    seen: set = set()
+    for ac in config.agents:
+        if ac.id in seen:
+            raise ValueError(f"config.agents contains duplicate agent id {ac.id!r}")
+        seen.add(ac.id)
+    if config.coordinator.id in seen:
+        raise ValueError(
+            f"coordinator id {config.coordinator.id!r} collides with a panel agent id"
+        )
+    panel = config.selector.default_deliberation_panel
+    if len(set(panel)) != len(panel):
+        dupes = sorted({aid for aid in panel if panel.count(aid) > 1})
+        raise ValueError(
+            f"selector.default_deliberation_panel contains duplicate entries: {dupes}"
+        )
 
-    # 4) emit artifact
-    return _emit_artifact(session, config, outcome, term, writer)
+
+def _shutdown_providers(*provider_maps: Optional[Dict[str, _ProviderAdapter]]) -> None:
+    """Best-effort `shutdown()` of session-owned adapters at run teardown.
+
+    HTTP-backed adapters own one `httpx.Client` each; without this call
+    every session leaked a client per provider. Adapters without a
+    `shutdown` method (FakeProvider, CLI adapters) are skipped, and
+    failures are swallowed — teardown must never mask the session outcome.
+    """
+    released: set = set()
+    for pmap in provider_maps:
+        if not pmap:
+            continue
+        for adapter in pmap.values():
+            if id(adapter) in released:
+                continue
+            released.add(id(adapter))
+            shutdown = getattr(adapter, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _emit_artifact(session, config, outcome, term, writer):
@@ -939,6 +1035,10 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
 
         breach = _budget_gate(session)
         if breach:
+            # The breach fired at round-open, before any turn of the new
+            # round was held: report the last round that actually ran, not
+            # the empty one (final_round would otherwise over-count by one).
+            session.round -= 1
             return _terminate(session, writer, reason=breach)
 
         # §4.6 deferred queue drain (at round-open, before any primary_turn)
@@ -951,6 +1051,12 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
 
         # §4.2 step 1–3: panel members in declared order
         for agent_id in list(session.active_panel):
+            # The iteration runs over a snapshot while contraction edits the
+            # LIVE panel: an agent contracted mid-round (e.g. as the failed
+            # target of an earlier member's inline branch) must not still
+            # take its primary turn this round.
+            if agent_id not in session.active_panel:
+                continue
             breach = _budget_gate(session)
             if breach:
                 return _terminate(session, writer, reason=breach)
@@ -982,7 +1088,14 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                     )
                 continue
             assert inv.result is not None and inv.result.structured_output is not None
-            tso = TurnStructuredOutput.model_validate(inv.result.structured_output)
+            try:
+                tso = TurnStructuredOutput.model_validate(inv.result.structured_output)
+            except ValidationError:
+                # A provider reporting success with a non-conforming dict
+                # (unvalidated FakeProvider script, third-party adapter) must
+                # terminate as a schema error with a persisted artifact —
+                # not crash the run (§4.9).
+                return _terminate(session, writer, reason="schema_error")
 
             primary_msg = Message(
                 id=_new_id(),
@@ -1083,7 +1196,12 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             )
         assert inv.result is not None and inv.result.structured_output is not None
 
-        verdict = Verdict.model_validate(inv.result.structured_output)
+        try:
+            verdict = Verdict.model_validate(inv.result.structured_output)
+        except ValidationError:
+            # Same self-defense as the panel turns: a non-conforming verdict
+            # dict terminates with schema_error instead of crashing mid-run.
+            return _terminate(session, writer, reason="schema_error")
         coord_msg = Message(
             id=_new_id(),
             speaker=coord_id,
@@ -1205,9 +1323,26 @@ def _dispatch_branch(
         _append_panel_contraction(session, writer, target, inv.contraction_reason)
         if target in session.active_panel:
             session.active_panel.remove(target)
+        if not session.active_panel:
+            # Mirror the primary path's empty-panel check: contracting the
+            # last member must terminate the run — the next ContextPacket
+            # would otherwise be derived over an empty panel_disclosure
+            # (min_length 1) and crash with an uncaught ValidationError.
+            return _BranchTermination(
+                reason="provider_unrecoverable",
+                last_error=inv.last_error,
+                target=target,
+            )
         return None
     assert inv.result is not None and inv.result.structured_output is not None
-    tso = TurnStructuredOutput.model_validate(inv.result.structured_output)
+    try:
+        tso = TurnStructuredOutput.model_validate(inv.result.structured_output)
+    except ValidationError:
+        # Same self-defense as the primary path: a non-conforming branch
+        # payload terminates with schema_error instead of crashing.
+        return _BranchTermination(
+            reason="schema_error", last_error=inv.last_error, target=target,
+        )
 
     # §4.5 B→C suppression: branch-origin direct_requests become
     # `suggested_followups`, never dispatched.
@@ -1252,6 +1387,23 @@ def _drain_deferred_queue(
             active_panel=session.active_panel,
             coordinator=session.config.coordinator.id,
         ):
+            # Record the drop on the originating message, mirroring the
+            # enqueue-time schema_failure records — pre-fix these requests
+            # were popped with no transcript trace at all. The parent's
+            # journal line was written at append time, so the record
+            # surfaces in the canonical_transcript (the authoritative
+            # artifact), which is also where the enqueue-time records live.
+            record = SchemaFailureRecord(
+                offending_request=request.model_dump(exclude_none=True),
+                reason=(
+                    "deferred direct_request no longer routable at drain time "
+                    "(target left active_panel, is originator, or is coordinator)"
+                ),
+            )
+            if parent_msg.schema_failure:
+                parent_msg.schema_failure.append(record)
+            else:
+                parent_msg.schema_failure = [record]
             continue
         bt = _dispatch_branch(
             session, writer, parent_msg=parent_msg, request=request,
@@ -1291,7 +1443,17 @@ def _try_synthesis(
         session, agent_id=coord_id, request=req, attempts_override=attempts_override,
     )
     if inv.ok and inv.result is not None and inv.result.structured_output is not None:
-        sc = SynthesisContent.model_validate(inv.result.structured_output)
+        try:
+            sc = SynthesisContent.model_validate(inv.result.structured_output)
+        except ValidationError as exc:
+            # Report the malformed synthesis as a provider-shaped failure so
+            # `_attempt_finalize` classifies it as schema_error and the
+            # salvage path falls through to a normal termination.
+            return None, ProviderError(
+                kind="malformed_response",
+                message=f"synthesis structured_output failed schema validation: {exc}",
+                retriable=False,
+            )
         synth_msg = Message(
             id=_new_id(),
             speaker=coord_id,
@@ -1319,13 +1481,19 @@ def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
     if outcome is not None:
         return outcome, None
 
-    # Synthesis failed → terminate with provider_unrecoverable (R2).
+    # Synthesis failed → terminate (R2). malformed_response / invalid_request
+    # classify as schema_error; everything else stays provider_unrecoverable.
     # Codex T2 #2b: carry the coordinator's last error into the artifact
     # so synthesis-time provider failures are diagnosable too.
     # allow_synthesis=False: we just tried to synthesize and it failed; the
     # salvage path inside _terminate must not attempt it a second time.
+    reason = (
+        _classify_unrecoverable(last_error.kind)
+        if last_error is not None
+        else "provider_unrecoverable"
+    )
     return _terminate(
-        session, writer, reason="provider_unrecoverable", allow_synthesis=False,
+        session, writer, reason=reason, allow_synthesis=False,
         last_provider_failure=_failure_from(session, coord_id, last_error),
     )
 

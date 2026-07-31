@@ -34,6 +34,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError
+
 from symposium.models import (
     Config,
     ProviderRequest,
@@ -67,7 +69,15 @@ def select_llm(
         provider.last_request_round = None  # type: ignore[attr-defined]
         provider.last_request_turn_index = None  # type: ignore[attr-defined]
 
-    result = provider.invoke(request)
+    try:
+        result = provider.invoke(request)
+    except Exception as exc:  # noqa: BLE001 — the §6.1 contract reports
+        # failures via result.error, but a third-party adapter can raise
+        # anything; surface it as a SelectorError so `run_session` maps it
+        # to a schema_error termination instead of crashing before round 1.
+        raise SelectorError(
+            f"llm selector provider invocation raised: {exc}"
+        ) from exc
 
     # --- §4.7 selector-budget cap: accumulate then check BEFORE parsing ----
     budget = _selector_budget(config)
@@ -209,14 +219,22 @@ def _payload_to_output(config: Config, payload: Dict[str, Any]) -> SelectorOutpu
     if reasoning is not None and not isinstance(reasoning, str):
         raise SelectorError("llm selector reasoning must be a string")
 
-    return SelectorOutput(
-        strategy="llm",
-        selected_agents=list(selected),
-        coordinator_agent=coordinator,
-        excluded_agents=excluded or None,
-        missing_capabilities=missing or None,
-        reasoning=reasoning,
-    )
+    try:
+        return SelectorOutput(
+            strategy="llm",
+            selected_agents=list(selected),
+            coordinator_agent=coordinator,
+            excluded_agents=excluded or None,
+            missing_capabilities=missing or None,
+            reasoning=reasoning,
+        )
+    except ValidationError as exc:
+        # e.g. a non-string coordinator_agent or an empty-string agent id
+        # slipping past the checks above — a malformed selection, not a
+        # runtime crash.
+        raise SelectorError(
+            f"llm selector output failed SelectorOutput validation: {exc}"
+        ) from exc
 
 
 def _parse_exclusions(raw: Any) -> List[SelectorExclusion]:
