@@ -64,12 +64,15 @@ from symposium.models import (
     ProviderRequestMessage,
     ProviderResult,
     ToolEvent,
+    Usage,
 )
+from symposium.providers._cli_env import effective_timeout
 from symposium.providers._http_common import (
     UsageAccum,
     build_corrective_request,
     http_error_result,
     malformed_result,
+    merge_usage,
     normalize_tool_result,
     safe_raw,
     usage_from,
@@ -172,41 +175,75 @@ class OpenAIProvider(ProviderAdapter):
         self._tool_handlers[name] = handler
 
     def invoke(self, request: ProviderRequest) -> ProviderResult:
-        first = self._invoke_once(request)
+        # The scheduler's deadline-aware path budgets the WHOLE invocation
+        # — tool iterations plus the §6.7 corrective retry — via
+        # `request.metadata["symposium_timeout_seconds"]`, the same contract
+        # the CLI adapters honor. Split the budget across both passes so a
+        # single invoke can never overrun the wall-clock the scheduler
+        # reserved for the eventual synthesis.
+        budget = effective_timeout(request, self._timeout)
+        start = time.monotonic()
+        first = self._invoke_once(request, budget=budget)
         if first.error is not None and first.error.kind == "malformed_response":
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                return first
             corrective = self._build_corrective_request(request, first)
-            second = self._invoke_once(corrective)
-            if second.error is None:
-                return second
-            return second
+            second = self._invoke_once(corrective, budget=remaining)
+            # The first attempt consumed real tokens and money; fold its
+            # usage into the returned result so budget accounting sees
+            # both passes, not just the corrective one.
+            return second.model_copy(
+                update={"usage": merge_usage(first.usage, second.usage)}
+            )
         return first
 
     # ------------------------------------------------------------------
     # Single-pass invocation
     # ------------------------------------------------------------------
 
-    def _invoke_once(self, request: ProviderRequest) -> ProviderResult:
+    def _invoke_once(self, request: ProviderRequest, *, budget: float) -> ProviderResult:
         body = self._build_request_body(request)
         aggregate = UsageAccum()
         tool_events: List[ToolEvent] = []
         iteration = 0
         current_messages: List[Dict[str, Any]] = list(body["messages"])
+        start = time.monotonic()
 
         while True:
             body["messages"] = current_messages
+
+            # Wall-clock budget check: without it a tool loop of N
+            # iterations could run N × timeout, silently overrunning the
+            # scheduler's per-turn deadline. The remaining budget doubles
+            # as the per-request httpx timeout below.
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                return http_error_result(
+                    kind="timeout",
+                    message=(
+                        f"per-turn budget of {budget:.1f}s exhausted after "
+                        f"{iteration} tool iteration(s)"
+                    ),
+                    retriable=True,
+                    usage=self._usage(request.model, aggregate),
+                    raw=None,
+                    tool_events=tool_events,
+                )
 
             try:
                 resp = self._http.post(
                     f"{self._base_url}/chat/completions",
                     json=body,
                     headers=self._auth_headers(),
+                    timeout=remaining,
                 )
             except httpx.TimeoutException as exc:
                 return http_error_result(
                     kind="timeout",
                     message=f"request timed out: {exc}",
                     retriable=True,
-                    usage=usage_from(aggregate, cost=0.0),
+                    usage=self._usage(request.model, aggregate),
                     raw=None,
                     tool_events=tool_events,
                 )
@@ -215,13 +252,15 @@ class OpenAIProvider(ProviderAdapter):
                     kind="network",
                     message=f"network error: {exc}",
                     retriable=True,
-                    usage=usage_from(aggregate, cost=0.0),
+                    usage=self._usage(request.model, aggregate),
                     raw=None,
                     tool_events=tool_events,
                 )
 
             if resp.status_code != 200:
-                return self._classify_http_error(resp, aggregate, tool_events)
+                return self._classify_http_error(
+                    resp, aggregate, tool_events, request.model
+                )
 
             try:
                 data = resp.json()
@@ -230,7 +269,7 @@ class OpenAIProvider(ProviderAdapter):
                     kind="internal",
                     message=f"could not parse JSON response body: {exc}",
                     retriable=False,
-                    usage=usage_from(aggregate, cost=0.0),
+                    usage=self._usage(request.model, aggregate),
                     raw=None,
                     tool_events=tool_events,
                 )
@@ -245,7 +284,7 @@ class OpenAIProvider(ProviderAdapter):
                     kind="internal",
                     message="response missing choices[0]",
                     retriable=False,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     raw=safe_raw(data),
                     tool_events=tool_events,
                 )
@@ -262,7 +301,7 @@ class OpenAIProvider(ProviderAdapter):
                         )
                     ],
                     tool_events=tool_events,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     finish_reason="content_filter",
                     structured_output=None,
                     raw=safe_raw(data),
@@ -275,7 +314,12 @@ class OpenAIProvider(ProviderAdapter):
                 )
 
             tool_calls = message.get("tool_calls") or []
-            if tool_calls and vendor_finish in ("tool_calls", "function_call"):
+            # Enter the loop whenever tool_calls is populated, regardless
+            # of the vendor finish_reason: some OpenAI-compatible servers
+            # report `stop` alongside a non-empty tool_calls array, and
+            # gating on the finish_reason turned those into a misleading
+            # "empty content" internal error.
+            if tool_calls:
                 if iteration >= self._max_tool_iterations:
                     return http_error_result(
                         kind="tool_failure",
@@ -284,7 +328,7 @@ class OpenAIProvider(ProviderAdapter):
                             "loop cap reached without a terminal response"
                         ),
                         retriable=False,
-                        usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                        usage=self._usage(request.model, aggregate),
                         raw=safe_raw(data),
                         tool_events=tool_events,
                     )
@@ -314,7 +358,7 @@ class OpenAIProvider(ProviderAdapter):
                             )
                         ],
                         tool_events=tool_events,
-                        usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                        usage=self._usage(request.model, aggregate),
                         finish_reason="error",
                         structured_output=None,
                         raw=safe_raw(data),
@@ -325,8 +369,41 @@ class OpenAIProvider(ProviderAdapter):
                 iteration += 1
                 continue
 
-            # Terminal — parse + validate structured output.
+            # Terminal — free-text vs structured handling.
             content_str = message.get("content")
+            free_text = request.expected_output_schema in (None, "null")
+
+            # Truncation MUST be classified BEFORE any JSON parsing: a
+            # response cut off at the token cap is almost never valid
+            # JSON, and parsing it first would misfile the failure as a
+            # retriable `malformed_response` — dooming the corrective
+            # retry (and every runtime retry) at the very same cap.
+            if not free_text and vendor_finish == "length":
+                return ProviderResult(
+                    messages=[
+                        ProviderRawMessage(
+                            role=message.get("role") or "assistant",
+                            content=content_str if isinstance(content_str, str) else "",
+                        )
+                    ],
+                    tool_events=tool_events,
+                    usage=self._usage(request.model, aggregate),
+                    finish_reason="length",
+                    structured_output=None,
+                    raw=safe_raw(data),
+                    error=ProviderError(
+                        kind="context_length_exceeded",
+                        message=(
+                            "output truncated: finish_reason=length hit the "
+                            "completion token cap before the structured output "
+                            "completed; retrying at the same cap cannot "
+                            "succeed — raise sampling.max_tokens"
+                        ),
+                        retriable=False,
+                        details={"vendor_finish_reason": "length"},
+                    ),
+                )
+
             if not isinstance(content_str, str) or content_str == "":
                 return ProviderResult(
                     messages=[
@@ -336,7 +413,7 @@ class OpenAIProvider(ProviderAdapter):
                         )
                     ],
                     tool_events=tool_events,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     finish_reason="error",
                     structured_output=None,
                     raw=safe_raw(data),
@@ -347,14 +424,59 @@ class OpenAIProvider(ProviderAdapter):
                     ),
                 )
 
+            # Free-text path (no expected schema — the §4.1 llm selector):
+            # the model legitimately answers in prose, so force-parsing it
+            # as JSON is wrong twice over (prose → spurious
+            # malformed_response; a JSON scalar/array → a non-dict
+            # structured_output that would raise out of invoke()). Return
+            # the raw text, mirroring the CLI adapters.
+            if free_text:
+                canonical_finish = _normalize_finish_reason(vendor_finish)
+                if canonical_finish == "error":
+                    return ProviderResult(
+                        messages=[
+                            ProviderRawMessage(
+                                role=message.get("role") or "assistant",
+                                content=content_str,
+                            )
+                        ],
+                        tool_events=tool_events,
+                        usage=self._usage(request.model, aggregate),
+                        finish_reason="error",
+                        structured_output=None,
+                        raw=safe_raw(data),
+                        error=ProviderError(
+                            kind="internal",
+                            message=(
+                                f"vendor finish_reason {vendor_finish!r} arrived "
+                                "terminally with no consumable tool_calls"
+                            ),
+                            retriable=False,
+                            details={"vendor_finish_reason": vendor_finish},
+                        ),
+                    )
+                return ProviderResult(
+                    messages=[
+                        ProviderRawMessage(
+                            role=message.get("role") or "assistant",
+                            content=content_str,
+                        )
+                    ],
+                    tool_events=tool_events,
+                    usage=self._usage(request.model, aggregate),
+                    finish_reason=canonical_finish,
+                    structured_output=None,
+                    raw=safe_raw(data),
+                    error=None,
+                )
+
             try:
                 structured = json.loads(content_str)
             except json.JSONDecodeError as exc:
                 return malformed_result(
                     request=request,
                     content_str=content_str,
-                    aggregate=aggregate,
-                    cost=self._cost(request.model, aggregate),
+                    usage=self._usage(request.model, aggregate),
                     tool_events=tool_events,
                     raw=safe_raw(data),
                     failing_path="<root>",
@@ -366,8 +488,7 @@ class OpenAIProvider(ProviderAdapter):
                 return malformed_result(
                     request=request,
                     content_str=content_str,
-                    aggregate=aggregate,
-                    cost=self._cost(request.model, aggregate),
+                    usage=self._usage(request.model, aggregate),
                     tool_events=tool_events,
                     raw=safe_raw(data),
                     failing_path=failure["failing_path"],
@@ -390,7 +511,7 @@ class OpenAIProvider(ProviderAdapter):
                         )
                     ],
                     tool_events=tool_events,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     finish_reason="error",
                     structured_output=None,
                     raw=safe_raw(data),
@@ -412,7 +533,7 @@ class OpenAIProvider(ProviderAdapter):
                     )
                 ],
                 tool_events=tool_events,
-                usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                usage=self._usage(request.model, aggregate),
                 finish_reason=canonical_finish,
                 structured_output=structured,
                 raw=safe_raw(data),
@@ -468,7 +589,27 @@ class OpenAIProvider(ProviderAdapter):
 
             schema = tool_desc.get("input_schema") or {}
             try:
+                jsonschema.Draft202012Validator.check_schema(schema)
                 jsonschema.Draft202012Validator(schema).validate(args)
+            except jsonschema.SchemaError as exc:
+                # The tool's OWN input_schema is broken (config bug) —
+                # surface as tool_failure instead of letting SchemaError
+                # escape invoke() (errors-via-result contract).
+                err = ProviderError(
+                    kind="tool_failure",
+                    message=f"tool input_schema is not a valid JSON Schema: {exc.message}",
+                    retriable=False,
+                    details={"tool_name": name, "validator_message": exc.message},
+                )
+                tool_events.append(
+                    ToolEvent(
+                        name=name,
+                        arguments=args if isinstance(args, dict) else {},
+                        result=None,
+                        error=err,
+                    )
+                )
+                return err
             except jsonschema.ValidationError as exc:
                 err = ProviderError(
                     kind="tool_failure",
@@ -576,7 +717,11 @@ class OpenAIProvider(ProviderAdapter):
         ):
             body["response_format"] = {"type": "json_object"}
         reasoning_effort = getattr(request, "reasoning_effort", None)
-        if reasoning_effort:
+        if reasoning_effort and _supports_reasoning_effort(request.model):
+            # Only reasoning-capable families accept the parameter; the
+            # gpt-4o generation 400s on it (a non-retriable failure for
+            # what is only a hint). Elsewhere we mirror the Anthropic
+            # adapter's posture and silently drop it (§6.2).
             body["reasoning_effort"] = reasoning_effort
         sampling = request.sampling or {}
         for key in ("temperature", "top_p", "seed", "max_tokens", "stop", "stop_sequences"):
@@ -601,6 +746,7 @@ class OpenAIProvider(ProviderAdapter):
         resp: httpx.Response,
         aggregate: UsageAccum,
         tool_events: List[ToolEvent],
+        model: str,
     ) -> ProviderResult:
         status = resp.status_code
         try:
@@ -649,14 +795,16 @@ class OpenAIProvider(ProviderAdapter):
             retry_after = resp.headers.get("retry-after")
             if retry_after:
                 try:
-                    details["retry_after_seconds"] = int(float(retry_after))
+                    # Keep the float: truncating a sub-second Retry-After
+                    # to int(0) would produce a zero-sleep retry.
+                    details["retry_after_seconds"] = float(retry_after)
                 except ValueError:
                     pass
 
         return ProviderResult(
             messages=[],
             tool_events=tool_events,
-            usage=usage_from(aggregate, cost=0.0),
+            usage=self._usage(model, aggregate),
             finish_reason="error",
             structured_output=None,
             raw=safe_raw(body),
@@ -709,22 +857,28 @@ class OpenAIProvider(ProviderAdapter):
     # Cost
     # ------------------------------------------------------------------
 
-    def _cost(self, model: str, aggregate: UsageAccum) -> float:
+    def _prices_for(self, model: str) -> Optional[Tuple[float, float]]:
         prices = self._price_table.get(model)
         if prices is None:
             # Heuristic: try a prefix match (e.g. gpt-4o-mini-2024-07-18 → gpt-4o-mini).
             for known, p in self._price_table.items():
                 if model.startswith(known):
-                    prices = p
-                    break
+                    return p
+        return prices
+
+    def _usage(self, model: str, aggregate: UsageAccum) -> Usage:
+        prices = self._prices_for(model)
         if prices is None:
-            return 0.0
+            # No price row for this model: 0.0 is a placeholder, not a
+            # measurement — flag it estimated (§6.9).
+            return usage_from(aggregate, cost=0.0, estimated=True)
         prompt_per_1k, completion_per_1k = prices
-        return round(
+        cost = round(
             (aggregate.prompt / 1000.0) * prompt_per_1k
             + (aggregate.completion / 1000.0) * completion_per_1k,
             6,
         )
+        return usage_from(aggregate, cost=cost)
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +892,17 @@ def _translate_message(m: ProviderRequestMessage) -> Dict[str, Any]:
     if m.tool_call_id is not None:
         entry["tool_call_id"] = m.tool_call_id
     return entry
+
+
+def _supports_reasoning_effort(model: str) -> bool:
+    """Whether `model` accepts the `reasoning_effort` parameter.
+
+    Only the reasoning families (o-series, gpt-5 generation) do; sending
+    it to a non-reasoning model (gpt-4o and friends) is a 400. Prefix
+    matching keeps dated snapshots (`o3-mini-2025-...`) covered.
+    """
+    m = model.lower()
+    return m.startswith(("o1", "o3", "o4", "gpt-5"))
 
 
 def _normalize_finish_reason(vendor_finish: Optional[str]) -> str:

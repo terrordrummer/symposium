@@ -73,10 +73,11 @@ from symposium.models import (
 )
 from symposium.providers._cli_env import (
     claude_child_env,
+    classify_cli_exit,
     effective_timeout,
     run_in_process_group,
 )
-from symposium.providers._http_common import validate_structured_output
+from symposium.providers._http_common import merge_usage, validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
 DEFAULT_CLAUDE_BINARY = "claude"
@@ -236,7 +237,12 @@ class ClaudeCliProvider(ProviderAdapter):
                 f"`{details.get('failing_path')}`: {details.get('validator_message')}. "
                 "Re-emit ONLY the structured object that conforms to the schema."
             )
-            return self._invoke_once(request, system_suffix=suffix, timeout=remaining)
+            second = self._invoke_once(request, system_suffix=suffix, timeout=remaining)
+            # The first attempt consumed real tokens; fold its usage into
+            # the returned result so budget accounting sees both passes.
+            return second.model_copy(
+                update={"usage": merge_usage(first.usage, second.usage)}
+            )
         return first
 
     # ------------------------------------------------------------------
@@ -302,11 +308,11 @@ class ClaudeCliProvider(ProviderAdapter):
 
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
-            kind = "rate_limit" if "rate" in stderr.lower() else "internal"
+            kind, retriable = classify_cli_exit(stderr)
             return _error_result(
                 kind,
                 f"claude CLI exited {proc.returncode}: {stderr[:500] or '<no stderr>'}",
-                retriable=(kind == "rate_limit"),
+                retriable=retriable,
             )
 
         try:
@@ -316,6 +322,18 @@ class ClaudeCliProvider(ProviderAdapter):
                 "internal", f"could not parse claude CLI JSON output: {exc}", False
             )
 
+        if not isinstance(data, dict):
+            # rc=0 with `null` / an array on stdout: syntactically valid
+            # JSON, but not the result envelope — treat as a malformed
+            # response rather than crashing on `data.get(...)`.
+            return _error_result(
+                "malformed_response",
+                f"claude CLI emitted non-object JSON output ({type(data).__name__})",
+                True,
+            )
+
+        usage = _usage_from_cli(data)
+
         if data.get("is_error") or data.get("subtype") not in (None, "success"):
             return _error_result(
                 "internal",
@@ -323,10 +341,20 @@ class ClaudeCliProvider(ProviderAdapter):
                 f"{data.get('api_error_status') or ''}".strip(),
                 retriable=False,
                 raw=_safe(data),
+                usage=usage,
             )
 
-        usage = _usage_from_cli(data)
         finish = _finish_reason(data.get("stop_reason"))
+        if finish == "error":
+            # Unknown stop_reason terminally — align with the anthropic
+            # adapter: surface an internal error instead of a clean stop.
+            return _error_result(
+                "internal",
+                f"claude CLI returned unexpected stop_reason: {data.get('stop_reason')!r}",
+                retriable=False,
+                raw=_safe(data),
+                usage=usage,
+            )
         result_text = data.get("result") if isinstance(data.get("result"), str) else ""
 
         # Free-text path (null schema): no structured validation (§4.1 llm selector).
@@ -409,7 +437,11 @@ def _split_prompt(request: ProviderRequest) -> tuple[str, str]:
             system_prompt = text
         else:
             body.append(text)
-    return system_prompt, "\n\n".join(body) if body else (system_prompt or "")
+    if body:
+        return system_prompt, "\n\n".join(body)
+    # System-only message list: emit the text once as the prompt body
+    # instead of duplicating it behind the [SYSTEM] sentinel.
+    return "", system_prompt
 
 
 def _safe_int(v: Any) -> int:
@@ -450,7 +482,9 @@ def _finish_reason(stop_reason: Optional[str]) -> str:
         return "length"
     if stop_reason == "refusal":
         return "content_filter"
-    return "stop"
+    # Unknown vendor value — align with the anthropic adapter (§6.10):
+    # collapse to `error` rather than report a clean finish.
+    return "error"
 
 
 def _safe(data: Any) -> Optional[Dict[str, Any]]:
@@ -458,12 +492,18 @@ def _safe(data: Any) -> Optional[Dict[str, Any]]:
 
 
 def _error_result(
-    kind: str, message: str, retriable: bool, *, raw: Optional[Dict[str, Any]] = None
+    kind: str,
+    message: str,
+    retriable: bool,
+    *,
+    raw: Optional[Dict[str, Any]] = None,
+    usage: Optional[Usage] = None,
 ) -> ProviderResult:
     return ProviderResult(
         messages=[],
         tool_events=[],
-        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=0.0),
+        usage=usage
+        or Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=0.0),
         finish_reason="error",
         structured_output=None,
         raw=raw,

@@ -56,12 +56,37 @@ class UsageAccum:
         return self.prompt + self.completion
 
 
-def usage_from(aggregate: UsageAccum, *, cost: float) -> Usage:
+def usage_from(aggregate: UsageAccum, *, cost: float, estimated: bool = False) -> Usage:
+    """Convert an accumulator into a canonical `Usage`.
+
+    `estimated` MUST be True whenever `cost` is a placeholder rather than
+    a computed figure — notably the unknown-model fallback where the
+    adapter has no price row and reports 0.0 (§6.9). Without the flag a
+    zero would read as an exact measurement downstream.
+    """
     return Usage(
         prompt_tokens=aggregate.prompt,
         completion_tokens=aggregate.completion,
         total_tokens=aggregate.total,
         cost_usd=cost,
+        estimated=estimated,
+    )
+
+
+def merge_usage(first: Usage, second: Usage) -> Usage:
+    """Sum the usage of two provider passes into one canonical `Usage`.
+
+    Used by the §6.7 corrective-retry path: the malformed first attempt
+    consumed real tokens and real money, so its usage must be folded into
+    the usage of the result the adapter ultimately returns — otherwise
+    budget accounting only ever sees the second call.
+    """
+    return Usage(
+        prompt_tokens=first.prompt_tokens + second.prompt_tokens,
+        completion_tokens=first.completion_tokens + second.completion_tokens,
+        total_tokens=first.total_tokens + second.total_tokens,
+        cost_usd=round(first.cost_usd + second.cost_usd, 6),
+        estimated=bool(first.estimated) or bool(second.estimated),
     )
 
 
@@ -142,8 +167,7 @@ def malformed_result(
     *,
     request: ProviderRequest,
     content_str: str,
-    aggregate: UsageAccum,
-    cost: float,
+    usage: Usage,
     tool_events: List[ToolEvent],
     raw: Optional[Dict[str, Any]],
     failing_path: str,
@@ -160,7 +184,7 @@ def malformed_result(
     return ProviderResult(
         messages=[ProviderRawMessage(role="assistant", content=content_str or "")],
         tool_events=tool_events,
-        usage=usage_from(aggregate, cost=cost),
+        usage=usage,
         finish_reason="error",
         structured_output=None,
         raw=raw,

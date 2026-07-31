@@ -475,7 +475,11 @@ def test_tool_loop_single_iteration(respx_mock):
     "vendor_reason, canonical, expect_error",
     [
         ("stop", "stop", False),
-        ("length", "length", False),
+        # `length` terminally means the completion was truncated at the
+        # token cap — surfaced as finish_reason="length" with a
+        # non-retriable error (see
+        # test_length_truncation_is_length_not_malformed).
+        ("length", "length", True),
         ("content_filter", "content_filter", True),
         # tool_calls / function_call / None should NEVER appear terminally
         # under the internal loop; if they do, they collapse to `error`.
@@ -525,10 +529,16 @@ def test_finish_reason_normalization(respx_mock, vendor_reason, canonical, expec
     respx_mock.post("/chat/completions").mock(return_value=httpx.Response(200, json=body))
     result = _provider().invoke(_request())
 
-    if vendor_reason in ("stop", "length"):
+    if vendor_reason == "stop":
         # Happy path: error is None, structured_output validated.
         assert result.error is None
         assert result.finish_reason == canonical
+    elif vendor_reason == "length":
+        # Truncated at the token cap: `length` finish plus a
+        # non-retriable error — never a clean success.
+        assert result.finish_reason == "length"
+        assert result.error is not None
+        assert result.error.retriable is False
     else:
         # Vendor-reason cases that don't yield a valid response:
         # content_filter has its own error.kind; tool_calls/function_call/None
@@ -633,6 +643,358 @@ def test_credentials_never_leak_into_persisted_artifact(tmp_path, respx_mock, mo
         text = p.read_text()
         assert API_KEY not in text, f"API key leaked into {p}"
     assert found_any, "no persisted files were found under the run directory"
+
+
+# ---------------------------------------------------------------------------
+# Corrective-retry usage accounting
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_corrective_retry_usage_includes_first_attempt(respx_mock):
+    """The malformed first attempt consumed real tokens and money; the
+    returned result's usage must be the SUM of both passes, not just the
+    corrective one."""
+    bad = _ok_response(structured={"not_the_right_field": 42})
+    good = _ok_response(structured=_valid_turn())
+    respx_mock.post("/chat/completions").mock(
+        side_effect=[httpx.Response(200, json=bad), httpx.Response(200, json=good)]
+    )
+    result = _provider().invoke(_request())
+    assert result.error is None
+    assert respx_mock.calls.call_count == 2
+    # Each pass reported 100 prompt / 30 completion tokens.
+    assert result.usage.prompt_tokens == 200
+    assert result.usage.completion_tokens == 60
+    assert result.usage.total_tokens == 260
+    # Cost doubles with the tokens (gpt-4o-mini price row).
+    assert result.usage.cost_usd == pytest.approx(0.000066, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# length truncation classification
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_length_truncation_is_length_not_malformed(respx_mock):
+    """Truncated JSON + finish_reason=length must classify as a
+    non-retriable `length` outcome BEFORE JSON parsing — not as a
+    retriable malformed_response whose corrective retry is doomed at the
+    very same cap."""
+    truncated = {
+        "id": "chatcmpl-trunc",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": '{"text": "cut of'},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 512, "total_tokens": 612},
+    }
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=truncated)
+    )
+    result = _provider().invoke(_request())
+    assert result.finish_reason == "length"
+    assert result.error is not None
+    assert result.error.kind == "context_length_exceeded"
+    assert result.error.retriable is False
+    assert "truncated" in result.error.message
+    # No corrective retry was issued: one upstream call only.
+    assert respx_mock.calls.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Free-text path (expected_output_schema = null)
+# ---------------------------------------------------------------------------
+
+
+def _free_text_response(text: str) -> Dict[str, Any]:
+    return {
+        "id": "chatcmpl-free",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 40, "completion_tokens": 12, "total_tokens": 52},
+    }
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_free_text_prose_with_no_schema_is_ok(respx_mock):
+    """With no expected schema (the §4.1 llm selector) prose must come
+    back verbatim — not be force-parsed into a malformed_response."""
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=_free_text_response("A prose answer."))
+    )
+    result = _provider().invoke(_request(expected=None))
+    assert result.error is None
+    assert result.finish_reason == "stop"
+    assert result.structured_output is None
+    assert result.messages[0].content == "A prose answer."
+    assert respx_mock.calls.call_count == 1
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_free_text_json_array_with_no_schema_is_ok(respx_mock):
+    """A JSON-array answer on the free-text path must NOT be parsed into
+    `structured_output` — a non-dict there would raise a ValidationError
+    out of invoke(), breaking the errors-via-result contract."""
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(
+            200, json=_free_text_response('["logician", "critic"]')
+        )
+    )
+    result = _provider().invoke(_request(expected=None))
+    assert result.error is None
+    assert result.structured_output is None
+    assert result.messages[0].content == '["logician", "critic"]'
+
+
+# ---------------------------------------------------------------------------
+# Per-turn deadline (`symposium_timeout_seconds`)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_per_turn_deadline_bounds_tool_loop(respx_mock, monkeypatch):
+    """The scheduler's `symposium_timeout_seconds` metadata budgets the
+    WHOLE invocation: it caps each HTTP request AND bounds the tool
+    loop's wall-clock instead of being silently ignored."""
+    import symposium.providers.openai as openai_mod
+
+    # A controllable clock: each tool call "takes" 60s. Only the handler
+    # advances it, so extra monotonic readers (httpx et al.) can't skew
+    # the arithmetic.
+    clock = {"v": 0.0}
+    monkeypatch.setattr(openai_mod.time, "monotonic", lambda: clock["v"])
+
+    def slow_tool(args):
+        clock["v"] += 60.0
+        return {"matches": []}
+
+    tool_call = _tool_call_response(
+        name="search_papers", arguments_json='{"query": "x"}'
+    )
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=tool_call)
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+    ]
+    # Adapter ceiling above the metadata hint, so the scheduler's 100s
+    # budget is the binding constraint.
+    prov = _provider(timeout=600.0, tool_handlers={"search_papers": slow_tool})
+    req = _request(tools=tools).model_copy(
+        update={"metadata": {"symposium_timeout_seconds": 100.0}}
+    )
+    result = prov.invoke(req)
+    assert result.error is not None
+    assert result.error.kind == "timeout"
+    assert result.error.retriable is True
+    # Two 60s tool iterations fit inside the loop before the 100s budget
+    # ran out — the third never starts.
+    assert respx_mock.calls.call_count == 2
+    assert len(result.tool_events) == 2
+    # Tokens burned before the bail-out are still reported.
+    assert result.usage.prompt_tokens == 400
+    assert result.usage.completion_tokens == 80
+    # The remaining budget is applied as the per-request httpx timeout.
+    assert respx_mock.calls[0].request.extensions["timeout"]["read"] == pytest.approx(100.0)
+    assert respx_mock.calls[1].request.extensions["timeout"]["read"] == pytest.approx(40.0)
+
+
+# ---------------------------------------------------------------------------
+# Tool-loop entry on permissive finish_reason
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_tool_loop_entered_on_stop_finish_with_tool_calls(respx_mock):
+    """Some OpenAI-compatible servers report finish_reason="stop" with a
+    populated tool_calls array; the adapter must still run the tool loop
+    instead of failing with a misleading empty-content internal error."""
+    tool_call = _tool_call_response(
+        name="search_papers", arguments_json='{"query": "x"}'
+    )
+    tool_call["choices"][0]["finish_reason"] = "stop"
+    final = _ok_response(structured=_valid_turn())
+    respx_mock.post("/chat/completions").mock(
+        side_effect=[httpx.Response(200, json=tool_call), httpx.Response(200, json=final)]
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+    ]
+    prov = _provider(tool_handlers={"search_papers": lambda args: {"ok": True}})
+    result = prov.invoke(_request(tools=tools))
+    assert result.error is None
+    assert result.finish_reason == "stop"
+    assert len(result.tool_events) == 1
+    assert respx_mock.calls.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Usage / cost accounting details
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_mid_tool_loop_http_error_keeps_usage_cost(respx_mock):
+    """An HTTP failure after a completed tool iteration must report the
+    real cost of the tokens burned so far, not a hardcoded 0.0."""
+    tool_call = _tool_call_response(
+        name="search_papers", arguments_json='{"query": "x"}'
+    )
+    respx_mock.post("/chat/completions").mock(
+        side_effect=[
+            httpx.Response(200, json=tool_call),
+            httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "Too many requests",
+                        "type": "tokens",
+                    }
+                },
+            ),
+        ]
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+    ]
+    prov = _provider(tool_handlers={"search_papers": lambda args: {"ok": True}})
+    result = prov.invoke(_request(tools=tools))
+    assert result.error is not None
+    assert result.error.kind == "rate_limit"
+    assert result.usage.prompt_tokens == 200
+    assert result.usage.completion_tokens == 40
+    # 200/1000 * 0.00015 + 40/1000 * 0.0006 = 0.00003 + 0.000024
+    assert result.usage.cost_usd == pytest.approx(0.000054, rel=1e-6)
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_sub_second_retry_after_is_preserved(respx_mock):
+    """A Retry-After of 0.5s must not be truncated to a zero-sleep 0."""
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Too many requests",
+                    "type": "tokens",
+                }
+            },
+            headers={"retry-after": "0.5"},
+        )
+    )
+    result = _provider().invoke(_request())
+    assert result.error is not None
+    assert result.error.details["retry_after_seconds"] == 0.5
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_unknown_model_zero_cost_is_flagged_estimated(respx_mock):
+    """With no price row the 0.0 cost is a placeholder, not a measurement
+    — the usage must carry estimated=True (§6.9)."""
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=_ok_response(structured=_valid_turn()))
+    )
+    result = _provider().invoke(_request(model="somebody-elses-model"))
+    assert result.error is None
+    assert result.usage.cost_usd == 0.0
+    assert result.usage.estimated is True
+
+
+# ---------------------------------------------------------------------------
+# Tool-schema robustness + reasoning_effort gating
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_broken_tool_input_schema_maps_to_tool_failure(respx_mock):
+    """A malformed input_schema must surface as tool_failure instead of
+    raising jsonschema.SchemaError out of invoke()."""
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_call_response(
+                name="search_papers", arguments_json='{"query": "x"}'
+            ),
+        )
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "not-a-type"}},
+            },
+        }
+    ]
+    prov = _provider(tool_handlers={"search_papers": lambda args: {}})
+    result = prov.invoke(_request(tools=tools))
+    assert result.error is not None
+    assert result.error.kind == "tool_failure"
+    assert "JSON Schema" in result.error.message
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_reasoning_effort_gated_by_model_family(respx_mock):
+    """`reasoning_effort` must only reach reasoning-capable families —
+    the gpt-4o generation 400s on the parameter, so the hint is silently
+    dropped there (mirroring the anthropic adapter)."""
+    respx_mock.post("/chat/completions").mock(
+        return_value=httpx.Response(200, json=_ok_response(structured=_valid_turn()))
+    )
+    prov = _provider()
+
+    req = _request(model="gpt-4o-mini").model_copy(update={"reasoning_effort": "high"})
+    prov.invoke(req)
+    sent = json.loads(respx_mock.calls[0].request.content)
+    assert "reasoning_effort" not in sent
+
+    for model in ("o3-mini", "gpt-5"):
+        req = _request(model=model).model_copy(update={"reasoning_effort": "high"})
+        prov.invoke(req)
+        sent = json.loads(respx_mock.calls[-1].request.content)
+        assert sent["reasoning_effort"] == "high"
 
 
 # ---------------------------------------------------------------------------

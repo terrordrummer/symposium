@@ -48,7 +48,7 @@ What this module covers
   prose, per N4).
 * **Sampling**: `seed` and `reasoning_effort` are silently dropped
   per §6.2 ("adapters MUST silently drop unrecognized keys"). The
-  Messages API requires `max_tokens`; we default to 1024 if
+  Messages API requires `max_tokens`; we default to 4096 if
   `sampling.max_tokens` is not supplied.
 
 Open clarification (`rate_limit` vs `quota_exhausted`)
@@ -80,12 +80,15 @@ from symposium.models import (
     ProviderRequestMessage,
     ProviderResult,
     ToolEvent,
+    Usage,
 )
+from symposium.providers._cli_env import effective_timeout
 from symposium.providers._http_common import (
     UsageAccum,
     build_corrective_request,
     http_error_result,
     malformed_result,
+    merge_usage,
     normalize_tool_result,
     safe_raw,
     usage_from,
@@ -107,8 +110,10 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 # field on every request; if the caller didn't supply it via
 # `sampling.max_tokens`, we substitute this default. Surfacing the
 # default here keeps callers from having to know vendor-specific
-# requirements.
-DEFAULT_MAX_TOKENS = 1024
+# requirements. 4096 gives a structured deliberation turn (multi-KB
+# JSON payloads) enough room — the earlier 1024 truncated real turns
+# and every retry was doomed at the same cap.
+DEFAULT_MAX_TOKENS = 4096
 
 # Per-1k-token price table for `cost_usd` (§6.9). Values approximate
 # public Anthropic pricing at M3 drafting; the adapter treats this as
@@ -224,39 +229,75 @@ class AnthropicProvider(ProviderAdapter):
         self._tool_handlers[name] = handler
 
     def invoke(self, request: ProviderRequest) -> ProviderResult:
-        first = self._invoke_once(request)
+        # The scheduler's deadline-aware path budgets the WHOLE invocation
+        # — tool iterations plus the §6.7 corrective retry — via
+        # `request.metadata["symposium_timeout_seconds"]`, the same contract
+        # the CLI adapters honor. Split the budget across both passes so a
+        # single invoke can never overrun the wall-clock the scheduler
+        # reserved for the eventual synthesis.
+        budget = effective_timeout(request, self._timeout)
+        start = time.monotonic()
+        first = self._invoke_once(request, budget=budget)
         if first.error is not None and first.error.kind == "malformed_response":
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                return first
             corrective = self._build_corrective_request(request, first)
-            second = self._invoke_once(corrective)
-            return second
+            second = self._invoke_once(corrective, budget=remaining)
+            # The first attempt consumed real tokens and money; fold its
+            # usage into the returned result so budget accounting sees
+            # both passes, not just the corrective one.
+            return second.model_copy(
+                update={"usage": merge_usage(first.usage, second.usage)}
+            )
         return first
 
     # ------------------------------------------------------------------
     # Single-pass invocation
     # ------------------------------------------------------------------
 
-    def _invoke_once(self, request: ProviderRequest) -> ProviderResult:
+    def _invoke_once(self, request: ProviderRequest, *, budget: float) -> ProviderResult:
         body = self._build_request_body(request)
         aggregate = UsageAccum()
         tool_events: List[ToolEvent] = []
         iteration = 0
         current_messages: List[Dict[str, Any]] = list(body["messages"])
+        start = time.monotonic()
 
         while True:
             body["messages"] = current_messages
+
+            # Wall-clock budget check: without it a tool loop of N
+            # iterations could run N × timeout, silently overrunning the
+            # scheduler's per-turn deadline. The remaining budget doubles
+            # as the per-request httpx timeout below.
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                return http_error_result(
+                    kind="timeout",
+                    message=(
+                        f"per-turn budget of {budget:.1f}s exhausted after "
+                        f"{iteration} tool iteration(s)"
+                    ),
+                    retriable=True,
+                    usage=self._usage(request.model, aggregate),
+                    raw=None,
+                    tool_events=tool_events,
+                )
 
             try:
                 resp = self._http.post(
                     f"{self._base_url}/messages",
                     json=body,
                     headers=self._auth_headers(),
+                    timeout=remaining,
                 )
             except httpx.TimeoutException as exc:
                 return http_error_result(
                     kind="timeout",
                     message=f"request timed out: {exc}",
                     retriable=True,
-                    usage=usage_from(aggregate, cost=0.0),
+                    usage=self._usage(request.model, aggregate),
                     raw=None,
                     tool_events=tool_events,
                 )
@@ -265,13 +306,15 @@ class AnthropicProvider(ProviderAdapter):
                     kind="network",
                     message=f"network error: {exc}",
                     retriable=True,
-                    usage=usage_from(aggregate, cost=0.0),
+                    usage=self._usage(request.model, aggregate),
                     raw=None,
                     tool_events=tool_events,
                 )
 
             if resp.status_code != 200:
-                return self._classify_http_error(resp, aggregate, tool_events)
+                return self._classify_http_error(
+                    resp, aggregate, tool_events, request.model
+                )
 
             try:
                 data = resp.json()
@@ -280,14 +323,19 @@ class AnthropicProvider(ProviderAdapter):
                     kind="internal",
                     message=f"could not parse JSON response body: {exc}",
                     retriable=False,
-                    usage=usage_from(aggregate, cost=0.0),
+                    usage=self._usage(request.model, aggregate),
                     raw=None,
                     tool_events=tool_events,
                 )
 
             usage = data.get("usage") or {}
+            # Cache reads/writes are billable input tokens too; dropping
+            # them under-reports prompt usage (the CLI adapter counts them).
             aggregate.add(
-                usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0),
+                usage.get("output_tokens", 0),
             )
 
             content_blocks = data.get("content")
@@ -296,7 +344,7 @@ class AnthropicProvider(ProviderAdapter):
                     kind="internal",
                     message="response missing content[] array",
                     retriable=False,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     raw=safe_raw(data),
                     tool_events=tool_events,
                 )
@@ -312,7 +360,7 @@ class AnthropicProvider(ProviderAdapter):
                         ProviderRawMessage(role="assistant", content=refusal_text)
                     ],
                     tool_events=tool_events,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     finish_reason="content_filter",
                     structured_output=None,
                     raw=safe_raw(data),
@@ -338,7 +386,7 @@ class AnthropicProvider(ProviderAdapter):
                             "exceeded; loop cap reached without a terminal response"
                         ),
                         retriable=False,
-                        usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                        usage=self._usage(request.model, aggregate),
                         raw=safe_raw(data),
                         tool_events=tool_events,
                     )
@@ -367,7 +415,7 @@ class AnthropicProvider(ProviderAdapter):
                             )
                         ],
                         tool_events=tool_events,
-                        usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                        usage=self._usage(request.model, aggregate),
                         finish_reason="error",
                         structured_output=None,
                         raw=safe_raw(data),
@@ -382,13 +430,44 @@ class AnthropicProvider(ProviderAdapter):
                 iteration += 1
                 continue
 
-            # Terminal — parse the first text block as JSON and validate.
+            # Terminal — free-text vs structured handling.
             text = _first_text_block(content_blocks)
+            free_text = request.expected_output_schema in (None, "null")
+
+            # Truncation MUST be classified BEFORE any JSON parsing: a
+            # response cut off at `max_tokens` is almost never valid JSON,
+            # and parsing it first would misfile the failure as a
+            # retriable `malformed_response` — dooming the corrective
+            # retry (and every runtime retry) at the very same cap.
+            if not free_text and vendor_stop == "max_tokens":
+                return ProviderResult(
+                    messages=[ProviderRawMessage(role="assistant", content=text)],
+                    tool_events=tool_events,
+                    usage=self._usage(request.model, aggregate),
+                    finish_reason="length",
+                    structured_output=None,
+                    raw=safe_raw(data),
+                    error=ProviderError(
+                        kind="context_length_exceeded",
+                        message=(
+                            "output truncated: stop_reason=max_tokens hit the "
+                            f"{body.get('max_tokens')}-token cap before the "
+                            "structured output completed; retrying at the same "
+                            "cap cannot succeed — raise sampling.max_tokens"
+                        ),
+                        retriable=False,
+                        details={
+                            "stop_reason": "max_tokens",
+                            "max_tokens": body.get("max_tokens"),
+                        },
+                    ),
+                )
+
             if not text:
                 return ProviderResult(
                     messages=[ProviderRawMessage(role="assistant", content="")],
                     tool_events=tool_events,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     finish_reason="error",
                     structured_output=None,
                     raw=safe_raw(data),
@@ -400,14 +479,49 @@ class AnthropicProvider(ProviderAdapter):
                     ),
                 )
 
+            # Free-text path (no expected schema — the §4.1 llm selector):
+            # the model legitimately answers in prose, so force-parsing it
+            # as JSON is wrong twice over (prose → spurious
+            # malformed_response; a JSON scalar/array → a non-dict
+            # structured_output that would raise out of invoke()). Return
+            # the raw text, mirroring the CLI adapters.
+            if free_text:
+                canonical_finish = _normalize_finish_reason(vendor_stop)
+                if canonical_finish == "error":
+                    return ProviderResult(
+                        messages=[ProviderRawMessage(role="assistant", content=text)],
+                        tool_events=tool_events,
+                        usage=self._usage(request.model, aggregate),
+                        finish_reason="error",
+                        structured_output=None,
+                        raw=safe_raw(data),
+                        error=ProviderError(
+                            kind="internal",
+                            message=(
+                                f"vendor stop_reason {vendor_stop!r} arrived "
+                                "terminally with no consumable tool_use blocks"
+                            ),
+                            retriable=False,
+                            details={"stop_reason": vendor_stop},
+                        ),
+                    )
+                return ProviderResult(
+                    messages=[ProviderRawMessage(role="assistant", content=text)],
+                    tool_events=tool_events,
+                    usage=self._usage(request.model, aggregate),
+                    finish_reason=canonical_finish,
+                    structured_output=None,
+                    raw=safe_raw(data),
+                    error=None,
+                )
+
             try:
                 structured = json.loads(text)
             except json.JSONDecodeError as exc:
                 return malformed_result(
                     request=request,
                     content_str=text,
-                    aggregate=aggregate,
-                    cost=self._cost(request.model, aggregate),
+                    usage=self._usage(request.model, aggregate),
                     tool_events=tool_events,
                     raw=safe_raw(data),
                     failing_path="<root>",
@@ -421,8 +535,7 @@ class AnthropicProvider(ProviderAdapter):
                 return malformed_result(
                     request=request,
                     content_str=text,
-                    aggregate=aggregate,
-                    cost=self._cost(request.model, aggregate),
+                    usage=self._usage(request.model, aggregate),
                     tool_events=tool_events,
                     raw=safe_raw(data),
                     failing_path=failure["failing_path"],
@@ -435,7 +548,7 @@ class AnthropicProvider(ProviderAdapter):
                 return ProviderResult(
                     messages=[ProviderRawMessage(role="assistant", content=text)],
                     tool_events=tool_events,
-                    usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                    usage=self._usage(request.model, aggregate),
                     finish_reason="error",
                     structured_output=None,
                     raw=safe_raw(data),
@@ -453,7 +566,7 @@ class AnthropicProvider(ProviderAdapter):
             return ProviderResult(
                 messages=[ProviderRawMessage(role="assistant", content=text)],
                 tool_events=tool_events,
-                usage=usage_from(aggregate, cost=self._cost(request.model, aggregate)),
+                usage=self._usage(request.model, aggregate),
                 finish_reason=canonical_finish,
                 structured_output=structured,
                 raw=safe_raw(data),
@@ -507,7 +620,22 @@ class AnthropicProvider(ProviderAdapter):
 
             schema = tool_desc.get("input_schema") or {}
             try:
+                jsonschema.Draft202012Validator.check_schema(schema)
                 jsonschema.Draft202012Validator(schema).validate(args)
+            except jsonschema.SchemaError as exc:
+                # The tool's OWN input_schema is broken (config bug) —
+                # surface as tool_failure instead of letting SchemaError
+                # escape invoke() (errors-via-result contract).
+                err = ProviderError(
+                    kind="tool_failure",
+                    message=f"tool input_schema is not a valid JSON Schema: {exc.message}",
+                    retriable=False,
+                    details={"tool_name": name, "validator_message": exc.message},
+                )
+                tool_events.append(
+                    ToolEvent(name=name, arguments=args, result=None, error=err)
+                )
+                return err, tool_result_blocks
             except jsonschema.ValidationError as exc:
                 err = ProviderError(
                     kind="tool_failure",
@@ -657,6 +785,7 @@ class AnthropicProvider(ProviderAdapter):
         resp: httpx.Response,
         aggregate: UsageAccum,
         tool_events: List[ToolEvent],
+        model: str,
     ) -> ProviderResult:
         status = resp.status_code
         try:
@@ -705,14 +834,16 @@ class AnthropicProvider(ProviderAdapter):
             retry_after = resp.headers.get("retry-after")
             if retry_after:
                 try:
-                    details["retry_after_seconds"] = int(float(retry_after))
+                    # Keep the float: truncating a sub-second Retry-After
+                    # to int(0) would produce a zero-sleep retry.
+                    details["retry_after_seconds"] = float(retry_after)
                 except ValueError:
                     pass
 
         return ProviderResult(
             messages=[],
             tool_events=tool_events,
-            usage=usage_from(aggregate, cost=0.0),
+            usage=self._usage(model, aggregate),
             finish_reason="error",
             structured_output=None,
             raw=safe_raw(body),
@@ -760,22 +891,28 @@ class AnthropicProvider(ProviderAdapter):
     # Cost
     # ------------------------------------------------------------------
 
-    def _cost(self, model: str, aggregate: UsageAccum) -> float:
+    def _prices_for(self, model: str) -> Optional[Tuple[float, float]]:
         prices = self._price_table.get(model)
         if prices is None:
             # Heuristic: try a prefix match (e.g. claude-sonnet-4-5-20251022 → claude-sonnet-4-5).
             for known, p in self._price_table.items():
                 if model.startswith(known):
-                    prices = p
-                    break
+                    return p
+        return prices
+
+    def _usage(self, model: str, aggregate: UsageAccum) -> Usage:
+        prices = self._prices_for(model)
         if prices is None:
-            return 0.0
+            # No price row for this model: 0.0 is a placeholder, not a
+            # measurement — flag it estimated (§6.9).
+            return usage_from(aggregate, cost=0.0, estimated=True)
         prompt_per_1k, completion_per_1k = prices
-        return round(
+        cost = round(
             (aggregate.prompt / 1000.0) * prompt_per_1k
             + (aggregate.completion / 1000.0) * completion_per_1k,
             6,
         )
+        return usage_from(aggregate, cost=cost)
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +929,24 @@ def _translate_message(m: ProviderRequestMessage) -> Dict[str, Any]:
     assistant content during the tool loop, or a synthetic user
     tool_result) the caller bypasses this helper and constructs the
     `content[]` directly.
+
+    Canonical `tool`-role turns (§6.3) need a rewire: the Messages API
+    only accepts `user` / `assistant` roles, so passing `role = "tool"`
+    verbatim is a guaranteed 400. The vendor shape for a tool result is
+    a user-role message carrying a `tool_result` block — the same
+    translation the internal tool loop performs.
     """
+    if m.role == "tool":
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id or "",
+                    "content": _stringify_content(m.content),
+                }
+            ],
+        }
     return {
         "role": m.role,
         "content": [{"type": "text", "text": _stringify_content(m.content)}],

@@ -55,11 +55,12 @@ from symposium.models import (
     Verdict,
 )
 from symposium.providers._cli_env import (
+    classify_cli_exit,
     codex_child_env,
     effective_timeout,
     run_in_process_group,
 )
-from symposium.providers._http_common import validate_structured_output
+from symposium.providers._http_common import merge_usage, validate_structured_output
 from symposium.providers.base import ProviderAdapter
 
 DEFAULT_CODEX_BINARY = "codex"
@@ -259,7 +260,12 @@ class CodexCliProvider(ProviderAdapter):
                 f"`{details.get('failing_path')}`: {details.get('validator_message')}. "
                 "Re-emit ONLY the structured object that conforms to the schema."
             )
-            return self._invoke_once(request, prompt_suffix=suffix, timeout=remaining)
+            second = self._invoke_once(request, prompt_suffix=suffix, timeout=remaining)
+            # The first attempt consumed real tokens; fold its usage into
+            # the returned result so budget accounting sees both passes.
+            return second.model_copy(
+                update={"usage": merge_usage(first.usage, second.usage)}
+            )
         return first
 
     # ------------------------------------------------------------------
@@ -368,7 +374,7 @@ class CodexCliProvider(ProviderAdapter):
                     except json.JSONDecodeError:
                         stdout_msg = raw_msg
             detail = stderr or stdout_msg or "<no stderr, no stdout error>"
-            kind, retriable = _classify_cli_exit(stderr or stdout_msg)
+            kind, retriable = classify_cli_exit(stderr or stdout_msg)
             return _error_result(
                 kind,
                 f"codex CLI exited {proc.returncode}: {detail[:500]}",
@@ -376,12 +382,17 @@ class CodexCliProvider(ProviderAdapter):
             )
 
         agent_text, usage_event, error_event = _parse_jsonl(proc.stdout or "")
+        usage = _usage_from_event(usage_event)
         if error_event is not None:
+            # Keep whatever usage the stream reported before failing —
+            # those tokens were spent and must reach budget accounting.
             return _error_result(
-                "internal", f"codex CLI reported an error: {json.dumps(error_event)[:400]}", False
+                "internal",
+                f"codex CLI reported an error: {json.dumps(error_event)[:400]}",
+                False,
+                usage=usage,
             )
 
-        usage = _usage_from_event(usage_event)
         finish = "stop"
 
         if schema_json is None:
@@ -533,29 +544,6 @@ def _safe_int(v: Any) -> int:
         return 0
 
 
-def _classify_cli_exit(stderr: str) -> tuple[str, bool]:
-    """Map a non-zero codex CLI exit to (error.kind, retriable).
-
-    Looks for well-known phrases in stderr / stdout-tail. Falls back to
-    `internal` non-retriable for unknown exits. Keeps the runtime in line
-    with the closed §6.6 ErrorKind enum.
-    """
-    s = (stderr or "").lower()
-    if "rate" in s and "limit" in s:
-        return ("rate_limit", True)
-    if "quota" in s or "exceeded" in s:
-        return ("quota_exhausted", False)
-    if "auth" in s or "unauthor" in s or "forbidden" in s or "login" in s:
-        return ("auth_failure", False)
-    if "context" in s and "length" in s:
-        return ("context_length_exceeded", False)
-    if "timeout" in s or "timed out" in s:
-        return ("timeout", True)
-    if "network" in s or "connection" in s or "dns" in s:
-        return ("network", True)
-    return ("internal", False)
-
-
 def _usage_from_event(usage_event: Optional[Dict[str, Any]]) -> Usage:
     u = usage_event or {}
     prompt = _safe_int(u.get("input_tokens")) + _safe_int(u.get("cached_input_tokens"))
@@ -573,10 +561,13 @@ def _usage_from_event(usage_event: Optional[Dict[str, Any]]) -> Usage:
     )
 
 
-def _error_result(kind: str, message: str, retriable: bool) -> ProviderResult:
+def _error_result(
+    kind: str, message: str, retriable: bool, *, usage: Optional[Usage] = None
+) -> ProviderResult:
     return ProviderResult(
         messages=[], tool_events=[],
-        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=0.0),
+        usage=usage
+        or Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=0.0),
         finish_reason="error", structured_output=None, raw=None,
         error=ProviderError(kind=kind, message=message, retriable=retriable),  # type: ignore[arg-type]
     )

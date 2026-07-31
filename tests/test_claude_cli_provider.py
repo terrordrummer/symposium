@@ -229,12 +229,135 @@ def test_schema_invalid_after_retry_returns_malformed():
     assert result.structured_output is None
 
 
+def test_corrective_retry_usage_includes_first_attempt():
+    """The malformed first pass burned real tokens; the returned usage is
+    the SUM of both CLI invocations, not just the corrective one."""
+    runner = _RecordingRunner([
+        _completed(_cli_json(structured=None)),                 # 1st: malformed
+        _completed(_cli_json(structured={"text": "fixed"})),    # 2nd: ok
+    ])
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    assert result.error is None
+    assert len(runner.calls) == 2
+    # 110 prompt (input+cache_read) and 50 completion per pass.
+    assert result.usage.prompt_tokens == 220
+    assert result.usage.completion_tokens == 100
+    assert result.usage.total_tokens == 320
+    assert result.usage.cost_usd == pytest.approx(0.02)
+    assert result.usage.estimated is True
+
+
 def test_nonzero_exit_is_error():
     runner = _RecordingRunner([_completed("", returncode=1, stderr="boom")])
     result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
     assert result.error is not None
     assert result.error.kind == "internal"
     assert "boom" in result.error.message
+
+
+def test_failed_to_generate_stderr_is_internal_not_rate_limit():
+    """"Failed to generate response" contains "rate" (inside "generate");
+    the old single-word match classified it as a retriable rate_limit and
+    burned up to the whole retry budget on doomed respawns."""
+    runner = _RecordingRunner([
+        _completed("", returncode=1, stderr="Failed to generate response")
+    ])
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    assert result.error is not None
+    assert result.error.kind == "internal"
+    assert result.error.retriable is False
+
+
+def test_rate_limit_phrase_still_classified_retriable():
+    runner = _RecordingRunner([
+        _completed("", returncode=1, stderr="API error: 429 Too Many Requests")
+    ])
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    assert result.error is not None
+    assert result.error.kind == "rate_limit"
+    assert result.error.retriable is True
+
+
+@pytest.mark.parametrize(
+    "detail, expected_kind, expected_retriable",
+    [
+        ("Failed to generate response", "internal", False),
+        ("Rate limit reached for requests", "rate_limit", True),
+        ("HTTP 429: too many requests", "rate_limit", True),
+        ("monthly quota exceeded", "quota_exhausted", False),
+        ("usage limit reached — resets at 5pm", "quota_exhausted", False),
+        ("deadline exceeded", "timeout", True),
+        ("request timeout exceeded", "timeout", True),
+        ("prompt is too long: context length exceeded", "context_length_exceeded", False),
+        ("401 Unauthorized", "auth_failure", False),
+        ("connection reset by peer", "network", True),
+        ("something inexplicable", "internal", False),
+    ],
+)
+def test_classify_cli_exit_phrases(detail, expected_kind, expected_retriable):
+    """Phrase-based classification for CLI exits — regression coverage for
+    the false-positive substrings ("rate" in "generate", the bare
+    "exceeded") that used to misroute retries."""
+    from symposium.providers._cli_env import classify_cli_exit
+
+    assert classify_cli_exit(detail) == (expected_kind, expected_retriable)
+
+
+def test_non_object_json_stdout_is_malformed_not_crash():
+    """rc=0 with `null` or an array on stdout parses as JSON but is not
+    the result envelope; must yield malformed_response instead of an
+    AttributeError escaping invoke()."""
+    runner = _RecordingRunner([
+        _completed("null"),
+        _completed('["a", "b"]'),   # corrective retry answer, still bad
+    ])
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    assert result.error is not None
+    assert result.error.kind == "malformed_response"
+    assert len(runner.calls) == 2
+
+
+def test_unknown_stop_reason_is_error_not_clean_stop():
+    """An unknown stop_reason must not report a clean finish — align with
+    the anthropic adapter's unknown → "error" collapse (§6.10)."""
+    runner = _RecordingRunner([
+        _completed(_cli_json(structured={"text": "t"}, stop_reason="weird_stop"))
+    ])
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+    assert result.finish_reason == "error"
+    assert result.error is not None
+    assert result.error.kind == "internal"
+
+
+def test_system_only_messages_emit_system_text_once():
+    """A system-only message list used to duplicate the system text (once
+    behind the [SYSTEM] sentinel, once as the fallback body)."""
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    req = ProviderRequest(
+        provider="claude-cli",
+        model="sonnet",
+        agent_id="logician",
+        messages=[ProviderRequestMessage(role="system", content="Only the system text.")],
+        expected_output_schema="turn_structured_output",
+    )
+    ClaudeCliProvider(runner=runner).invoke(req)
+    stdin_payload = runner.calls[0]["input"]
+    assert stdin_payload.count("Only the system text.") == 1
+
+
+def test_run_in_process_group_timeout_falls_back_without_killpg(monkeypatch):
+    """Platforms without os.killpg (Windows) must fall back to killing the
+    direct child instead of raising AttributeError past the timeout
+    handler."""
+    import os
+
+    from symposium.providers._cli_env import run_in_process_group
+
+    monkeypatch.delattr(os, "killpg", raising=False)
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_in_process_group(
+            ["sh", "-c", "sleep 30"], capture_output=True, text=True, timeout=0.5,
+        )
 
 
 def test_timeout_maps_to_timeout_error():

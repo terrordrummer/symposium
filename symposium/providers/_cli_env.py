@@ -70,7 +70,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-from typing import Any, Dict, FrozenSet, Optional
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 INHERITED_ENV_BLOCKLIST: FrozenSet[str] = frozenset({
     # Nested-Claude-Code markers — set by a parent Claude Code session
@@ -271,7 +271,12 @@ def run_in_process_group(
         out, err = proc.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            if hasattr(os, "killpg"):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                # Windows: no POSIX process groups (os.killpg/os.getpgid
+                # are absent) — fall back to killing the direct child.
+                proc.kill()
         except (ProcessLookupError, PermissionError):
             proc.kill()
         # Reap so the pipes close and no zombie/grandchild lingers.
@@ -284,14 +289,16 @@ def run_in_process_group(
 
 
 def effective_timeout(request: Any, default: float) -> float:
-    """Resolve the subprocess timeout for a CLI turn.
+    """Resolve the per-invocation wall-clock budget for a turn.
 
     The scheduler's deadline-aware path may pass a per-turn budget via
     ``request.metadata["symposium_timeout_seconds"]``. We honor it but only
     to TIGHTEN the adapter's own ``default`` — a request can never extend a
     turn past the adapter-configured ceiling, only shorten it to fit the
     remaining session wall-clock. A missing/invalid/non-positive hint falls
-    back to ``default``.
+    back to ``default``. The CLI adapters use the result as their subprocess
+    timeout; the HTTP adapters use it as the whole-invocation budget across
+    tool iterations and the corrective retry.
     """
     meta = getattr(request, "metadata", None)
     if not isinstance(meta, dict):
@@ -306,3 +313,51 @@ def effective_timeout(request: Any, default: float) -> float:
     if requested <= 0:
         return default
     return min(default, requested)
+
+
+def classify_cli_exit(detail: str) -> Tuple[str, bool]:
+    """Map a non-zero CLI exit to ``(error.kind, retriable)`` from its
+    stderr / stdout-tail text. Shared by the claude-cli and codex-cli
+    adapters.
+
+    Matching is phrase-based on purpose. Single-word markers proved too
+    greedy in the wild:
+
+    * ``"rate" in s`` classified claude's generic "Failed to generate
+      response" as a retriable ``rate_limit`` (the substring is inside
+      "generate"), burning the whole retry budget on doomed respawns.
+    * ``"exceeded" in s`` classified codex's "deadline exceeded" /
+      "timeout exceeded" as non-retriable ``quota_exhausted`` and made
+      the context-length check unreachable.
+
+    Falls back to ``internal`` non-retriable for unknown exits, keeping
+    the result inside the CLOSED §6.6 ErrorKind enum.
+    """
+    s = (detail or "").lower()
+    if (
+        "rate limit" in s
+        or "rate-limit" in s
+        or "rate_limit" in s
+        or "too many requests" in s
+        or "429" in s
+    ):
+        return ("rate_limit", True)
+    if "quota" in s or "usage limit" in s or "credit balance" in s:
+        return ("quota_exhausted", False)
+    if (
+        "unauthorized" in s
+        or "forbidden" in s
+        or "authentication" in s
+        or "invalid api key" in s
+        or "login" in s
+        or "401" in s
+        or "403" in s
+    ):
+        return ("auth_failure", False)
+    if "context length" in s or "context_length" in s or "prompt is too long" in s:
+        return ("context_length_exceeded", False)
+    if "timed out" in s or "timeout" in s or "deadline exceeded" in s:
+        return ("timeout", True)
+    if "network" in s or "connection" in s or "dns" in s:
+        return ("network", True)
+    return ("internal", False)

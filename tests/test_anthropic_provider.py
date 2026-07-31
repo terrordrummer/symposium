@@ -169,8 +169,8 @@ def test_system_message_hoisted_to_top_level(respx_mock):
     assert all(m["role"] != "system" for m in sent["messages"])
     assert len(sent["messages"]) == 1
     assert sent["messages"][0]["role"] == "user"
-    # max_tokens defaulted to DEFAULT_MAX_TOKENS (1024).
-    assert sent["max_tokens"] == 1024
+    # max_tokens defaulted to DEFAULT_MAX_TOKENS (4096).
+    assert sent["max_tokens"] == 4096
 
 
 @respx.mock(base_url=BASE_URL, assert_all_called=False)
@@ -561,7 +561,10 @@ def test_tool_loop_single_iteration(respx_mock):
     [
         ("end_turn", "stop", False),
         ("stop_sequence", "stop", False),
-        ("max_tokens", "length", False),
+        # max_tokens terminally means the output was truncated at the
+        # cap — surfaced as finish_reason="length" with a non-retriable
+        # error (see test_max_tokens_truncation_is_length_not_malformed).
+        ("max_tokens", "length", True),
         # `refusal` is exercised separately because the body shape is
         # different (no JSON body for refusal).
         # tool_use surfaced terminally without consumable tool_use blocks
@@ -576,12 +579,11 @@ def test_finish_reason_normalization(respx_mock, vendor_stop, canonical, expect_
     respx_mock.post("/messages").mock(return_value=httpx.Response(200, json=body))
     result = _provider().invoke(_request())
 
+    assert result.finish_reason == canonical
     if not expect_error:
         assert result.error is None
-        assert result.finish_reason == canonical
     else:
         assert result.error is not None
-        assert result.finish_reason == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +685,340 @@ def test_credentials_never_leak_into_persisted_artifact(tmp_path, respx_mock, mo
         text = p.read_text()
         assert API_KEY not in text, f"API key leaked into {p}"
     assert found_any, "no persisted files were found under the run directory"
+
+
+# ---------------------------------------------------------------------------
+# Corrective-retry usage accounting
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_corrective_retry_usage_includes_first_attempt(respx_mock):
+    """The malformed first attempt consumed real tokens and money; the
+    returned result's usage must be the SUM of both passes, not just the
+    corrective one."""
+    bad = _ok_response(structured={"not_the_right_field": 42})
+    good = _ok_response(structured=_valid_turn())
+    respx_mock.post("/messages").mock(
+        side_effect=[httpx.Response(200, json=bad), httpx.Response(200, json=good)]
+    )
+    result = _provider().invoke(_request())
+    assert result.error is None
+    assert respx_mock.calls.call_count == 2
+    # Each pass reported 100 prompt / 30 completion tokens.
+    assert result.usage.prompt_tokens == 200
+    assert result.usage.completion_tokens == 60
+    assert result.usage.total_tokens == 260
+    # Cost doubles with the tokens (claude-sonnet-4-5 price row).
+    assert result.usage.cost_usd == pytest.approx(0.0015, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# max_tokens truncation classification
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_max_tokens_truncation_is_length_not_malformed(respx_mock):
+    """Truncated JSON + stop_reason=max_tokens must classify as a
+    non-retriable `length` outcome BEFORE JSON parsing — not as a
+    retriable malformed_response whose corrective retry is doomed at the
+    very same cap."""
+    truncated = {
+        "id": "msg_trunc",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [{"type": "text", "text": '{"text": "an answer that got cut of'}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 100, "output_tokens": 1024},
+    }
+    respx_mock.post("/messages").mock(return_value=httpx.Response(200, json=truncated))
+    result = _provider().invoke(_request())
+    assert result.finish_reason == "length"
+    assert result.error is not None
+    assert result.error.kind == "context_length_exceeded"
+    assert result.error.retriable is False
+    assert "truncated" in result.error.message
+    # No corrective retry was issued: one upstream call only.
+    assert respx_mock.calls.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Free-text path (expected_output_schema = null)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_free_text_prose_with_no_schema_is_ok(respx_mock):
+    """With no expected schema (the §4.1 llm selector) prose must come
+    back verbatim — not be force-parsed into a malformed_response."""
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "msg_prose",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "A prose answer, no JSON."}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 40, "output_tokens": 12},
+            },
+        )
+    )
+    result = _provider().invoke(_request(expected=None))
+    assert result.error is None
+    assert result.finish_reason == "stop"
+    assert result.structured_output is None
+    assert result.messages[0].content == "A prose answer, no JSON."
+    assert respx_mock.calls.call_count == 1
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_free_text_json_array_with_no_schema_is_ok(respx_mock):
+    """A JSON-array answer on the free-text path must NOT be parsed into
+    `structured_output` — a non-dict there would raise a ValidationError
+    out of invoke(), breaking the errors-via-result contract."""
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "msg_array",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": '["logician", "critic"]'}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 40, "output_tokens": 8},
+            },
+        )
+    )
+    result = _provider().invoke(_request(expected=None))
+    assert result.error is None
+    assert result.structured_output is None
+    assert result.messages[0].content == '["logician", "critic"]'
+
+
+# ---------------------------------------------------------------------------
+# Per-turn deadline (`symposium_timeout_seconds`)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_per_turn_deadline_bounds_tool_loop(respx_mock, monkeypatch):
+    """The scheduler's `symposium_timeout_seconds` metadata budgets the
+    WHOLE invocation: it caps each HTTP request AND bounds the tool
+    loop's wall-clock instead of being silently ignored."""
+    import symposium.providers.anthropic as anthropic_mod
+
+    # A controllable clock: each tool call "takes" 60s. Only the handler
+    # advances it, so extra monotonic readers (httpx et al.) can't skew
+    # the arithmetic.
+    clock = {"v": 0.0}
+    monkeypatch.setattr(anthropic_mod.time, "monotonic", lambda: clock["v"])
+
+    def slow_tool(args):
+        clock["v"] += 60.0
+        return {"matches": []}
+
+    tool_call = _tool_use_response(name="search_papers", input_args={"query": "x"})
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(200, json=tool_call)
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+    ]
+    # Adapter ceiling above the metadata hint, so the scheduler's 100s
+    # budget is the binding constraint.
+    prov = _provider(timeout=600.0, tool_handlers={"search_papers": slow_tool})
+    req = _request(tools=tools).model_copy(
+        update={"metadata": {"symposium_timeout_seconds": 100.0}}
+    )
+    result = prov.invoke(req)
+    assert result.error is not None
+    assert result.error.kind == "timeout"
+    assert result.error.retriable is True
+    # Two 60s tool iterations fit inside the loop before the 100s budget
+    # ran out — the third never starts.
+    assert respx_mock.calls.call_count == 2
+    assert len(result.tool_events) == 2
+    # Tokens burned before the bail-out are still reported.
+    assert result.usage.prompt_tokens == 400
+    assert result.usage.completion_tokens == 80
+    # The remaining budget is applied as the per-request httpx timeout.
+    assert respx_mock.calls[0].request.extensions["timeout"]["read"] == pytest.approx(100.0)
+    assert respx_mock.calls[1].request.extensions["timeout"]["read"] == pytest.approx(40.0)
+
+
+# ---------------------------------------------------------------------------
+# Usage / cost accounting details
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_cache_tokens_counted_in_prompt_usage(respx_mock):
+    """cache_read/cache_creation input tokens are billable input tokens;
+    dropping them under-reports prompt usage."""
+    body = _ok_response(
+        structured=_valid_turn(),
+        usage={
+            "input_tokens": 100,
+            "output_tokens": 30,
+            "cache_read_input_tokens": 40,
+            "cache_creation_input_tokens": 10,
+        },
+    )
+    respx_mock.post("/messages").mock(return_value=httpx.Response(200, json=body))
+    result = _provider().invoke(_request())
+    assert result.error is None
+    assert result.usage.prompt_tokens == 150
+    assert result.usage.completion_tokens == 30
+    assert result.usage.total_tokens == 180
+    # 150/1000 * 0.003 + 30/1000 * 0.015 = 0.00045 + 0.00045
+    assert result.usage.cost_usd == pytest.approx(0.0009, rel=1e-6)
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_mid_tool_loop_http_error_keeps_usage_cost(respx_mock):
+    """An HTTP failure after a completed tool iteration must report the
+    real cost of the tokens burned so far, not a hardcoded 0.0."""
+    tool_call = _tool_use_response(name="search_papers", input_args={"query": "x"})
+    respx_mock.post("/messages").mock(
+        side_effect=[
+            httpx.Response(200, json=tool_call),
+            httpx.Response(
+                429,
+                json={
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": "Too many requests"},
+                },
+            ),
+        ]
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+    ]
+    prov = _provider(tool_handlers={"search_papers": lambda args: {"ok": True}})
+    result = prov.invoke(_request(tools=tools))
+    assert result.error is not None
+    assert result.error.kind == "rate_limit"
+    assert result.usage.prompt_tokens == 200
+    assert result.usage.completion_tokens == 40
+    # 200/1000 * 0.003 + 40/1000 * 0.015 = 0.0006 + 0.0006
+    assert result.usage.cost_usd == pytest.approx(0.0012, rel=1e-6)
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_sub_second_retry_after_is_preserved(respx_mock):
+    """A Retry-After of 0.5s must not be truncated to a zero-sleep 0."""
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(
+            429,
+            json={
+                "type": "error",
+                "error": {"type": "rate_limit_error", "message": "Too many requests"},
+            },
+            headers={"retry-after": "0.5"},
+        )
+    )
+    result = _provider().invoke(_request())
+    assert result.error is not None
+    assert result.error.details["retry_after_seconds"] == 0.5
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_unknown_model_zero_cost_is_flagged_estimated(respx_mock):
+    """With no price row the 0.0 cost is a placeholder, not a measurement
+    — the usage must carry estimated=True (§6.9)."""
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(200, json=_ok_response(structured=_valid_turn()))
+    )
+    result = _provider().invoke(_request(model="somebody-elses-model"))
+    assert result.error is None
+    assert result.usage.cost_usd == 0.0
+    assert result.usage.estimated is True
+
+
+# ---------------------------------------------------------------------------
+# Tool-schema robustness + message translation
+# ---------------------------------------------------------------------------
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_broken_tool_input_schema_maps_to_tool_failure(respx_mock):
+    """A malformed input_schema must surface as tool_failure instead of
+    raising jsonschema.SchemaError out of invoke()."""
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response(name="search_papers", input_args={"query": "x"})
+        )
+    )
+    tools = [
+        {
+            "name": "search_papers",
+            "description": "search corpus",
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "not-a-type"}},
+            },
+        }
+    ]
+    prov = _provider(tool_handlers={"search_papers": lambda args: {}})
+    result = prov.invoke(_request(tools=tools))
+    assert result.error is not None
+    assert result.error.kind == "tool_failure"
+    assert "JSON Schema" in result.error.message
+
+
+@respx.mock(base_url=BASE_URL, assert_all_called=False)
+def test_tool_role_message_translated_to_tool_result_block(respx_mock):
+    """Canonical `tool`-role turns must be rewired into a user-role
+    tool_result block — the Messages API rejects role="tool" with a 400."""
+    respx_mock.post("/messages").mock(
+        return_value=httpx.Response(200, json=_ok_response(structured=_valid_turn()))
+    )
+    req = ProviderRequest(
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        agent_id="logician",
+        messages=[
+            ProviderRequestMessage(role="system", content="persona=logician"),
+            ProviderRequestMessage(role="user", content="problem statement here"),
+            ProviderRequestMessage(role="assistant", content="calling a tool"),
+            ProviderRequestMessage(
+                role="tool", content="tool says 42", tool_call_id="toolu_9"
+            ),
+        ],
+        expected_output_schema="turn_structured_output",
+    )
+    result = _provider().invoke(req)
+    assert result.error is None
+    sent = json.loads(respx_mock.calls[0].request.content)
+    assert all(m["role"] in ("user", "assistant") for m in sent["messages"])
+    rewired = sent["messages"][-1]
+    assert rewired["role"] == "user"
+    assert rewired["content"][0]["type"] == "tool_result"
+    assert rewired["content"][0]["tool_use_id"] == "toolu_9"
+    assert rewired["content"][0]["content"] == "tool says 42"
 
 
 # ---------------------------------------------------------------------------

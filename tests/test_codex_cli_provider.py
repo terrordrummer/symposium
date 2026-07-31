@@ -126,11 +126,80 @@ def test_schema_invalid_after_retry_returns_malformed():
     assert result.error is not None and result.error.kind == "malformed_response"
 
 
+def test_corrective_retry_usage_includes_first_attempt():
+    """The malformed first pass burned real tokens; the returned usage is
+    the SUM of both CLI invocations, not just the corrective one."""
+    runner = _RecordingRunner([
+        _completed(_codex_stdout(text="not json at all")),
+        _completed(_codex_stdout(structured={"text": "fixed"})),
+    ])
+    result = CodexCliProvider(runner=runner).invoke(_req())
+    assert result.error is None
+    assert len(runner.calls) == 2
+    # 120 prompt (input+cached) and 55 completion (output+reasoning) per pass.
+    assert result.usage.prompt_tokens == 240
+    assert result.usage.completion_tokens == 110
+    assert result.usage.total_tokens == 350
+    assert result.usage.estimated is True
+
+
 def test_nonzero_exit_is_error():
     runner = _RecordingRunner([_completed("", returncode=1, stderr="kaput")])
     result = CodexCliProvider(runner=runner).invoke(_req())
     assert result.error is not None and result.error.kind == "internal"
     assert "kaput" in result.error.message
+
+
+def test_deadline_exceeded_stderr_is_timeout_not_quota():
+    """The bare "exceeded" marker used to turn "deadline exceeded" into a
+    non-retriable quota_exhausted, killing turns that a retry would have
+    salvaged."""
+    runner = _RecordingRunner([_completed("", returncode=1, stderr="deadline exceeded")])
+    result = CodexCliProvider(runner=runner).invoke(_req())
+    assert result.error is not None
+    assert result.error.kind == "timeout"
+    assert result.error.retriable is True
+
+
+def test_context_length_stderr_classification_reachable():
+    """"context length exceeded" used to be swallowed by the bare
+    "exceeded" → quota_exhausted branch before the context-length check
+    could run."""
+    runner = _RecordingRunner([
+        _completed("", returncode=1, stderr="requested tokens exceed context length")
+    ])
+    result = CodexCliProvider(runner=runner).invoke(_req())
+    assert result.error is not None
+    assert result.error.kind == "context_length_exceeded"
+    assert result.error.retriable is False
+
+
+def test_quota_requires_quota_specific_phrase():
+    runner = _RecordingRunner([
+        _completed("", returncode=1, stderr="usage limit reached for your plan")
+    ])
+    result = CodexCliProvider(runner=runner).invoke(_req())
+    assert result.error is not None
+    assert result.error.kind == "quota_exhausted"
+    assert result.error.retriable is False
+
+
+def test_error_event_result_keeps_parsed_usage():
+    """A turn that reported usage before failing must not zero it out —
+    those tokens were spent and belong in budget accounting."""
+    stdout = (
+        '{"type":"thread.started","thread_id":"t"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,'
+        '"output_tokens":50,"reasoning_output_tokens":5}}\n'
+        '{"type":"error","message":"backend blew up"}\n'
+    )
+    runner = _RecordingRunner([_completed(stdout)])
+    result = CodexCliProvider(runner=runner).invoke(_req())
+    assert result.error is not None and result.error.kind == "internal"
+    assert result.usage.prompt_tokens == 120
+    assert result.usage.completion_tokens == 55
+    assert result.usage.total_tokens == 175
 
 
 def test_turn_failed_event_is_error():

@@ -19,7 +19,7 @@ provider invocation happens.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict
 
 from symposium.models import AgentConfig, Config
 from symposium.providers.base import ProviderAdapter
