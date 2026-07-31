@@ -73,8 +73,8 @@ symposium run \
   --script examples/scripts/walking-skeleton.json \
   --output runs/ examples/problem.md
 
-symposium replay runs/demo-walking-skeleton-001     # byte-identity check
-symposium watch  runs/demo-walking-skeleton-001     # ↑ watch it in the browser
+symposium replay runs/demo-walking-skeleton-001            # byte-identity check
+symposium watch --run runs/demo-walking-skeleton-001       # ↑ watch it in the browser
 ```
 
 ## Use it in Claude Code
@@ -168,7 +168,7 @@ A conformant runtime in any language is just as valid as this one, as long as it
 The **v1.0 spec is frozen** (ratified 2026-05-26); the runtime ships as `symposium-protocol` on PyPI. Issues, errata, and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md).
 
 ```bash
-pip install -e ".[test]" && pytest -q     # run the suite
+pip install -e ".[test]" && pytest        # run the suite
 ```
 
 ## License

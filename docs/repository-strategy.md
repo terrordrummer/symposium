@@ -29,12 +29,16 @@
   uses the owner-agnostic form in §1; do not commit a specific
   owner into the spec body.
 - **License**: Apache License 2.0 (rationale in §3 below).
-- **Status label**: `Experimental / Early Architecture Phase`.
-  The label is intended to communicate active exploration,
-  evolving APIs, architectural experimentation, and openness to
-  contributions. The label is informational; the protocol's
-  conformance surface is defined by `docs/specification.md` and
-  the JSON schemas under `docs/schemas/v1.0.0/`.
+- **Status label**: `Beta / Reference Implementation`. The
+  specification is frozen at v1.0 and the runtime ships on PyPI
+  as `symposium-protocol` (Trove classifier
+  `Development Status :: 4 - Beta`); the label communicates a
+  stable protocol surface with a reference implementation that
+  still iterates. (The original label during the architecture
+  phase was `Experimental / Early Architecture Phase`.) The
+  label is informational; the protocol's conformance surface is
+  defined by `docs/specification.md` and the JSON schemas under
+  `docs/schemas/v1.0.0/`.
 
 ## 2. Repository layout
 
@@ -60,13 +64,17 @@ symposium/
 │           ├── *.schema.json  — JSON Schemas (§5 of the spec)
 │           └── examples/      — fixtures + validate.py / validate_negative.py
 ├── symposium/                 — reference Python package
-│   ├── orchestrator/          — orchestrator_runtime (ADR-005)
+│   ├── models.py              — Pydantic mirrors of the §5 schemas
+│   ├── cli/                   — `symposium` CLI entrypoint (§11.2)
+│   ├── integrations/          — MCP server, per-persona CLI routing, persona factory (§11.4/§11.5)
+│   ├── observability/         — §7.9 offline metrics
 │   ├── personas/              — built-in persona configs
 │   ├── providers/             — ProviderAdapter implementations (§6)
-│   ├── replay/                — transcript_replay / execution_replay
-│   ├── scheduler/             — round / branch / queue mechanics
-│   ├── storage/               — run directory I/O
-│   └── cli/                   — `symposium` CLI entrypoint
+│   ├── replay/                — transcript_replay / execution_replay (§7.5/§7.6)
+│   ├── scheduler/             — orchestrator_runtime main loop (§4.11, ADR-005)
+│   ├── selector/              — §4.1 selector strategies (fixed / rules / llm)
+│   ├── storage/               — run directory I/O + transcript digest
+│   └── viewer/                — live browser viewer (`symposium watch`)
 ├── examples/
 │   └── configs/               — example YAML configs (vendor literals live here)
 └── tests/
@@ -108,8 +116,9 @@ The reference implementation targets standard Python packaging.
 Two installation paths are expected:
 
 ```bash
-# Stable / release install (when published to PyPI):
-pip install symposium
+# Stable / release install from PyPI (the distribution is named
+# `symposium-protocol`; the import package stays `symposium`):
+pip install symposium-protocol
 
 # Development install:
 git clone github.com/<owner>/symposium
@@ -315,7 +324,10 @@ The reference implementation's near-term work is biased toward
   (released as `v1.6.0`).** `symposium/integrations/mcp_server.py`
   wraps the runtime as a Model-Context-Protocol server
   (`symposium-mcp`) exposing `deliberate` (streaming) / `deliberate_muted` /
-  `get_run_summary` / `list_personas`, so a Claude client (Claude
+  `get_run_summary` / `list_personas` (the surface has since grown to
+  nine tools — the `deliberate_adaptive` / `*_muted` variants,
+  `get_run_status`, `generate_persona`, `get_version`; see the README),
+  so a Claude client (Claude
   Code / Desktop / claude.ai) can drive a deliberation over the stable
   `run_session(...)` API — and, with `deliberate` (the streaming default),
   follow each turn live as it is appended to the run journal. It is a pure

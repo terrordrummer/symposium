@@ -8,9 +8,11 @@ yet promoted to the roadmap live in spec §13.
 
 ## Current phase
 
-**Phase 1 — reference MVP shipped (v1.5.0).** The spec is frozen at
-v1.0.0; the reference Python runtime implements the Core MVP MUST-set
-(§1–§9):
+**Reference runtime shipped and iterating (v1.11.x, heading into
+v1.12).** The spec is frozen at v1.0.0; the reference Python runtime
+implements the Core MVP MUST-set (§1–§9) and has since grown a
+streaming-by-default MCP surface, adaptive deliberation (on-demand
+persona generation), and a live browser viewer:
 
 - ✅ Transcript system + RFC-8785 JCS `transcript_digest` (§7.7), atomic
   run-directory persistence (§7.1–§7.4)
@@ -26,9 +28,22 @@ v1.0.0; the reference Python runtime implements the Core MVP MUST-set
 - ✅ `transcript_replay` (§7.5) + `execution_replay` under the ten §7.6
   pinning conditions
 - ✅ §7.9 MVP observability metric set (offline, derived from the Artifact)
-- ✅ Selector (§4.1 / §5.11): `fixed`, `rules`, `llm` strategies
-- ✅ CLI (§11.2): `run` / `replay` / `validate` / `metrics` /
+- ✅ Selector (§4.1 / §5.11): `fixed`, `rules`, `llm` strategies,
+  including the optional §5.11 output fields (`excluded_agents`,
+  `missing_capabilities`, `reasoning`), populated by the `rules` /
+  `llm` strategies
+- ✅ CLI: `run` / `watch` / `replay` / `validate` / `metrics` /
   `execution-replay`
+- ✅ Live viewer (`symposium watch`, v1.11.0) — a read-only browser
+  page that tails `transcript.jsonl` over SSE: personas on a circle,
+  a glow on the speaker, animated arrows for directed inter-agent
+  requests; works on a running deliberation or a finished run
+
+**Known deviations from the §11.2 MVP CLI contract**: `--config` is
+required (the spec makes it optional over an implementation default);
+the `--max-rounds` / `--provider` overrides are not implemented; and
+`replay` / `execution-replay` take a run-dir path rather than a bare
+session id.
 
 ## What's next (per spec §12)
 
@@ -39,17 +54,19 @@ authoritative list with target windows:
   `disagreement_frequency`, `interaction_graph`, `delegation_frequency`,
   `time_to_finalize`); `summarize_context` / `replace_agent` recovery
   actions; plugin-style adapter discovery (entry points); `symposium eval`
-  CLI; richer selector output fields; `fallback_model` +
-  `Message.provider_used` / `model_used`.
+  CLI; `fallback_model` + `Message.provider_used` / `model_used`.
+  (The "richer selector output fields" item shipped — see the
+  selector bullet above.)
 - **v1+** — interactive event-stream execution mode + `observability_event`
   live stream; async job API; dynamic participant introduction
   (panel mutation); `EnsembleMode` (parallel first-pass perspectives);
   capability-based tool allowlists; external-loop adapter pattern.
-- **Roadmap** — HTML replay viewer; TTS narration; transcript
-  visualization (timeline / branch overlays); persona registry
-  (versioning, lifecycle, signing, marketplace); benchmarking suite +
-  curated problem sets; IDE plugin; HTTP/RPC service host pattern; voting /
-  weighted-confidence convergence; bundled research adapters.
+- **Roadmap** — TTS narration; persona registry (versioning,
+  lifecycle, signing, marketplace); benchmarking suite + curated
+  problem sets; IDE plugin; HTTP/RPC service host pattern; voting /
+  weighted-confidence convergence; bundled research adapters. (The
+  HTML replay viewer / transcript-visualization line shipped as the
+  v1.11.0 live viewer — see the current-phase list above.)
 
 ## Host integration (examples, not runtime concerns)
 
@@ -59,10 +76,14 @@ host-integration pattern (spec §11.4 / §11.5), built on the stable
 runtime. These are downstream of the protocol, not part of it.
 
 - ✅ **MCP server (`symposium-mcp`, v1.6.0)** — `symposium/integrations/`
-  exposes the runtime as MCP tools (`deliberate`, `deliberate_streaming`,
-  `get_run_summary`, `list_personas`) so a Claude client can launch a
-  deliberation — optionally **streaming each turn live** as the panel
-  produces it — and read its result, replay status, and metrics. Optional
+  exposes the runtime as MCP tools — today nine: `deliberate`,
+  `deliberate_muted`, `deliberate_adaptive`, `deliberate_adaptive_muted`,
+  `get_run_status`, `get_run_summary`, `list_personas`,
+  `generate_persona`, `get_version` (streaming is the default since
+  v1.10.12; the old `deliberate_streaming` name is gone) — so a Claude
+  client can launch a deliberation — **streaming each turn live** as
+  the panel produces it, unless a `*_muted` variant is chosen — and
+  read its result, replay status, and metrics. Optional
   `[mcp]` extra; the core install and CLI are unchanged. See the README
   "Use in Claude Code" section. This realizes the §12 "HTTP / RPC service
   host pattern" / IDE-integration line as a pure consumer of the public API.
@@ -88,6 +109,15 @@ runtime. These are downstream of the protocol, not part of it.
 
 ## Open follow-ups (post v1.10.x)
 
+- **Split the two oversized modules.** `symposium/scheduler/loop.py`
+  (~1,500 lines) and `symposium/integrations/mcp_server.py` (~1,800
+  lines) have each grown well past comfortable review size. Both
+  should be factored into smaller units — the loop into its phases
+  (round scheduling, verdict handling, branch/deferred mechanics,
+  failure policy), the MCP server into tool registration, streaming
+  plumbing, and the adaptive-deliberation orchestration — with no
+  behavior change. Ordinary refactoring debt; no spec / schema
+  impact.
 - **Forensic per-vendor usage detail.** The canonical `Usage`
   (`prompt_tokens` / `completion_tokens` / `total_tokens` / `cost_usd`)
   is provider-uniform per §6.5, which means provider-specific

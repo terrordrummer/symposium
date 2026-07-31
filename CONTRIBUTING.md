@@ -19,6 +19,19 @@ file operationalizes (§8).
   implementation; a different runtime in another language is equally valid
   as long as it conforms to the spec and validates against the schemas.
 
+### Schema errata
+
+One additive erratum has been ratified against the frozen v1.0.0
+schemas: `termination_artifact.schema.json` gained the **optional**
+diagnostic field `last_provider_failure` (a snapshot of the last
+provider error before retries were exhausted, populated when the
+termination reason is provider-attributable). Shipped in v1.10.7;
+artifacts produced by earlier versions simply omit it, so the change
+is additive-only and backward-compatible. This is the recorded
+exception to the freeze above — any further additive change publishes
+under `docs/schemas/v1.1.0/` per the §5.1 versioning policy rather
+than amending v1.0.0 in place.
+
 ## Coding standards
 
 - **Language**: Python ≥ 3.11. Type hints throughout; `from __future__
@@ -79,7 +92,7 @@ signing, marketplace) is spec §12 Roadmap, not part of this repository.
 3. **Run the gates locally** before opening a PR:
    ```bash
    pip install -e ".[test]"
-   pytest -q
+   pytest        # -ra -q already applied via addopts; a second -q would hide the summary
    python3 docs/schemas/v1.0.0/examples/validate.py          # 28 positive
    python3 docs/schemas/v1.0.0/examples/validate_negative.py  # 36 negative
    ```
