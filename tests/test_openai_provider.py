@@ -16,9 +16,6 @@ OpenAI endpoint is never reached. The test suite covers:
 from __future__ import annotations
 
 import json
-import os
-import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -147,7 +144,6 @@ def test_registry_resolves_openai_factory(monkeypatch):
     reg = default_registry()
     assert reg.has("openai")
     # The factory should produce an OpenAIProvider; we don't invoke it.
-    from symposium.models import Config
 
     cfg = _minimal_config()
     providers = reg.build_session_providers(cfg)

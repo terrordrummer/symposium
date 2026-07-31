@@ -11,7 +11,6 @@ import re
 
 from symposium.providers import FakeProvider
 from symposium.scheduler import run_session
-from symposium.storage.digest import compute_transcript_digest
 
 
 _TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -46,7 +45,6 @@ def test_match_failure_terminates_session(example_config):
         FakeProviderEntry,
         FakeProviderMatch,
         FakeProviderScript,
-        ProviderError,
         ProviderRawMessage,
         ProviderResult,
         Usage,

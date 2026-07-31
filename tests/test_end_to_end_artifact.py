@@ -27,7 +27,7 @@ def _load_registry(schemas_dir: Path) -> Registry:
 
 def test_walking_skeleton_produces_valid_artifact(tmp_path, repo_root, example_config, example_script):
     fp = FakeProvider(script=example_script)
-    artifact = run_session(example_config, {"default": fp}, runs_root=str(tmp_path))
+    run_session(example_config, {"default": fp}, runs_root=str(tmp_path))
 
     run_dir = tmp_path / example_config.session_id
     assert (run_dir / "artifact.json").exists()

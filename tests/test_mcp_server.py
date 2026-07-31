@@ -526,18 +526,8 @@ def test_artifact_carries_last_provider_failure_end_to_end(tmp_path, repo_root):
     the path the regression test in test_retry_backoff stops short of.
     """
     import json
-    from unittest.mock import patch
 
-    from symposium.models import (
-        ProviderError,
-        ProviderRawMessage,
-        ProviderResult,
-        Usage,
-    )
-    from symposium.integrations.mcp_server import _build_result, get_run_summary
-    from symposium.providers.fake import FakeProvider
-    from symposium.scheduler import run_session
-    from symposium.models import FakeProviderScript
+    from symposium.integrations.mcp_server import get_run_summary
 
     # FakeProvider entry that errors on the very first call (logician,
     # round 1). The match is intentionally loose so the same entry
