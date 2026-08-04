@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "symposium",
+  "description": "Slash commands for structured, sequential, adversarial multi-agent deliberation: run a debate, plan or reshape the panel, generate an expert, summarize a run.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Roberto Sartori",
+    "email": "roberto.sartori@gmail.com"
+  },
+  "homepage": "https://github.com/terrordrummer/symposium/tree/main/plugins/symposium",
+  "repository": "https://github.com/terrordrummer/symposium",
+  "license": "Apache-2.0",
+  "keywords": [ "deliberation", "multi-agent", "debate", "panel", "mcp", "personas" ]
+}

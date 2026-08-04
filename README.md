@@ -106,6 +106,32 @@ Claude maps these to `deliberate` / `deliberate_adaptive` / `get_run_summary` an
 
 > **Billing.** Logged in with a Pro/Max or ChatGPT subscription? CLI turns spend **subscription quota and rate limits**, not metered API dollars. The real ceiling under `cli-auto` is `max_wallclock_seconds` (default 1h) and your plan's rate limit — the token/cost caps are telemetry, not a hard budget. Only the `anthropic` / `openai` HTTP adapters bill per token.
 
+### Slash commands (optional plugin)
+
+Plain language is enough. If you'd rather be explicit — and skip the model
+deciding anything about your prompt — this repo also ships the commands as a
+Claude Code plugin:
+
+```
+/plugin marketplace add terrordrummer/symposium
+/plugin install symposium@symposium
+```
+
+| Command | Does |
+|---|---|
+| `/symposium_deliberate` | Adaptive panel, streamed live. The default. |
+| `/symposium_deliberate_silent` | Same, no streaming — one result at the end. |
+| `/symposium_deliberate_strict` | Fixed panel, no personas generated at runtime. |
+| `/symposium_deliberate_live` | Adaptive, plus a browser viewer with the circle of personas. |
+| `/symposium_plan_panel` | Plan the panel before launching: who's relevant, who's missing. |
+| `/symposium_reshape_panel` | Audit a panel for overlap and redundancy. |
+| `/symposium_generate_persona` | Design one expert for a capability gap. |
+| `/symposium_list_personas` | The six built-in personas. |
+| `/symposium_run_summary` | Outcome, digest, replay check and metrics for a run. |
+
+The commands dispatch the MCP call verbatim, with no pre-processing of your
+prompt. They need the MCP server registered as above.
+
 ## API keys: what's used, what isn't
 
 | Provider | API key |
@@ -160,6 +186,7 @@ The full rationale, and a comparison against AutoGen / CrewAI / LangGraph / Open
 - **[`docs/specification.md`](docs/specification.md)** — the normative protocol (language-independent) + 16 JSON Schemas under [`docs/schemas/v1.0.0/`](docs/schemas/v1.0.0/).
 - **`symposium/`** — the reference Python runtime (scheduler, providers, replay, viewer, MCP server, CLI).
 - **`examples/`**, **`tests/`** — runnable configs and the conformance suite.
+- **`plugins/symposium/`** — the Claude Code plugin: slash commands that drive the MCP server, versioned with the protocol they speak.
 
 A conformant runtime in any language is just as valid as this one, as long as it matches the spec and validates against the schemas.
 

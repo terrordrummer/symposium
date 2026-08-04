@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "symposium",
+  "owner": {
+    "name": "Roberto Sartori",
+    "email": "roberto.sartori@gmail.com"
+  },
+  "metadata": {
+    "description": "The Claude Code front end for Symposium: slash commands that drive the symposium MCP server, versioned alongside the protocol they speak."
+  },
+  "plugins": [
+    {
+      "name": "symposium",
+      "source": "./plugins/symposium",
+      "description": "Slash commands for structured, sequential, adversarial multi-agent deliberation: run a debate, plan or reshape the panel, generate an expert, summarize a run.",
+      "category": "productivity",
+      "keywords": [ "deliberation", "multi-agent", "debate", "panel", "mcp", "personas" ]
+    }
+  ]
+}
