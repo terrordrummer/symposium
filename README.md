@@ -120,9 +120,15 @@ Claude Code plugin:
 | Command | Does |
 |---|---|
 | `/symposium_deliberate` | Adaptive panel, streamed live. The default. |
-| `/symposium_deliberate_silent` | Same, no streaming — one result at the end. |
-| `/symposium_deliberate_strict` | Fixed panel, no personas generated at runtime. |
+| `/symposium_deliberate --silent` | Same, no streaming — one result at the end. |
+| `/symposium_deliberate --strict` | Fixed panel, no personas generated at runtime. |
+| `/symposium_deliberate --strict --silent` | Both. |
 | `/symposium_deliberate_live` | Adaptive, plus a browser viewer with the circle of personas. |
+
+> **0.2.0.** `--silent` and `--strict` used to be separate commands
+> (`/symposium_deliberate_silent`, `_strict`, `_strict_silent`). Five menu
+> entries for two booleans is four too many, and every session had to read and
+> tell them apart. They are flags now.
 | `/symposium_plan_panel` | Plan the panel before launching: who's relevant, who's missing. |
 | `/symposium_reshape_panel` | Audit a panel for overlap and redundancy. |
 | `/symposium_generate_persona` | Design one expert for a capability gap. |
