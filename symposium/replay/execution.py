@@ -159,6 +159,12 @@ def pinned_runtime(
 ) -> Iterator[None]:
     """Pin the runtime's two non-deterministic, digest-bearing sources.
 
+    LEGACY global-patching harness — retained for existing callers (golden
+    tests, third-party scripts). New code should prefer the per-session
+    injection on `run_session(..., id_source=..., clock_source=...,
+    started_at=...)`, which needs no process-global state and is safe under
+    concurrent sessions; `execution_replay` itself now uses that mechanism.
+
     Patches, on the scheduler module that actually calls them:
 
       * `_new_id` — message-id minting (normally `uuid.uuid4().hex`) is
@@ -172,11 +178,17 @@ def pinned_runtime(
         `clock()` (an ISO-8601 string). Patched on both
         `symposium.scheduler.loop` and `symposium.models` so no call site
         escapes the pin (per §7.6 #8's "any wall-clock-reading function").
+        NOT pinned: `Session.started_at`, which reads real wall-clock by
+        design so the pinned timestamp stream stays aligned — pass
+        `run_session(started_at=...)` to pin it explicitly.
 
     Both `id_source` and `clock` are plain zero-arg callables returning
     strings; the runtime calls them once per appended message in dispatch
     order (`now_utc_iso` is additionally called once for `Artifact.ended_at`,
     which does not enter the digest).
+
+    Thread-safety: this patches SHARED module objects. Never enter it while
+    another session may be running in the same process.
     """
     import symposium.models as _models
     from symposium.scheduler import loop as _loop
@@ -188,16 +200,16 @@ def pinned_runtime(
     saved_loop_now = _loop.now_utc_iso
     saved_models_now = _models.now_utc_iso
 
-    _loop._new_id = id_source  # type: ignore[assignment]
+    _loop._new_id = id_source
     if clock is not None:
-        _loop.now_utc_iso = clock  # type: ignore[assignment]
-        _models.now_utc_iso = clock  # type: ignore[assignment]
+        _loop.now_utc_iso = clock
+        _models.now_utc_iso = clock
     try:
         yield
     finally:
-        _loop._new_id = saved_new_id  # type: ignore[assignment]
-        _loop.now_utc_iso = saved_loop_now  # type: ignore[assignment]
-        _models.now_utc_iso = saved_models_now  # type: ignore[assignment]
+        _loop._new_id = saved_new_id
+        _loop.now_utc_iso = saved_loop_now
+        _models.now_utc_iso = saved_models_now
 
 
 def _sequential_id_source(prefix: str = "msg-", width: int = 3) -> Callable[[], str]:
@@ -449,17 +461,17 @@ def execution_replay(
     # --- #9 persona ---------------------------------------------------------
     if persona_hashes is not None:
         for aid, expected in persona_hashes.items():
-            ac = next((a for a in agents_all if a.id == aid), None)
-            if ac is None:
+            hashed = next((a for a in agents_all if a.id == aid), None)
+            if hashed is None:
                 raise PinningViolation(
                     "persona", f"persona_hashes references unknown agent {aid!r}"
                 )
-            if not isinstance(ac.persona_ref, Persona):
+            if not isinstance(hashed.persona_ref, Persona):
                 raise PinningViolation(
                     "persona",
                     f"agent {aid!r} persona_ref is an unresolved registry id; cannot hash it",
                 )
-            actual = persona_hash(ac.persona_ref)
+            actual = persona_hash(hashed.persona_ref)
             if actual != expected:
                 raise PinningViolation(
                     "persona",
@@ -503,17 +515,24 @@ def execution_replay(
     fresh_config = config.model_copy(update={"session_id": fresh_session_id})
 
     id_source = _recorded_id_source(original_artifact)
-    with pinned_runtime(id_source=id_source, clock=clock_source):
-        fresh_artifact = run_session(
-            fresh_config,
-            dict(providers),
-            runs_root=str(fresh_runs_root),
-            # §7.6: keep the retry-backoff RNG seeded from the ORIGINAL
-            # session_id, not from the `-replay`-suffixed fresh id. Otherwise
-            # the original and the replay sleep different amounts, which can
-            # flip a wallclock-cap decision and diverge the digest.
-            rng_seed=config.session_id,
-        )
+    # The pins are injected PER-SESSION (run_session kwargs), not by
+    # patching module globals: a replay can therefore execute concurrently
+    # with any live session in this process without corrupting the other's
+    # id/timestamp sequences. The start stamp is pinned to the ORIGINAL's
+    # so the replayed manifest/artifact carry the recorded wall-clock too.
+    fresh_artifact = run_session(
+        fresh_config,
+        dict(providers),
+        runs_root=str(fresh_runs_root),
+        # §7.6: keep the retry-backoff RNG seeded from the ORIGINAL
+        # session_id, not from the `-replay`-suffixed fresh id. Otherwise
+        # the original and the replay sleep different amounts, which can
+        # flip a wallclock-cap decision and diverge the digest.
+        rng_seed=config.session_id,
+        id_source=id_source,
+        clock_source=clock_source,
+        started_at=original_artifact.started_at,
+    )
     fresh_run_dir = fresh_runs_root / fresh_session_id
 
     original_digest = original_artifact.transcript_digest

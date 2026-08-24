@@ -58,6 +58,8 @@ import httpx
 import jsonschema
 
 from symposium.models import (
+    ErrorKind,
+    FinishReason,
     ProviderError,
     ProviderRawMessage,
     ProviderRequest,
@@ -339,7 +341,11 @@ class OpenAIProvider(ProviderAdapter):
                     "tool_calls": tool_calls,
                 }
                 next_messages: List[Dict[str, Any]] = list(current_messages) + [assistant_entry]
-                tools_by_name = {t.get("name"): t for t in (request.tools or [])}
+                tools_by_name: Dict[str, Dict[str, Any]] = {}
+                for t in request.tools or []:
+                    tname = t.get("name")
+                    if isinstance(tname, str):
+                        tools_by_name[tname] = t
 
                 # Process every tool_call in this iteration before re-invoking.
                 # On any tool error, terminate the loop with tool_failure.
@@ -763,6 +769,8 @@ class OpenAIProvider(ProviderAdapter):
         vendor_type = err.get("type") or ""
         vendor_message = err.get("message") or (resp.text or f"HTTP {status}")
 
+        kind: ErrorKind
+        retriable: bool
         if status == 408:
             kind, retriable = "timeout", True
         elif status in (502, 503, 504):
@@ -905,7 +913,7 @@ def _supports_reasoning_effort(model: str) -> bool:
     return m.startswith(("o1", "o3", "o4", "gpt-5"))
 
 
-def _normalize_finish_reason(vendor_finish: Optional[str]) -> str:
+def _normalize_finish_reason(vendor_finish: Optional[str]) -> FinishReason:
     """§6.10 OpenAI terminal mapping."""
     if vendor_finish == "stop":
         return "stop"

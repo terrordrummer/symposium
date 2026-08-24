@@ -66,6 +66,7 @@ Repository = "https://github.com/terrordrummer/symposium"
 [project.scripts]
 symposium = "symposium.cli:main"
 symposium-mcp = "symposium.integrations.mcp_server:main"
+symposium-launcher = "symposium.launcher:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["symposium"]
@@ -97,6 +98,8 @@ include = [
   "/symposium",
   "/docs/specification.md",
   "/docs/repository-strategy.md",
+  "/docs/symposium-2.0.md",
+  "/docs/avatar-assets.md",
   "/docs/schemas/v1.0.0",
   "/examples",
   "/tests",
@@ -120,3 +123,14 @@ select = ["E4", "E7", "E9", "F"]
 [tool.ruff.lint.per-file-ignores]
 # The scheduler keeps a documented block of mid-file imports.
 "symposium/scheduler/loop.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["symposium"]
+# Third-party stubs are not shipped for every dependency; the boundaries
+# are validated by the test suite instead.
+ignore_missing_imports = true
+no_implicit_optional = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true

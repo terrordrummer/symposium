@@ -14,6 +14,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from click.testing import CliRunner
+
+from symposium.cli.main import main
 from symposium.viewer.discovery import list_runs, newest_run
 from symposium.viewer.streamer import EdgeResolver, config_event, extract_text, message_event
 from symposium.viewer.tail import JournalTail
@@ -167,14 +170,37 @@ def test_config_event_layout(tmp_path):
     assert ids == ["logician", "researcher"]
     assert ev["personas"][0]["persona_class"] == "horizontal"
     assert ev["personas"][0]["label"] == "Logician"
+    avatar = ev["personas"][0]["avatar"]
+    assert avatar["profile_id"] == "logician"
+    assert avatar["asset_id"] == "logician"
+    assert avatar["display_name"] == "Logician"
+    assert avatar["portrait_url"] == "/static/avatars/logician.webp"
+    assert avatar["synthetic"] is True
+    assert avatar["voice"]["presentation"] == "masculine"
+    assert avatar["voice"]["speaker"] == "Richard"
     # bare-string persona_ref still yields a usable entry
     assert ev["personas"][1]["persona_id"] == "researcher"
+    assert ev["coordinator_profile"]["avatar"]["display_name"] == "Sartori"
 
 
 def test_config_event_missing_file(tmp_path):
     ev = config_event(tmp_path)
     assert ev["personas"] == []
     assert ev["coordinator"] is None
+    assert ev["coordinator_profile"] is None
+
+
+def test_config_event_partial_ids_use_safe_placeholders(tmp_path):
+    cfg = {
+        "agents": [{"id": None, "persona_ref": {"id": 42}}],
+        "coordinator": {"id": None},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    ev = config_event(tmp_path)
+    assert ev["personas"][0]["id"] == "?"
+    assert ev["personas"][0]["avatar"]["portrait_url"] is None
+    assert ev["coordinator"] == "coordinator"
+    assert ev["coordinator_profile"]["avatar"]["display_name"] == "Sartori"
 
 
 def test_edge_resolution_branch_turn():
@@ -234,3 +260,76 @@ def test_message_event_shape():
     assert ev["text"] == "hello"
     assert ev["direct_requests"][0]["type"] == "challenge"
     assert ev["edge"] is None
+
+
+def test_watch_absolute_run_path_rebases_the_runs_root(tmp_path, monkeypatch):
+    """`watch --run /path/to/run` must stream that path, not default runs/."""
+    run_dir = tmp_path / "external-runs" / "session-1"
+    run_dir.mkdir(parents=True)
+    captured = {}
+
+    def fake_serve(runs_root, **kwargs):
+        captured["runs_root"] = runs_root
+        captured.update(kwargs)
+
+    monkeypatch.setattr("symposium.viewer.server.serve", fake_serve)
+    result = CliRunner().invoke(
+        main,
+        ["watch", "--run", str(run_dir), "--no-open"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert Path(captured["runs_root"]).resolve() == run_dir.parent.resolve()
+    assert captured["run"] == run_dir.name
+    assert captured["open_browser"] is False
+    assert captured["workspace_root"] == Path(".symposium")
+
+
+def test_viewer_static_presence_contract_is_zero_cost_and_motionless():
+    """Guard the deliberate product choice against paid/moving regressions."""
+    static = Path(__file__).parents[1] / "symposium" / "viewer" / "static"
+    app = (static / "app.js").read_text(encoding="utf-8")
+    css = (static / "style.css").read_text(encoding="utf-8")
+    index = (static / "index.html").read_text(encoding="utf-8")
+
+    assert "setSpeaking(m.speaker)" in app
+    assert 'classList.add("speaker-focus")' in app
+    assert 'classList.add("thinker-focus")' in app
+    assert 'playbackMode: "manual"' in app
+    assert "readingDelayMs" in app
+    assert "replayNextButton" in index
+    assert "sessione" in index
+    assert "refreshWorkspace" in app
+    assert "syncWorkspace" in app
+    assert "state.workspaceSnapshot.revision !== snapshot.revision" in app
+    assert "sartoriPanel" in index
+    assert "sartoriCommandForm" in index
+    assert "roomCreateForm" in index
+    assert "agentCreateForm" in index
+    assert "roomPromptForm" in index
+    assert "Avvia discussione" in index
+    assert "executionActivity" in index
+    assert "Il loop è automatico" in index
+    assert "launcherControls" in index
+    assert "Chiudi Symposium" in index
+    assert 'withAuth("/api/control")' in app
+    assert 'withAuth("/api/executions")' in app
+    assert 'action: "start_session"' in app
+    assert "renderExecutionActivity" in app
+    assert "non devi fare nulla" in app
+    assert '!existing.classList.contains("thinking")' in app
+    assert 'withAuth("/api/system")' in app
+    assert 'withAuth("/api/system/shutdown")' in app
+    assert '"X-Symposium-Request": "1"' in app
+    assert "--identity-hue" in app
+    assert ".meeting-grid.speaker-focus .participant:not(.speaking)" in css
+    assert ".meeting-grid.thinker-focus:not(.speaker-focus)" in css
+    assert "brightness(.62)" in css
+    assert "@keyframes" not in css
+    assert "animation" not in css
+    assert "transition" not in css
+    assert "video" not in index.lower()
+    assert "simli" not in (app + index).lower()
+    assert "speechSynthesis" not in app
+    assert 'withAuth("/api/tts/synthesize")' in app
+    assert "avatarRerollButton" in index

@@ -21,7 +21,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 # Exponential backoff bounds for retriable provider failures (§4.9). The
 # initial sleep is small enough to not slow down tests against the
@@ -88,9 +88,11 @@ from symposium.models import (
     Config,
     ContextPacket,
     DirectRequest,
+    ExternalResearchRequest,
     LastProviderFailure,
     Message,
     PanelContractionContent,
+    PanelDisclosureEntry,
     Persona,
     ProviderError,
     ProviderRequest,
@@ -101,8 +103,11 @@ from symposium.models import (
     SynthesisOutcome,
     TerminationArtifact,
     TerminationOutcome,
+    TerminationReason,
     TurnStructuredOutput,
+    UnresolvedDisagreement,
     Usage,
+    UserInputRequest,
     Verdict,
     now_utc_iso,
 )
@@ -118,6 +123,30 @@ from symposium.storage import RunDirectory, RunWriter, compute_transcript_digest
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
+
+
+def _default_id() -> str:
+    """Default `Message.id` source. Lazy: resolves the module-global
+    `_new_id` at CALL time so the legacy `pinned_runtime(id_source=...)`
+    global patch keeps working for sessions constructed inside it."""
+    return _new_id()
+
+
+def _default_clock() -> str:
+    """Default message-timestamp source; lazy like `_default_id`."""
+    return now_utc_iso()
+
+
+def _default_monotonic() -> float:
+    """Default monotonic source for cap/deadline decisions; lazy so tests
+    can patch `loop.time.monotonic` as they always have."""
+    return time.monotonic()
+
+
+# Bound at IMPORT time (before any patching can occur): the session start
+# stamp always reads real wall-clock, exactly matching the historical
+# `field(default_factory=now_utc_iso)` binding semantics.
+_STARTED_AT_CLOCK = now_utc_iso
 
 
 @dataclass
@@ -152,7 +181,30 @@ class _Cumulative:
 
 @dataclass
 class Session:
-    """Runtime session state (§4.1, §4.2)."""
+    """Runtime session state (§4.1, §4.2).
+
+    Non-deterministic sources are injectable factories so a caller (the
+    §7.6 execution replay, golden tests) can pin them WITHOUT monkeypatching
+    module globals — the previous `pinned_runtime` approach was process-
+    global state and therefore unsafe alongside concurrent sessions:
+
+      * `id_factory`     — mints every `Message.id` (default `uuid4().hex`).
+      * `clock_factory`  — mints every message `timestamp` and the final
+        `Artifact.ended_at` (default `now_utc_iso()`).
+      * `monotonic_factory` — the monotonic source behind every hard-cap /
+        soft-deadline decision (default `time.monotonic()`).
+
+    The defaults resolve the underlying functions LAZILY (at call time), so
+    the legacy `pinned_runtime` global-patching context keeps working for
+    existing callers.
+
+    `started_at` / `started_monotonic` are derived in `__post_init__` unless
+    supplied explicitly. `started_at` deliberately reads REAL wall-clock
+    (not `clock_factory`): feeding it from the pinned clock would consume
+    the first entry of a replayed timestamp sequence and desync every
+    subsequent message stamp. A caller that needs a pinned start time (the
+    execution replay) passes `started_at=` directly.
+    """
 
     config: Config
     providers: Dict[str, _ProviderAdapter]
@@ -160,12 +212,15 @@ class Session:
     active_panel: List[str] = field(default_factory=list)
     deferred_queue: List[Tuple[DirectRequest, Message]] = field(default_factory=list)
     cumulative: _Cumulative = field(default_factory=_Cumulative)
-    cumulative_unresolved: List = field(default_factory=list)
+    cumulative_unresolved: List[UnresolvedDisagreement] = field(default_factory=list)
     round: int = 0
     turn_index: int = 0
     last_verdict: Optional[Verdict] = None
-    started_at: str = field(default_factory=now_utc_iso)
-    started_monotonic: float = field(default_factory=time.monotonic)
+    # Sentinels finalized in __post_init__ ("-1" can never be produced by a
+    # monotonic clock; "" is not a valid ISO stamp), keeping the public
+    # annotations concrete instead of Optional-everywhere.
+    started_at: str = field(default="")
+    started_monotonic: float = field(default=-1.0)
     # Session-bound RNG used for retry-backoff jitter. Seeded deterministically
     # from a *replay-stable* identity so the jitter sequence in the original
     # run matches the replay (§7.6 replay-divergence guard). The default
@@ -173,9 +228,22 @@ class Session:
     # `rng_seed=` to keep the seed identical across the original and the
     # `<session_id>-replay` reproduction.
     rng_seed: Optional[str] = None
-    rng: random.Random = field(default=None)  # type: ignore[assignment]
+    rng: Optional[random.Random] = None
+    # Non-Optional with lazy defaults (see the factory helpers above): the
+    # default wrappers resolve the underlying functions at CALL time, so
+    # legacy global patching keeps working while the annotations stay exact.
+    id_factory: Callable[[], str] = field(default=_default_id)
+    clock_factory: Callable[[], str] = field(default=_default_clock)
+    monotonic_factory: Callable[[], float] = field(default=_default_monotonic)
 
     def __post_init__(self) -> None:
+        if not self.started_at:
+            # Bound the ORIGINAL function object (import-time), mirroring the
+            # historical `field(default_factory=now_utc_iso)` semantics: a
+            # globally patched clock must not leak into the start stamp.
+            self.started_at = _STARTED_AT_CLOCK()
+        if self.started_monotonic < 0:
+            self.started_monotonic = self.monotonic_factory()
         if self.rng is None:
             seed_token = self.rng_seed or self.config.session_id
             self.rng = random.Random(f"symposium:backoff:{seed_token}")
@@ -183,6 +251,15 @@ class Session:
     # ------------------------------------------------------------------
     # Derived helpers
     # ------------------------------------------------------------------
+
+    def elapsed_seconds(self) -> float:
+        """Monotonic seconds consumed since session start.
+
+        Single seam for every §4.7 cap/deadline decision, so an injected
+        `monotonic_factory` drives them all consistently (both this read
+        and the `started_monotonic` anchor come from the same factory).
+        """
+        return self.monotonic_factory() - self.started_monotonic
 
     def agent_by_id(self, agent_id: str) -> AgentConfig:
         for a in self.config.agents:
@@ -192,14 +269,16 @@ class Session:
             return self.config.coordinator
         raise KeyError(f"agent {agent_id!r} not in config")
 
-    def panel_disclosure(self) -> List[dict]:
-        out: List[dict] = []
+    def panel_disclosure(self) -> List[PanelDisclosureEntry]:
+        out: List[PanelDisclosureEntry] = []
         for aid in self.active_panel:
             ac = self.agent_by_id(aid)
             persona_id = (
                 ac.persona_ref.id if isinstance(ac.persona_ref, Persona) else ac.persona_ref
             )
-            out.append({"id": ac.id, "role_summary": f"{persona_id} ({ac.provider}/{ac.model})"})
+            out.append(PanelDisclosureEntry(
+                id=ac.id, role_summary=f"{persona_id} ({ac.provider}/{ac.model})"
+            ))
         return out
 
     def messages_this_round(self) -> List[Message]:
@@ -211,7 +290,7 @@ class Session:
 # ---------------------------------------------------------------------------
 
 
-def check_hard_caps(session: Session) -> Optional[str]:
+def check_hard_caps(session: Session) -> Optional[TerminationReason]:
     """Return a termination reason if any *terminating* cap is breached, else None.
 
     Per §8.1 + §4.7, the terminating caps are: max_rounds, max_wallclock_seconds,
@@ -225,7 +304,7 @@ def check_hard_caps(session: Session) -> Optional[str]:
         return "budget_exceeded"
     if session.cumulative.cost_usd > b.max_total_cost_usd:
         return "budget_exceeded"
-    if (time.monotonic() - session.started_monotonic) > b.max_wallclock_seconds:
+    if session.elapsed_seconds() > b.max_wallclock_seconds:
         return "timeout"
     if session.round > b.max_rounds:
         return "budget_exceeded"
@@ -238,8 +317,7 @@ def check_hard_caps(session: Session) -> Optional[str]:
 
 def _remaining_wallclock_seconds(session: Session) -> float:
     """Seconds left before the hard wall-clock cap trips."""
-    elapsed = time.monotonic() - session.started_monotonic
-    return session.config.budget.max_wallclock_seconds - elapsed
+    return session.config.budget.max_wallclock_seconds - session.elapsed_seconds()
 
 
 def _synthesis_reserve_seconds(session: Session) -> float:
@@ -259,7 +337,7 @@ def _synthesis_reserve_seconds(session: Session) -> float:
     )
 
 
-def _budget_gate(session: Session) -> Optional[str]:
+def _budget_gate(session: Session) -> Optional[TerminationReason]:
     """Combined cap check for the points where a new turn may be opened.
 
     Returns a termination reason, or None to proceed. Layers a *soft*
@@ -698,9 +776,9 @@ def build_provider_request(
 class _InvokeResult:
     ok: bool
     result: Optional[ProviderResult]
-    terminating: Optional[str] = None  # termination reason (TerminationReason value)
+    terminating: Optional[TerminationReason] = None
     panel_contracted: bool = False
-    contraction_reason: Optional[str] = None  # "provider_unrecoverable" | "schema_error"
+    contraction_reason: Optional[_ContractionReason] = None
     # The last ProviderError observed before retries were exhausted —
     # used by `_terminate` to populate
     # `TerminationArtifact.last_provider_failure`, so an operator sees the
@@ -771,7 +849,7 @@ def _invoke_with_retry(
         provider = _provider_for(session, agent_id)
         # If FakeProvider: stash round/turn_index hints so match assertions work.
         if hasattr(provider, "last_request_round"):
-            provider.last_request_round = session.round  # type: ignore[attr-defined]
+            provider.last_request_round = session.round
             provider.last_request_turn_index = session.turn_index  # type: ignore[attr-defined]
         result = provider.invoke(request)
         session.cumulative.add(agent_id, result.usage)
@@ -796,7 +874,7 @@ def _invoke_with_retry(
                     ok=False,
                     result=result,
                     panel_contracted=True,
-                    contraction_reason=reason,  # type: ignore[arg-type]
+                    contraction_reason=reason,
                     last_error=last_error,
                 )
             # Retriable failure: backoff before next attempt (unless we're done).
@@ -819,12 +897,17 @@ def _invoke_with_retry(
         ok=False,
         result=None,
         panel_contracted=True,
-        contraction_reason=final_reason,  # type: ignore[arg-type]
+        contraction_reason=final_reason,
         last_error=last_error,
     )
 
 
-def _classify_unrecoverable(kind: str) -> str:
+# Closed cause set carried by panel-contraction records (§5.6) and by the
+# §4.9 escalation paths.
+_ContractionReason = Literal["provider_unrecoverable", "schema_error"]
+
+
+def _classify_unrecoverable(kind: str) -> _ContractionReason:
     if kind in ("malformed_response", "invalid_request"):
         return "schema_error"
     return "provider_unrecoverable"
@@ -844,7 +927,7 @@ def _extract_retry_after(details: Optional[Dict[str, object]]) -> Optional[float
         if v is None:
             continue
         try:
-            return float(v)
+            return float(v)  # type: ignore[arg-type]  # guarded by the except below
         except (TypeError, ValueError):
             continue
     return None
@@ -862,6 +945,9 @@ def run_session(
     runs_root: Optional[str] = None,
     selector_providers: Optional[Dict[str, _ProviderAdapter]] = None,
     rng_seed: Optional[str] = None,
+    id_source: Optional[Callable[[], str]] = None,
+    clock_source: Optional[Callable[[], str]] = None,
+    started_at: Optional[str] = None,
 ) -> Artifact:
     """Run a session to completion. Returns the persisted Artifact.
 
@@ -880,6 +966,16 @@ def run_session(
     sequence matches the original even though the replay run dir uses a
     `-replay`-suffixed session id.
 
+    `id_source` / `clock_source` / `started_at` are OPTIONAL pins for the
+    runtime's non-deterministic sources (§7.6 conditions: message-id
+    minting, message timestamps, session start stamp). They are injected
+    per-SESSION — no process-global patching — so concurrent sessions in
+    one process stay independent. `id_source` mints every `Message.id`;
+    `clock_source` mints every message timestamp and the final
+    `Artifact.ended_at`; `started_at` fixes the session start stamp (and
+    therefore the manifest `created_at`). When omitted, each source falls
+    back to its default (`uuid4().hex` ids, real UTC clock).
+
     If `runs_root` is given, the session is persisted under
     `runs_root/<session_id>/`.
     """
@@ -887,31 +983,48 @@ def run_session(
     # match, so a duplicated id would silently shadow its twin for the whole
     # deliberation. This is a runtime check, not a Config model validator —
     # schema-valid configs must still parse.
-    _check_agent_id_uniqueness(config)
-
-    session = Session(config=config, providers=providers, rng_seed=rng_seed)
-
     writer: Optional[RunWriter] = None
-    if runs_root is not None:
-        from pathlib import Path
+    try:
+        _check_agent_id_uniqueness(config)
+        _check_provider_coverage(config, providers)
+        session_kwargs: Dict[str, Any] = {"started_at": started_at or ""}
+        if id_source is not None:
+            session_kwargs["id_factory"] = id_source
+        if clock_source is not None:
+            session_kwargs["clock_factory"] = clock_source
+        session = Session(
+            config=config,
+            providers=providers,
+            rng_seed=rng_seed,
+            **session_kwargs,
+        )
 
-        rd = RunDirectory.for_session(Path(runs_root), config.session_id)
-        writer = RunWriter(rd)
-        writer.start(config, session.started_at)
+        if runs_root is not None:
+            from pathlib import Path
+
+            rd = RunDirectory.for_session(Path(runs_root), config.session_id)
+            writer = RunWriter(rd)
+            writer.start(config, session.started_at)
+    except BaseException:
+        # Provider instances are session-owned once handed to run_session.
+        # Setup failures (invalid ids, lock contention, filesystem errors)
+        # occur before the main loop's finally block, so close them here too.
+        _shutdown_providers(providers, selector_providers)
+        raise
 
     try:
         # 1) problem_statement message (round 0, turn_index 0). §4.1 appends it
         #    during **init**, BEFORE the **selector** phase — so even a selector
         #    failure persists a valid 1-message canonical_transcript.
         problem_msg = Message(
-            id=_new_id(),
+            id=session.id_factory(),
             speaker=config.originator,
             type="problem_statement",
             content=config.problem_statement,
             round=0,
             turn_index=0,
             branch_depth=0,
-            timestamp=now_utc_iso(),
+            timestamp=session.clock_factory(),
             usage=_zero_usage(),
         )
         session.transcript.append(problem_msg)
@@ -979,6 +1092,31 @@ def _check_agent_id_uniqueness(config: Config) -> None:
         )
 
 
+def _check_provider_coverage(
+    config: Config, providers: Dict[str, _ProviderAdapter]
+) -> None:
+    """Reject configs whose agents cannot resolve an adapter at run time.
+
+    `_provider_for` resolves each agent's adapter as
+    `providers[agent_id]` with a `providers["default"]` fallback. Without
+    this upfront check a coverage gap surfaced MID-RUN as a bare
+    `KeyError("default")`, which crash-marked the manifest instead of
+    failing fast with an actionable config error (mirrors the runtime-not-
+    model-level placement of `_check_agent_id_uniqueness`: schema-valid
+    configs must still parse).
+    """
+    if "default" in providers:
+        return
+    needed = [ac.id for ac in config.agents] + [config.coordinator.id]
+    missing = [aid for aid in needed if aid not in providers]
+    if missing:
+        raise ValueError(
+            f"no provider adapter for agent id(s) {missing!r} and no "
+            f"'default' fallback in the providers map "
+            f"({len(providers)} adapter(s) supplied)"
+        )
+
+
 def _shutdown_providers(*provider_maps: Optional[Dict[str, _ProviderAdapter]]) -> None:
     """Best-effort `shutdown()` of session-owned adapters at run teardown.
 
@@ -1003,13 +1141,19 @@ def _shutdown_providers(*provider_maps: Optional[Dict[str, _ProviderAdapter]]) -
                     pass
 
 
-def _emit_artifact(session, config, outcome, term, writer):
+def _emit_artifact(
+    session: Session,
+    config: Config,
+    outcome: "Union[SynthesisOutcome, TerminationOutcome]",
+    term: Optional[TerminationArtifact],
+    writer: Optional[RunWriter],
+) -> Artifact:
     """Build, persist, and return the final Artifact (§5.10).
 
     Shared by the normal round-loop exit and the §4.1 selector-failure path
     so both produce a schema-valid Artifact over the same transcript.
     """
-    ended_at = now_utc_iso()
+    ended_at = session.clock_factory()
     final_artifact = Artifact(
         session_id=config.session_id,
         config=config,
@@ -1026,7 +1170,9 @@ def _emit_artifact(session, config, outcome, term, writer):
     return final_artifact
 
 
-def _run_rounds(session: Session, writer: Optional[RunWriter]):
+def _run_rounds(
+    session: Session, writer: Optional[RunWriter]
+) -> Tuple[Union[SynthesisOutcome, TerminationOutcome], Optional[TerminationArtifact]]:
     """Execute rounds until termination or finalize. Returns (Outcome, Optional[TerminationArtifact])."""
     while True:
         # Open a new round
@@ -1082,8 +1228,12 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                 if agent_id in session.active_panel:
                     session.active_panel.remove(agent_id)
                 if not session.active_panel:
+                    # Escalate with the ACTUAL failure cause, not a hardcoded
+                    # reason: a schema_error that emptied the panel must not
+                    # surface as provider_unrecoverable.
                     return _terminate(
-                        session, writer, reason="provider_unrecoverable",
+                        session, writer,
+                        reason=inv.contraction_reason or "provider_unrecoverable",
                         last_provider_failure=_failure_from(session, agent_id, inv.last_error),
                     )
                 continue
@@ -1098,14 +1248,14 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                 return _terminate(session, writer, reason="schema_error")
 
             primary_msg = Message(
-                id=_new_id(),
+                id=session.id_factory(),
                 speaker=agent_id,
                 type="primary_turn",
                 content=tso.model_dump(exclude_none=True),
                 round=session.round,
                 turn_index=session.turn_index,
                 branch_depth=0,
-                timestamp=now_utc_iso(),
+                timestamp=session.clock_factory(),
                 usage=inv.result.usage,
             )
 
@@ -1189,9 +1339,14 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
                 last_provider_failure=_failure_from(session, coord_id, inv.last_error),
             )
         if inv.panel_contracted:
-            # Coordinator cannot be contracted per §4.9 — escalate.
+            # Coordinator cannot be contracted per §4.9 — escalate, carrying
+            # the ACTUAL failure cause (schema_error vs provider_unrecoverable)
+            # instead of the hardcoded provider_unrecoverable that pre-fix
+            # mislabeled coordinator schema failures and dropped the
+            # schema-error salvage semantics.
             return _terminate(
-                session, writer, reason="provider_unrecoverable",
+                session, writer,
+                reason=inv.contraction_reason or "provider_unrecoverable",
                 last_provider_failure=_failure_from(session, coord_id, inv.last_error),
             )
         assert inv.result is not None and inv.result.structured_output is not None
@@ -1203,14 +1358,14 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             # dict terminates with schema_error instead of crashing mid-run.
             return _terminate(session, writer, reason="schema_error")
         coord_msg = Message(
-            id=_new_id(),
+            id=session.id_factory(),
             speaker=coord_id,
             type="coordination_turn",
             content=verdict.model_dump(exclude_none=True),
             round=session.round,
             turn_index=session.turn_index,
             branch_depth=0,
-            timestamp=now_utc_iso(),
+            timestamp=session.clock_factory(),
             usage=inv.result.usage,
         )
         session.transcript.append(coord_msg)
@@ -1218,8 +1373,7 @@ def _run_rounds(session: Session, writer: Optional[RunWriter]):
             writer.append_message(coord_msg)
         session.last_verdict = verdict
         # Carry forward cumulative unresolved (M5).
-        for ud in verdict.unresolved_disagreements:
-            session.cumulative_unresolved.append(ud.model_dump(exclude_none=True))
+        session.cumulative_unresolved.extend(verdict.unresolved_disagreements)
 
         breach = check_hard_caps(session)
         if breach:
@@ -1268,7 +1422,7 @@ class _BranchTermination:
     main loop's primary-turn path already does this; pre-T2, the branch
     path silently dropped the error.
     """
-    reason: str
+    reason: TerminationReason
     last_error: Optional[ProviderError]
     target: str
 
@@ -1328,8 +1482,9 @@ def _dispatch_branch(
             # last member must terminate the run — the next ContextPacket
             # would otherwise be derived over an empty panel_disclosure
             # (min_length 1) and crash with an uncaught ValidationError.
+            # Carry the actual contraction cause, matching the primary path.
             return _BranchTermination(
-                reason="provider_unrecoverable",
+                reason=inv.contraction_reason or "provider_unrecoverable",
                 last_error=inv.last_error,
                 target=target,
             )
@@ -1349,7 +1504,7 @@ def _dispatch_branch(
     suggested_followups = list(tso.direct_requests or []) or None
 
     branch_msg = Message(
-        id=_new_id(),
+        id=session.id_factory(),
         speaker=target,
         type="branch_turn",
         content=TurnStructuredOutput(text=tso.text).model_dump(exclude_none=True),
@@ -1357,7 +1512,7 @@ def _dispatch_branch(
         round=session.round,
         turn_index=session.turn_index,
         branch_depth=1,
-        timestamp=now_utc_iso(),
+        timestamp=session.clock_factory(),
         usage=inv.result.usage,
         suggested_followups=suggested_followups,
     )
@@ -1455,14 +1610,14 @@ def _try_synthesis(
                 retriable=False,
             )
         synth_msg = Message(
-            id=_new_id(),
+            id=session.id_factory(),
             speaker=coord_id,
             type="synthesis",
             content=sc.model_dump(exclude_none=True),
             round=session.round,
             turn_index=session.turn_index,
             branch_depth=0,
-            timestamp=now_utc_iso(),
+            timestamp=session.clock_factory(),
             usage=inv.result.usage,
         )
         session.transcript.append(synth_msg)
@@ -1472,7 +1627,9 @@ def _try_synthesis(
     return None, inv.last_error
 
 
-def _attempt_finalize(session: Session, writer: Optional[RunWriter]):
+def _attempt_finalize(
+    session: Session, writer: Optional[RunWriter]
+) -> Tuple[Union[SynthesisOutcome, TerminationOutcome], Optional[TerminationArtifact]]:
     """§4.8 — invoke coordinator for a synthesis. On failure, fall back to terminate."""
     coord_id = session.config.coordinator.id
     outcome, last_error = _try_synthesis(
@@ -1514,11 +1671,11 @@ def _terminate(
     session: Session,
     writer: Optional[RunWriter],
     *,
-    reason: str,
-    pending=None,
-    last_provider_failure: Optional["LastProviderFailure"] = None,
+    reason: TerminationReason,
+    pending: Optional[Union[UserInputRequest, ExternalResearchRequest]] = None,
+    last_provider_failure: Optional[LastProviderFailure] = None,
     allow_synthesis: bool = True,
-):
+) -> Tuple[Union[SynthesisOutcome, TerminationOutcome], Optional[TerminationArtifact]]:
     """Build a TerminationOutcome and the per-§5.8 TerminationArtifact.
 
     `last_provider_failure` (Codex review T1 #2): when a provider-side
@@ -1544,35 +1701,38 @@ def _terminate(
         and reason in _SALVAGEABLE_TERMINATION_REASONS
         and _has_substantive_turn(session)
     ):
-        outcome, _ = _try_synthesis(
+        salvaged, _ = _try_synthesis(
             session,
             writer,
             timeout_seconds=_synthesis_timeout(session),
             attempts_override=1,
         )
-        if outcome is not None:
-            return outcome, None
+        if salvaged is not None:
+            return salvaged, None
 
     cumulative_usage = session.cumulative.to_usage()
     # Need the digest of the transcript *as terminated* (no synthesis added).
     digest = compute_transcript_digest(session.transcript)
 
-    kwargs = dict(
+    extra: Dict[str, Any] = {}
+    if reason == "user_input_required" and pending is not None:
+        extra["pending_user_input_request"] = pending
+    elif reason == "external_research_required" and pending is not None:
+        extra["pending_external_research_request"] = pending
+    if last_provider_failure is not None:
+        extra["last_provider_failure"] = last_provider_failure
+
+    term = TerminationArtifact(
         reason=reason,
         final_round=session.round,
         cumulative_usage=cumulative_usage,
         most_recent_verdict=session.last_verdict,
-        unresolved_disagreements=session.last_verdict.unresolved_disagreements if session.last_verdict else [],
+        unresolved_disagreements=(
+            session.last_verdict.unresolved_disagreements if session.last_verdict else []
+        ),
         transcript_digest=digest,
+        **extra,
     )
-    if reason == "user_input_required" and pending is not None:
-        kwargs["pending_user_input_request"] = pending
-    elif reason == "external_research_required" and pending is not None:
-        kwargs["pending_external_research_request"] = pending
-    if last_provider_failure is not None:
-        kwargs["last_provider_failure"] = last_provider_failure
-
-    term = TerminationArtifact(**kwargs)  # type: ignore[arg-type]
     outcome = TerminationOutcome(termination_artifact=term)
     return outcome, term
 
@@ -1604,21 +1764,21 @@ def _append_panel_contraction(
     session: Session,
     writer: Optional[RunWriter],
     agent_id: str,
-    reason: Optional[str],
+    reason: Optional[_ContractionReason],
 ) -> None:
     session.turn_index += 1
     pc_msg = Message(
-        id=_new_id(),
+        id=session.id_factory(),
         speaker="runtime",
         type="panel_contraction",
         content=PanelContractionContent(
             agent_id=agent_id,
-            reason=reason or "provider_unrecoverable",  # type: ignore[arg-type]
+            reason=reason or "provider_unrecoverable",
         ).model_dump(),
         round=session.round,
         turn_index=session.turn_index,
         branch_depth=0,
-        timestamp=now_utc_iso(),
+        timestamp=session.clock_factory(),
         usage=_zero_usage(),
     )
     session.transcript.append(pc_msg)

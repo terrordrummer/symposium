@@ -1,6 +1,6 @@
 """RunWriter lock lifecycle + journal truncation regressions.
 
-Pins three storage-writer failure modes:
+Pins storage-writer failure modes including:
 
   * a second writer whose start() fails with RunDirectoryLocked must NOT
     release (unlink) the active writer's lockfile when it is deleted /
@@ -15,6 +15,7 @@ Pins three storage-writer failure modes:
 
 from __future__ import annotations
 
+import builtins
 import gc
 import json
 import os
@@ -103,6 +104,65 @@ def test_failed_second_writer_does_not_release_active_lock(tmp_path, example_con
     active.append_message(msg)
     active.finalize(_termination_artifact(example_config, [msg]))
     assert not lock.exists()
+
+
+def test_start_manifest_failure_releases_owned_lock(
+    tmp_path, example_config, monkeypatch
+):
+    """A persistence error after lock acquisition must not wedge the run dir."""
+    rd = RunDirectory.for_session(tmp_path, example_config.session_id)
+    writer = RunWriter(rd)
+
+    def fail_manifest(_manifest):
+        raise OSError("manifest filesystem failure")
+
+    monkeypatch.setattr(writer, "_write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="manifest filesystem failure"):
+        writer.start(example_config, now_utc_iso())
+
+    assert not (rd.base / ".lock").exists()
+
+
+def test_start_journal_open_failure_releases_owned_lock(
+    tmp_path, example_config, monkeypatch
+):
+    """The config/manifest may exist, but a failed journal open is not a lock leak."""
+    rd = RunDirectory.for_session(tmp_path, example_config.session_id)
+    writer = RunWriter(rd)
+    real_open = builtins.open
+
+    def fail_journal(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(rd.journal_path):
+            raise OSError("journal filesystem failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(writer_mod, "open", fail_journal, raising=False)
+    with pytest.raises(OSError, match="journal filesystem failure"):
+        writer.start(example_config, now_utc_iso())
+
+    assert not (rd.base / ".lock").exists()
+    manifest = json.loads(rd.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "crashed"
+
+
+def test_crash_manifest_failure_still_closes_journal_and_releases_lock(
+    tmp_path, example_config, monkeypatch
+):
+    """Cleanup is unconditional when even the best-effort crash write fails."""
+    rd = RunDirectory.for_session(tmp_path, example_config.session_id)
+    writer = RunWriter(rd)
+    writer.start(example_config, now_utc_iso())
+
+    def fail_manifest(_manifest):
+        raise OSError("crash manifest filesystem failure")
+
+    monkeypatch.setattr(writer, "_write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="crash manifest filesystem failure"):
+        writer.mark_crashed()
+
+    assert not (rd.base / ".lock").exists()
+    with pytest.raises(RuntimeError, match=r"start\(\)"):
+        writer.append_message(_problem_msg(example_config))
 
 
 # ---------------------------------------------------------------------------

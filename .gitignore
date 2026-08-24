@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+/Symposium.app/
 downloads/
 eggs/
 .eggs/
@@ -226,3 +227,6 @@ docs/specification-v0-draft.md
 
 # Local deliberation run output (per-session artifacts; not part of the package)
 runs/
+
+# Symposium 2.x local workspace (rooms, agent instructions, onboarding context)
+.symposium/

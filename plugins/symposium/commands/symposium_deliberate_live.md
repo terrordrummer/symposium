@@ -1,5 +1,5 @@
 ---
-description: Symposium deliberation with a LIVE browser viewer (circle of personas, glow, animated direct-request arrows, optional per-persona TTS). Pass the problem as $ARGUMENTS.
+description: Symposium deliberation with a LIVE video-call viewer (synthetic portraits, presence states, direct-request arrows, optional per-persona TTS). Pass the problem as $ARGUMENTS.
 ---
 
 Run a Symposium deliberation and watch it unfold live in the browser.
@@ -7,8 +7,8 @@ Run a Symposium deliberation and watch it unfold live in the browser.
 Do this in TWO steps, in order:
 
 **Step 1 — launch the viewer (background).** Run this Bash command in the
-background (it serves a read-only viewer that tails the run's
-`transcript.jsonl` and auto-follows the newest run under `runs/`):
+background (it serves the meeting workspace, reads the run's
+`transcript.jsonl`, and auto-follows the newest run under `runs/`):
 
 ```
 symposium watch --runs-dir runs
@@ -33,10 +33,16 @@ $ARGUMENTS
 
 Do NOT analyze the problem, do NOT suggest a panel composition, do NOT
 pre-process the prompt. Dispatch the MCP call exactly as specified. While
-it runs, the browser shows: personas on a circle (coordinator at the
-centre), a glow on whoever is speaking, a live chat panel, and an animated
-labelled arrow for every directed inter-agent request (`branch_turn` born
-from a `direct_request`). The user can toggle per-persona text-to-speech.
+it runs, the browser shows: a video-call grid of explicitly synthetic
+photographic identities, listening/thinking/speaking states, a live chat
+panel, and a static labelled connector for every directed inter-agent request
+(`branch_turn` born from a `direct_request`). The user can toggle per-persona
+text-to-speech. The portraits are still images, not lip-synced video. When the
+local `.symposium` workspace exists, the room title and participant membership
+follow Sartori's active-room state; the run selector remains a separate
+session-history control. The Sartori panel can manage rooms and memberships;
+the conversation composer may start a separate immutable v1 run from the
+active room, but never mutates an existing run artifact.
 
 When the final result returns, summarize:
 

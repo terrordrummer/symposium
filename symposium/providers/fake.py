@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Optional
 
 from symposium.models import (
+    ErrorKind,
     FakeProviderScript,
     ProviderError,
     ProviderRawMessage,
@@ -121,7 +122,7 @@ class FakeProvider(ProviderAdapter):
         return None
 
 
-def _synth_error_result(kind: str, message: str) -> ProviderResult:
+def _synth_error_result(kind: ErrorKind, message: str) -> ProviderResult:
     return ProviderResult(
         messages=[ProviderRawMessage(role="assistant", content="")],
         tool_events=[],

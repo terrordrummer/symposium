@@ -161,6 +161,36 @@ def test_successful_turn_extracts_structured_output_and_usage():
     assert result.usage.estimated is True
 
 
+def test_structured_output_tool_stop_is_a_successful_terminal_result():
+    """Claude Code implements --json-schema with an internal output tool.
+
+    Version 2.1.229 can return a successful result envelope containing the
+    validated object while the API stop reason remains ``tool_use``.  The
+    structured object is consumable and must not terminate the room run.
+    """
+    runner = _RecordingRunner([
+        _completed(_cli_json(structured={"text": "My turn."}, stop_reason="tool_use"))
+    ])
+
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+
+    assert result.error is None
+    assert result.finish_reason == "stop"
+    assert result.structured_output == {"text": "My turn."}
+
+
+def test_tool_stop_without_structured_output_remains_an_error():
+    runner = _RecordingRunner([
+        _completed(_cli_json(structured=None, stop_reason="tool_use"))
+    ])
+
+    result = ClaudeCliProvider(runner=runner).invoke(_turn_request())
+
+    assert result.error is not None
+    assert result.error.kind == "internal"
+    assert len(runner.calls) == 1
+
+
 def test_argv_and_stdin_translation():
     runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
     ClaudeCliProvider(runner=runner).invoke(_turn_request(model="opus"))
@@ -168,11 +198,17 @@ def test_argv_and_stdin_translation():
     argv = runner.calls[0]["argv"]
     assert argv[:4] == ["claude", "-p", "--output-format", "json"]
     assert "--model" in argv and argv[argv.index("--model") + 1] == "opus"
-    # The system block is folded into stdin behind a `[SYSTEM]` sentinel —
-    # never on argv (visible to `ps`).
-    assert "--system-prompt" not in argv
+    # A small public constant replaces Claude Code's coding-agent prompt, while
+    # private persona material remains on stdin and out of `ps`.
+    assert "--system-prompt" in argv
+    system_arg = argv[argv.index("--system-prompt") + 1]
+    assert "bounded Symposium deliberation" in system_arg
+    assert "You are the logician." not in " ".join(argv)
     # the expected schema is passed via --json-schema
     assert "--json-schema" in argv
+    assert "--safe-mode" in argv
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "--no-session-persistence" in argv
     schema = json.loads(argv[argv.index("--json-schema") + 1])
     assert "text" in schema["properties"]
     stdin_payload = runner.calls[0]["input"]
@@ -421,6 +457,15 @@ def test_disable_mcps_opt_out():
     argv = runner.calls[0]["argv"]
     assert "--strict-mcp-config" not in argv
     assert "--mcp-config" not in argv
+
+
+def test_safe_mode_opt_out_for_older_cli_versions():
+    runner = _RecordingRunner([_completed(_cli_json(structured={"text": "t"}))])
+    ClaudeCliProvider(runner=runner, safe_mode=False).invoke(_turn_request())
+    argv = runner.calls[0]["argv"]
+    assert "--safe-mode" not in argv
+    assert "--tools" not in argv
+    assert "--no-session-persistence" not in argv
 
 
 def test_env_scrubs_inherited_claude_code_state(monkeypatch):

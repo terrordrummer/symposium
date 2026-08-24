@@ -91,14 +91,16 @@ signing, marketplace) is spec §12 Roadmap, not part of this repository.
    existing suite green.
 3. **Run the gates locally** before opening a PR:
    ```bash
-   pip install -e ".[test]"
-   pytest        # -ra -q already applied via addopts; a second -q would hide the summary
+   python -m pip install -e ".[test]" "ruff>=0.15,<0.16" "mypy>=1.11"
+   ruff check .
+   python -m mypy
+   pytest --cov=symposium --cov-fail-under=75
    python3 docs/schemas/v1.0.0/examples/validate.py          # 28 positive
    python3 docs/schemas/v1.0.0/examples/validate_negative.py  # 36 negative
    ```
-4. **Open a PR** against `main`. CI runs two required checks —
-   `schemas (positive + negative)` and `python reference impl (pytest)` —
-   and both MUST pass before merge.
+4. **Open a PR** against `main`. CI runs four required checks —
+   `schemas (positive + negative)`, `ruff`, `mypy`, and
+   `python reference impl (pytest)` — and all four MUST pass before merge.
 5. **Spec ↔ code coupling**: if a change touches a behaviour the spec
    pins, cite the section (`§4.x`) in the PR description. Do not edit the
    frozen spec/schemas to fit the code.

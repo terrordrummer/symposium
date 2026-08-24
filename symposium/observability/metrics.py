@@ -16,9 +16,6 @@ chosen heuristic are documented inline next to that derivation.
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +23,9 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from symposium.models import Artifact, TerminationReason
+from symposium.models import Artifact, TerminationOutcome, TerminationReason
+from symposium.storage.atomic import atomic_write_text
+from symposium.storage.digest import serialize_pretty
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +344,7 @@ def compute_metrics(artifact: Artifact) -> ObservabilityMetrics:
     outcome = artifact.outcome
     outcome_kind = outcome.kind
     termination_reason: Optional[TerminationReason] = None
-    if outcome_kind == "termination":
+    if isinstance(outcome, TerminationOutcome):
         termination_reason = outcome.termination_artifact.reason
 
     metrics = ObservabilityMetrics(
@@ -479,44 +478,14 @@ def _derive_deferred_queue_max(
 def write_metrics(run_dir: Path, metrics: ObservabilityMetrics) -> Path:
     """Atomically write `<run_dir>/metrics.json`.
 
-    Same temp-file → fsync → rename pattern as §7.4 for the Artifact.
-    The on-disk form is `json.dumps(..., indent=2, sort_keys=True)` for
-    diff stability; there is no v1.0.0 schema for the observability
-    output (§7.10 defers schema publication to v1+).
+    Same temp-file → fsync → rename pattern as §7.4 for the Artifact
+    (shared `storage.atomic.atomic_write_text`). The on-disk form is the
+    sorted-keys pretty JSON used by every other artifact; there is no
+    v1.0.0 schema for the observability output (§7.10 defers schema
+    publication to v1+).
     """
     run_dir = Path(run_dir)
     out_path = run_dir / "metrics.json"
     payload = metrics.model_dump(mode="json", exclude_none=False)
-    text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    _atomic_write_text(out_path, text)
+    atomic_write_text(out_path, serialize_pretty(payload))
     return out_path
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, path)
-        # Fsync the parent directory so the rename is durable (same
-        # pattern as the §7.4 storage writer).
-        try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except (OSError, AttributeError):
-            pass  # not supported on Windows or some filesystems
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise

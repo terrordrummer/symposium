@@ -155,7 +155,7 @@ def validate_structured_output(
         return None
     except ValidationError as exc:
         errs = exc.errors()
-        first = errs[0] if errs else {}
+        first: Dict[str, Any] = dict(errs[0]) if errs else {}
         loc = first.get("loc") or ()
         return {
             "failing_path": "/".join(str(p) for p in loc) or "<root>",

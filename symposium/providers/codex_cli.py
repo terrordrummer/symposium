@@ -45,6 +45,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from symposium.models import (
+    FinishReason,
     ProviderError,
     ProviderRawMessage,
     ProviderRequest,
@@ -393,7 +394,7 @@ class CodexCliProvider(ProviderAdapter):
                 usage=usage,
             )
 
-        finish = "stop"
+        finish: FinishReason = "stop"
 
         if schema_json is None:
             return ProviderResult(
@@ -521,7 +522,8 @@ def _parse_jsonl(stdout: str):
                 em = error_event.get("message")
                 if isinstance(em, str):
                     existing_msg = em.strip()
-            new_msg = ev.get("message") if isinstance(ev.get("message"), str) else ""
+            raw_msg = ev.get("message")
+            new_msg = raw_msg if isinstance(raw_msg, str) else ""
             if not existing_msg and new_msg.strip():
                 error_event = ev
             elif error_event is None:

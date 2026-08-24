@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import click
 import yaml
@@ -60,6 +60,7 @@ from symposium.providers import (
     default_registry,
     make_fake_factory,
 )
+from symposium.providers.base import ProviderAdapter
 from symposium.replay import PinningViolation, execution_replay, replay_transcript
 from symposium.scheduler import run_session
 
@@ -67,7 +68,7 @@ from symposium.scheduler import run_session
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(package_name="symposium-protocol")
 def main() -> None:
-    """Reference runtime for the Symposium 1.0 protocol."""
+    """Symposium v1 runtime plus the local 2.x room workspace."""
 
 
 @main.command("run")
@@ -134,7 +135,7 @@ def run_cmd(
 
     # §4.1 `llm` selector: a distinct FakeProvider drives the single selector
     # invocation so it never consumes deliberation-script entries.
-    selector_providers = None
+    selector_providers: Optional[Dict[str, ProviderAdapter]] = None
     if config.selector.strategy == "llm" and selector_script_path is not None:
         sel_fp = FakeProvider(script=_load_script(selector_script_path))
         selector_providers = {"default": sel_fp}
@@ -169,29 +170,318 @@ def run_cmd(
     "--run", "run",
     type=click.Path(file_okay=False, path_type=Path),
     default=None,
-    help="Pin a single run dir instead of following the newest one.",
+    help="Pin a single run directory path or a name under --runs-dir.",
+)
+@click.option(
+    "--workspace-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+    help="Local Symposium 2.x workspace shown as the active room.",
 )
 @click.option("--host", default="127.0.0.1", show_default=True, help="Bind host.")
 @click.option("--port", default=0, show_default=True, help="Bind port (0 = auto-pick a free port).")
+@click.option(
+    "--token", "token", default=None,
+    help="Require a bearer token on every request (header or ?token=). "
+         "When omitted and --host is not loopback, a random token is "
+         "generated and printed.",
+)
 @click.option("--no-open", "no_open", is_flag=True, help="Do not open a browser window.")
-def watch_cmd(runs_dir: Path, run: Optional[Path], host: str, port: int, no_open: bool) -> None:
-    """Open a read-only live viewer for a (possibly running) deliberation.
+def watch_cmd(
+    runs_dir: Path,
+    run: Optional[Path],
+    workspace_dir: Path,
+    host: str,
+    port: int,
+    token: Optional[str],
+    no_open: bool,
+) -> None:
+    """Open the live meeting workspace for a deliberation.
 
     Serves a single-page browser viewer that tails `transcript.jsonl` over
-    SSE: personas on a circle (coordinator at the centre), a glow on the
-    speaker, a live chat panel, and an animated arrow for every directed
-    inter-agent request (branch_turn). Works on a finished run too (replay).
-    Pure consumer — it never writes to the run directory.
+    SSE: a meeting grid with static synthetic photographic identities,
+    participant presence states, a live chat panel, and a connector for every
+    directed inter-agent request (branch_turn). The active speaker stays bright
+    while the other participants are attenuated. Works on a finished run too
+    (replay). Existing run artifacts remain read-only. The Sartori panel
+    controls the separate local 2.x workspace, and the conversation composer
+    can start a new immutable run with the agents currently in the room. The
+    viewer never calls an avatar service or selects a metered HTTP provider.
     """
     from symposium.viewer.server import serve
 
+    selected_run: Optional[str] = None
+    if run is not None:
+        # A bare name is resolved by the server under --runs-dir. A path
+        # (absolute or with an explicit parent such as runs/session-1)
+        # instead defines both the root and selected directory. Previously
+        # serve() discarded every parent via Path(run).name while retaining
+        # the default runs root, so `--run /tmp/runs/session-1` opened a page
+        # whose stream always returned 404.
+        if run.is_absolute() or run.parent != Path("."):
+            resolved_run = run.expanduser().resolve()
+            runs_dir = resolved_run.parent
+            selected_run = resolved_run.name
+        else:
+            selected_run = run.name
+
     serve(
         runs_dir,
+        workspace_root=workspace_dir,
         host=host,
         port=port,
         open_browser=not no_open,
-        run=str(run) if run is not None else None,
+        run=selected_run,
+        token=token,
     )
+
+
+# ---------------------------------------------------------------------------
+# Symposium 2.x local control plane (outside the frozen v1 schemas)
+# ---------------------------------------------------------------------------
+
+
+@main.group("workspace")
+def workspace_group() -> None:
+    """Create and inspect Sartori's local workspace."""
+
+
+@workspace_group.command("init")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+@click.option("--name", default="Symposium Workspace", show_default=True)
+def workspace_init_cmd(state_dir: Path, name: str) -> None:
+    """Initialize the default Symposium room, panel, and Sartori."""
+    cp = _control_plane(state_dir)
+    state = cp.ensure_initialized(name=name)
+    click.echo(f"workspace={state.workspace.id}")
+    click.echo(f"active_room={state.workspace.active_room_id}")
+    click.echo(f"agents={len(state.agents)}")
+    click.echo(f"persisted_to={cp.store.path}")
+
+
+@workspace_group.command("status")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+@click.option("--json-output", is_flag=True, help="Emit the public snapshot as JSON.")
+def workspace_status_cmd(state_dir: Path, json_output: bool) -> None:
+    """Show the active room and its current participants."""
+    snapshot = _control_snapshot(state_dir)
+    if json_output:
+        click.echo(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    room = snapshot["active_room"]
+    click.echo(f"workspace={snapshot['workspace']['name']}")
+    click.echo(f"active_room={room['id']} ({room['name']})")
+    click.echo(f"purpose={room['purpose']}")
+    click.echo("participants:")
+    for participant in snapshot["participants"]:
+        click.echo(
+            f"  {participant['id']} · {participant['role']} · "
+            f"{participant['presence']}"
+        )
+
+
+@main.group("room")
+def room_group() -> None:
+    """Create, switch, archive, and staff work rooms."""
+
+
+@room_group.command("create")
+@click.argument("name")
+@click.option("--purpose", required=True, help="Room purpose and context boundary.")
+@click.option("--id", "room_id", default=None, help="Stable room id (derived from name by default).")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def room_create_cmd(name: str, purpose: str, room_id: Optional[str], state_dir: Path) -> None:
+    """Create a room; Sartori joins it in listening mode."""
+    cp = _control_plane(state_dir)
+    try:
+        room = cp.create_room(name, purpose, room_id=room_id)
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"created_room={room.id}")
+    click.echo("sartori=listening")
+
+
+@room_group.command("list")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def room_list_cmd(state_dir: Path) -> None:
+    """List rooms and mark the active one."""
+    snapshot = _control_snapshot(state_dir)
+    for room in snapshot["rooms"]:
+        marker = "*" if room["active"] else " "
+        click.echo(
+            f"{marker} {room['id']} · {room['name']} · {room['status']} · "
+            f"{room['participant_count']} participants"
+        )
+
+
+@room_group.command("switch")
+@click.argument("room")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def room_switch_cmd(room: str, state_dir: Path) -> None:
+    """Make a room Sartori's active work context."""
+    cp = _control_plane(state_dir)
+    try:
+        selected = cp.switch_room(room)
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"active_room={selected.id}")
+
+
+@room_group.command("archive")
+@click.argument("room")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def room_archive_cmd(room: str, state_dir: Path) -> None:
+    """Archive an inactive room while preserving its event trail."""
+    cp = _control_plane(state_dir)
+    try:
+        archived = cp.archive_room(room)
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"archived_room={archived.id}")
+
+
+@room_group.command("invite")
+@click.argument("agent")
+@click.option("--room", default=None, help="Room id/name; defaults to the active room.")
+@click.option(
+    "--role",
+    type=click.Choice(["member", "guest", "observer"]),
+    default="guest",
+    show_default=True,
+)
+@click.option("--context", default=None, help="Room-scoped onboarding context.")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def room_invite_cmd(
+    agent: str,
+    room: Optional[str],
+    role: str,
+    context: Optional[str],
+    state_dir: Path,
+) -> None:
+    """Invite an existing global agent into a room."""
+    cp = _control_plane(state_dir)
+    try:
+        membership = cp.invite_agent(
+            agent, room=room, role=role, onboarding_context=context
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"invited_agent={membership.agent_id}")
+    click.echo(f"room={membership.room_id}")
+    click.echo(f"presence={membership.presence}")
+
+
+@room_group.command("dismiss")
+@click.argument("agent")
+@click.option("--room", default=None, help="Room id/name; defaults to the active room.")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def room_dismiss_cmd(agent: str, room: Optional[str], state_dir: Path) -> None:
+    """Dismiss an agent from a room while preserving its visit record."""
+    cp = _control_plane(state_dir)
+    try:
+        membership = cp.dismiss_agent(agent, room=room)
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"dismissed_agent={membership.agent_id}")
+    click.echo(f"room={membership.room_id}")
+
+
+@main.group("agent")
+def agent_group() -> None:
+    """Create and inspect reusable global agents."""
+
+
+@agent_group.command("create")
+@click.argument("agent_id")
+@click.option("--name", "display_name", required=True)
+@click.option("--instructions", required=True)
+@click.option("--capability", "capabilities", multiple=True)
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def agent_create_cmd(
+    agent_id: str,
+    display_name: str,
+    instructions: str,
+    capabilities: tuple[str, ...],
+    state_dir: Path,
+) -> None:
+    """Create a reusable agent without placing it in a room."""
+    cp = _control_plane(state_dir)
+    try:
+        agent = cp.create_agent(
+            agent_id,
+            display_name,
+            instructions,
+            capabilities=list(capabilities),
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"created_agent={agent.id}")
+    click.echo(f"avatar={agent.avatar_id or 'local-fallback'}")
+
+
+@agent_group.command("list")
+@click.option(
+    "--state-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(".symposium"),
+    show_default=True,
+)
+def agent_list_cmd(state_dir: Path) -> None:
+    """List all reusable agents in the workspace registry."""
+    cp = _control_plane(state_dir)
+    try:
+        state = cp.ensure_initialized()
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    for agent in state.agents.values():
+        kind = "built-in" if agent.built_in else "custom"
+        click.echo(f"{agent.id} · {agent.display_name} · {kind} · {agent.status}")
 
 
 @main.command("replay")
@@ -267,12 +557,13 @@ def metrics_cmd(run_dir: Path, output_path: Optional[Path], quiet: bool) -> None
     if output_path is None:
         out_path = write_metrics(run_dir, metrics)
     else:
-        # Inline mirror of write_metrics with a caller-chosen destination.
-        from symposium.observability.metrics import _atomic_write_text
+        # Same atomic write + pretty layout as write_metrics, with a
+        # caller-chosen destination.
+        from symposium.observability.metrics import serialize_pretty
+        from symposium.storage.atomic import atomic_write_text
 
         payload = metrics.model_dump(mode="json", exclude_none=False)
-        text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        _atomic_write_text(output_path, text)
+        atomic_write_text(output_path, serialize_pretty(payload))
         out_path = output_path
 
     if not quiet:
@@ -404,6 +695,21 @@ def execution_replay_cmd(
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _control_plane(state_dir: Path):
+    from symposium.control_plane import ControlPlane
+
+    return ControlPlane(state_dir)
+
+
+def _control_snapshot(state_dir: Path):
+    cp = _control_plane(state_dir)
+    try:
+        cp.ensure_initialized()
+        return cp.public_snapshot()
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _load_config(path: Path, problem_path: Optional[Path]) -> Config:

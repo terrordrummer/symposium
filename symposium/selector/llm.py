@@ -66,7 +66,7 @@ def select_llm(
     # If FakeProvider: clear the round / turn hints so a `match.round`
     # clause (if any) is not accidentally satisfied by stale state.
     if hasattr(provider, "last_request_round"):
-        provider.last_request_round = None  # type: ignore[attr-defined]
+        provider.last_request_round = None
         provider.last_request_turn_index = None  # type: ignore[attr-defined]
 
     try:

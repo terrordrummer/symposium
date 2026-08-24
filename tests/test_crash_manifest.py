@@ -93,6 +93,26 @@ def test_provider_shutdown_called_even_on_crash(tmp_path, example_config):
     assert provider.shutdown_calls == 1
 
 
+def test_provider_shutdown_called_when_writer_setup_fails(
+    tmp_path, example_config, example_script, monkeypatch
+):
+    """Setup errors happen before the round loop but still own the adapters."""
+    provider = _ShutdownTrackingFake(example_script)
+
+    def fail_start(self, config, started_at):
+        raise OSError("cannot start writer")
+
+    monkeypatch.setattr("symposium.scheduler.loop.RunWriter.start", fail_start)
+    with pytest.raises(OSError, match="cannot start writer"):
+        run_session(
+            example_config,
+            {"default": provider},
+            runs_root=str(tmp_path),
+        )
+
+    assert provider.shutdown_calls == 1
+
+
 def test_raising_shutdown_does_not_mask_the_session_outcome(
     example_config, example_script
 ):

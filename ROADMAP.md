@@ -8,8 +8,8 @@ yet promoted to the roadmap live in spec §13.
 
 ## Current phase
 
-**Reference runtime shipped and iterating (v1.11.x, heading into
-v1.12).** The spec is frozen at v1.0.0; the reference Python runtime
+**Reference runtime shipped and iterating (v1.12.0).** The spec is frozen
+at v1.0.0; the reference Python runtime
 implements the Core MVP MUST-set (§1–§9) and has since grown a
 streaming-by-default MCP surface, adaptive deliberation (on-demand
 persona generation), and a live browser viewer:
@@ -34,16 +34,54 @@ persona generation), and a live browser viewer:
   `llm` strategies
 - ✅ CLI: `run` / `watch` / `replay` / `validate` / `metrics` /
   `execution-replay`
-- ✅ Live viewer (`symposium watch`, v1.11.0) — a read-only browser
-  page that tails `transcript.jsonl` over SSE: personas on a circle,
-  a glow on the speaker, animated arrows for directed inter-agent
-  requests; works on a running deliberation or a finished run
+- ✅ Live viewer (`symposium watch`, introduced in v1.11.0) — a read-only
+  browser page that tails `transcript.jsonl` over SSE. The current 2.0
+  vertical slice presents the built-in panel as a synthetic photographic
+  video-call grid, derives participant presence from real transcript events,
+  retains static directed-request arrows, and works for both live and finished
+  runs. The active speaker is highlighted while the other portraits are
+  attenuated; no visual element requires a paid provider.
 
 **Known deviations from the §11.2 MVP CLI contract**: `--config` is
 required (the spec makes it optional over an implementation default);
 the `--max-rounds` / `--provider` overrides are not implemented; and
 `replay` / `execution-replay` take a run-dir path rather than a bare
 session id.
+
+## Symposium 2.0 product track
+
+This product track is layered around the frozen v1 protocol rather than
+folded into its replay schemas. The detailed architecture and acceptance
+criteria live in [`docs/symposium-2.0.md`](docs/symposium-2.0.md).
+
+1. **Zero-cost static presence** — synthetic photographic stills for built-in
+   agents, deterministic initials/color cards for every unregistered agent,
+   static active-speaker focus, and no provider credentials or metered calls.
+   Shipped in the current viewer slice.
+2. **Optional local voice** — browser-native narration, speaking-state timing,
+   and interruption without a remote TTS dependency. Higher-quality local
+   adapters may be added later only if they keep the zero-cost default intact.
+3. **Room control plane** — persistent `Workspace`, `Room`, `Agent`, and
+   `RoomMembership` records; invite, onboard, listen, speak, and leave events;
+   Sartori as the user-facing coordinator. The local atomic store, CLI/MCP
+   commands, same-origin browser controls, and live viewer projection are
+   shipped. The browser composer now binds the speaking room members to a new
+   immutable v1 run and follows it live. The composer now also owns the whole
+   automatic loop UX: current agent, elapsed time, waiting expectation, and an
+   explicit terminal error or completion state.
+4. **Guest briefing flow** — invite a project owner such as the Zeus Focus
+   Talking lead, let it brief the room, then release it without losing the
+   room transcript or context boundary. The initial single-session flow and
+   requested/completed/failed audit trail are shipped.
+5. **Operational hardening** — permissions, quotas, synthetic-identity
+   disclosure, audit trail, and accessible static fallbacks.
+
+The current vertical slices complete the local identity catalog, static
+presence projection, manual/word-aware playback, zero-cost presentation policy,
+persistent room/membership foundation, and first room-to-run guest briefing.
+The macOS launcher now removes the remaining one-time terminal start and gives
+the UI ownership of clean shutdown. The next product slice adds continuity
+across room sessions plus browser interruption and recovery.
 
 ## What's next (per spec §12)
 
@@ -61,7 +99,7 @@ authoritative list with target windows:
   live stream; async job API; dynamic participant introduction
   (panel mutation); `EnsembleMode` (parallel first-pass perspectives);
   capability-based tool allowlists; external-loop adapter pattern.
-- **Roadmap** — TTS narration; persona registry (versioning,
+- **Roadmap** — optional local/browser narration; persona registry (versioning,
   lifecycle, signing, marketplace); benchmarking suite + curated
   problem sets; IDE plugin; HTTP/RPC service host pattern; voting /
   weighted-confidence convergence; bundled research adapters. (The
@@ -107,10 +145,10 @@ runtime. These are downstream of the protocol, not part of it.
   intent **without** in-loop panel mutation or any spec / schema change
   (true in-loop mutation remains a v1+/Roadmap runtime concern).
 
-## Open follow-ups (post v1.10.x)
+## Open follow-ups (post v1.12.0 review)
 
 - **Split the two oversized modules.** `symposium/scheduler/loop.py`
-  (~1,500 lines) and `symposium/integrations/mcp_server.py` (~1,800
+  (~1,600 lines) and `symposium/integrations/mcp_server.py` (~2,000
   lines) have each grown well past comfortable review size. Both
   should be factored into smaller units — the loop into its phases
   (round scheduling, verdict handling, branch/deferred mechanics,
@@ -118,6 +156,12 @@ runtime. These are downstream of the protocol, not part of it.
   plumbing, and the adaptive-deliberation orchestration — with no
   behavior change. Ordinary refactoring debt; no spec / schema
   impact.
+- **Establish a static-type gate.** The codebase is type-annotated but CI
+  currently enforces runtime tests and Ruff only; an ad-hoc Pyright pass
+  still reports annotation debt, concentrated in dynamic MCP event payloads,
+  Pydantic discriminated unions, and provider Literal normalization. Define
+  the supported checker/configuration, clean that baseline, then add it to CI
+  so type drift becomes a reviewed failure rather than an informal signal.
 - **Forensic per-vendor usage detail.** The canonical `Usage`
   (`prompt_tokens` / `completion_tokens` / `total_tokens` / `cost_usd`)
   is provider-uniform per §6.5, which means provider-specific
@@ -141,13 +185,3 @@ runtime. These are downstream of the protocol, not part of it.
   `deliberate*` surfaces. Open design question (Codex review T1 #7):
   whitelist of registered MCPs vs. inline JSON payload vs. path to a
   config file; pick one once a real use case shows up.
-- **codex `_classify_cli_exit` ordering bug.** In
-  `symposium/providers/codex_cli.py`, the substring match for
-  `"exceeded"` runs before the more-specific check for
-  `"context length"`, so a "context length exceeded" stderr is
-  classified as `quota_exhausted` instead of a context-window kind.
-  Diagnostic-only (both classifications are non-retriable today, so
-  retry behavior is unaffected). Fix is one-line: move the
-  `context && length` check before the generic `exceeded` match, with
-  two regression tests. Codex review T6 side-find — deferred from
-  v1.10.8 because it predates the cli-auto diff window.

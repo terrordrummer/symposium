@@ -15,11 +15,11 @@ it.
 How it maps onto the contract
 -----------------------------
 
-* **One turn → one `claude -p` invocation.** The §6.3 system message
-  (`request.messages[0]`, role `system`) becomes `--system-prompt`
-  (it *replaces* the CLI's default system prompt, so the turn is a lean
-  deliberation call, not an agentic-coding session). The remaining
-  messages are concatenated into the prompt, fed on **stdin**.
+* **One turn → one `claude -p` invocation.** The complete request is fed on
+  **stdin** so persona material never appears in the process list. The CLI is
+  started in safe mode, with built-in tools disabled and without session
+  persistence: a Symposium turn is a deliberation call, not an agentic-coding
+  session over the local repository.
 * **Structured output (§6.5) via `--json-schema`.** The expected output
   schema (`turn_structured_output` / `verdict` / `synthesis_content`) is
   emitted from its Pydantic model as a self-contained JSON Schema and
@@ -62,6 +62,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from symposium.models import (
+    FinishReason,
     ProviderError,
     ProviderRawMessage,
     ProviderRequest,
@@ -82,6 +83,12 @@ from symposium.providers.base import ProviderAdapter
 
 DEFAULT_CLAUDE_BINARY = "claude"
 DEFAULT_MODEL = "sonnet"
+SYMPOSIUM_SYSTEM_PROMPT = (
+    "You are one participant in a bounded Symposium deliberation. "
+    "Follow the private [SYSTEM] guidance supplied in the input, use only the "
+    "information in that input, do not inspect the local machine, and return "
+    "the requested structured output."
+)
 # Per-invocation timeout. Calibrated against real-world deliberation
 # turns: a multi-paragraph technical problem statement (~3KB) on the
 # sonnet alias takes ~6 minutes per turn at "low" effort because the
@@ -162,6 +169,15 @@ class ClaudeCliProvider(ProviderAdapter):
         ``disable_mcps=False`` only if you have a specific reason for
         the spawned child to load MCPs (eg. tool-use over CLI, not yet
         wired through this adapter as of v1.10).
+    safe_mode:
+        When True (the **default**), append ``--safe-mode``, ``--tools ""``,
+        and ``--no-session-persistence``. Safe mode preserves the user's
+        normal OAuth/keychain authentication while disabling project/user
+        customizations; the empty tool list prevents a deliberation persona
+        from reading or modifying the checkout. Structured output remains
+        available because it is an output-format facility, not a tool exposed
+        to the agent. Set this to False only for compatibility with an older
+        Claude Code binary that predates ``--safe-mode``.
     env:
         Environment passed to the subprocess. ``None`` (the default)
         means :func:`~symposium.providers._cli_env.headless_child_env`:
@@ -193,6 +209,7 @@ class ClaudeCliProvider(ProviderAdapter):
         extra_args: Optional[List[str]] = None,
         bare: bool = False,
         disable_mcps: bool = True,
+        safe_mode: bool = True,
         env: Optional[Dict[str, str]] = None,
         runner: Optional[Runner] = None,
         check_binary: bool = True,
@@ -203,6 +220,7 @@ class ClaudeCliProvider(ProviderAdapter):
         self._extra_args = list(extra_args or [])
         self._bare = bare
         self._disable_mcps = disable_mcps
+        self._safe_mode = safe_mode
         self._env_override = env
         self._run: Runner = runner or run_in_process_group
         if check_binary and runner is None and shutil.which(binary) is None:
@@ -257,7 +275,18 @@ class ClaudeCliProvider(ProviderAdapter):
             user_prompt = f"{user_prompt}{system_suffix}"
 
         model = request.model or self._default_model
-        argv: List[str] = [self._binary, "-p", "--output-format", "json", "--model", model]
+        argv: List[str] = [
+            self._binary,
+            "-p",
+            "--output-format",
+            "json",
+            "--model",
+            model,
+            # Replace Claude Code's coding-agent prompt with a small constant.
+            # Persona material stays on stdin and therefore out of `ps`.
+            "--system-prompt",
+            SYMPOSIUM_SYSTEM_PROMPT,
+        ]
         if self._bare:
             # `--bare`: headless / minimal mode (no hooks, no LSP, no plugin
             # sync, no auto-memory, no CLAUDE.md auto-discovery, no keychain
@@ -272,6 +301,14 @@ class ClaudeCliProvider(ProviderAdapter):
             # second npm-exec at startup; a deliberation turn doesn't need
             # any of them. Unlike --bare, this preserves OAuth/keychain.
             argv += ["--strict-mcp-config", "--mcp-config", '{"mcpServers": {}}']
+        if self._safe_mode:
+            # A room turn needs the model, not Claude Code's project agent.
+            # Safe mode preserves OAuth auth but suppresses CLAUDE.md, hooks,
+            # skills, plugins, and memory; the empty tool list prevents local
+            # repository access. Session persistence is unnecessary for the
+            # immutable Symposium transcript and would retain private persona
+            # context outside the run artifact.
+            argv += ["--safe-mode", "--tools", "", "--no-session-persistence"]
         # The system block — which carries persona material and may contain
         # confidential prompt fragments — is ALWAYS folded into the stdin
         # payload with a `[SYSTEM]` sentinel; we never put it on the argv
@@ -344,18 +381,32 @@ class ClaudeCliProvider(ProviderAdapter):
                 usage=usage,
             )
 
-        finish = _finish_reason(data.get("stop_reason"))
+        structured = data.get("structured_output")
+        stop_reason = data.get("stop_reason")
+        # Claude Code implements --json-schema through an internal structured-
+        # output tool. Current CLI releases may therefore report `tool_use`
+        # even on a successful terminal result. The result envelope's success
+        # subtype plus a concrete structured_output object is the authoritative
+        # success contract. Never accept tool_use on the free-text path or when
+        # the validated object is absent.
+        structured_tool_stop = (
+            stop_reason == "tool_use"
+            and schema_json is not None
+            and isinstance(structured, dict)
+        )
+        finish: FinishReason = "stop" if structured_tool_stop else _finish_reason(stop_reason)
         if finish == "error":
             # Unknown stop_reason terminally — align with the anthropic
             # adapter: surface an internal error instead of a clean stop.
             return _error_result(
                 "internal",
-                f"claude CLI returned unexpected stop_reason: {data.get('stop_reason')!r}",
+                f"claude CLI returned unexpected stop_reason: {stop_reason!r}",
                 retriable=False,
                 raw=_safe(data),
                 usage=usage,
             )
-        result_text = data.get("result") if isinstance(data.get("result"), str) else ""
+        raw_result = data.get("result")
+        result_text = raw_result if isinstance(raw_result, str) else ""
 
         # Free-text path (null schema): no structured validation (§4.1 llm selector).
         if schema_json is None:
@@ -369,7 +420,6 @@ class ClaudeCliProvider(ProviderAdapter):
                 error=None,
             )
 
-        structured = data.get("structured_output")
         if not isinstance(structured, dict):
             return _malformed(
                 request,
@@ -475,7 +525,7 @@ def _usage_from_cli(data: Dict[str, Any]) -> Usage:
     )
 
 
-def _finish_reason(stop_reason: Optional[str]) -> str:
+def _finish_reason(stop_reason: Optional[str]) -> FinishReason:
     if stop_reason in ("end_turn", "stop_sequence", None):
         return "stop"
     if stop_reason == "max_tokens":

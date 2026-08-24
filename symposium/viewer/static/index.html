@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="it">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11,43 +11,168 @@
     <div class="brand">⬡ Symposium <span class="brand-sub">live</span></div>
     <div class="controls">
       <label class="run-select">
-        run
+        sessione
         <select id="runSelect"></select>
       </label>
       <label class="toggle">
-        <input type="checkbox" id="followNewest" checked> follow newest
+        <input type="checkbox" id="followNewest" checked> segui la più recente
       </label>
       <label class="toggle">
-        <input type="checkbox" id="ttsToggle"> 🔊 voice
+        <input type="checkbox" id="ttsToggle"> 🔊 voce locale
       </label>
+      <span id="ttsStatus" class="tts-status" title="Voce neurale locale, senza API">da configurare</span>
+      <label class="replay-speed">
+        riproduzione
+        <select id="replaySpeed" aria-label="Velocità riproduzione">
+          <option value="manual" selected>manuale</option>
+          <option value="0.5">automatica · 0,5×</option>
+          <option value="1">automatica · 1×</option>
+          <option value="2">automatica · 2×</option>
+        </select>
+      </label>
+      <button id="replayButton" class="replay-button" type="button">▶ Riproduci</button>
+      <button id="replayNextButton" class="replay-button" type="button" disabled>Avanti →</button>
+      <button id="sartoriOpenButton" class="replay-button" type="button"
+              aria-controls="sartoriPanel" aria-expanded="false">Sartori</button>
       <span id="status" class="status status-idle">idle</span>
     </div>
   </header>
 
   <main>
     <section id="stage">
-      <svg id="circle" viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid meet">
+      <div class="room-heading">
+        <div>
+          <span class="eyebrow">stanza attiva</span>
+          <h1 id="roomName">Symposium</h1>
+        </div>
+        <span class="synthetic-disclosure">Identità sintetiche</span>
+      </div>
+      <div id="problem" class="problem"></div>
+      <div id="nodes" class="meeting-grid" aria-live="polite"></div>
+      <svg id="connections" class="connections" aria-hidden="true">
         <defs>
           <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="3"
                   orient="auto" markerUnits="strokeWidth">
             <path d="M0,0 L8,3 L0,6 Z" fill="currentColor"></path>
           </marker>
-          <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
-            <feGaussianBlur stdDeviation="9" result="b"></feGaussianBlur>
-            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
         </defs>
         <g id="edges"></g>
-        <g id="nodes"></g>
       </svg>
-      <div id="problem" class="problem"></div>
     </section>
 
     <aside id="chat">
-      <div id="chatHead" class="chat-head">deliberation</div>
+      <div id="chatHead" class="chat-head">conversazione</div>
+      <section id="executionActivity" class="execution-activity" role="status"
+               aria-live="polite" hidden>
+        <div class="execution-activity-head">
+          <span id="executionPhase" class="execution-phase">discussione avviata</span>
+          <span id="executionElapsed" class="execution-elapsed">00:00</span>
+        </div>
+        <strong id="executionTitle">Il team sta iniziando a lavorare</strong>
+        <p id="executionDetail">Il loop è automatico: non devi fare nulla.</p>
+        <div class="execution-steps" aria-hidden="true">
+          <span data-step="received">Domanda ricevuta</span>
+          <span data-step="thinking">Agente al lavoro</span>
+          <span data-step="answer">Risposta in call</span>
+        </div>
+      </section>
       <div id="chatLog" class="chat-log"></div>
+      <form id="roomPromptForm" class="room-composer">
+        <label for="roomPrompt">Parla alla stanza</label>
+        <textarea id="roomPrompt" name="problem" required maxlength="20000"
+                  placeholder="Fai una domanda al team…"></textarea>
+        <div class="composer-actions">
+          <span id="roomPromptStatus" role="status" aria-live="polite">
+            Gli agenti presenti risponderanno nella chiamata.
+          </span>
+          <button id="roomPromptButton" type="submit">Avvia discussione</button>
+        </div>
+      </form>
     </aside>
   </main>
+
+  <aside id="sartoriPanel" class="sartori-panel" aria-label="Controlli di Sartori" hidden>
+    <div class="sartori-head">
+      <div>
+        <span class="eyebrow">coordinatore</span>
+        <h2>Sartori</h2>
+      </div>
+      <button id="sartoriCloseButton" class="icon-button" type="button"
+              aria-label="Chiudi pannello Sartori">×</button>
+    </div>
+
+    <p class="sartori-intro">Scrivi un comando oppure usa i controlli della stanza.</p>
+    <form id="sartoriCommandForm" class="control-form command-form">
+      <label for="sartoriCommand">Istruzione</label>
+      <div class="inline-control">
+        <input id="sartoriCommand" name="command" required
+               placeholder="Invita il Responsabile Zeus">
+        <button type="submit">Invia</button>
+      </div>
+      <small>Per esempio: “crea una stanza Prodotto per decidere la roadmap”.</small>
+    </form>
+    <div id="sartoriFeedback" class="sartori-feedback" role="status" aria-live="polite">
+      In ascolto.
+    </div>
+
+    <section class="control-section">
+      <h3>Stanze</h3>
+      <div class="inline-control">
+        <select id="roomControlSelect" aria-label="Stanza da gestire"></select>
+        <button id="roomSwitchButton" type="button">Entra</button>
+        <button id="roomArchiveButton" class="danger-button" type="button">Archivia</button>
+      </div>
+      <details>
+        <summary>Nuova stanza</summary>
+        <form id="roomCreateForm" class="control-form">
+          <label>Nome <input name="name" required maxlength="120"></label>
+          <label>Scopo <textarea name="purpose" required maxlength="2000"></textarea></label>
+          <button type="submit">Crea e apri</button>
+        </form>
+      </details>
+    </section>
+
+    <section class="control-section">
+      <h3>Agenti</h3>
+      <div id="agentRegistry" class="agent-registry"></div>
+      <details>
+        <summary>Nuovo agente</summary>
+        <form id="agentCreateForm" class="control-form">
+          <label>Nome <input name="display_name" required maxlength="120"></label>
+          <label>ID opzionale <input name="agent_id" maxlength="64"
+                 pattern="[a-z0-9][a-z0-9_-]{0,63}"></label>
+          <label>Istruzioni <textarea name="instructions" required maxlength="20000"></textarea></label>
+          <label>Capacità <input name="capabilities" placeholder="progetto, rischi, delivery"></label>
+          <div class="avatar-picker">
+            <img id="avatarPreview" alt="Anteprima del ritratto sintetico assegnato">
+            <div>
+              <strong>Identità visiva e voce</strong>
+              <small id="avatarPreviewMeta">Scelta casuale tra i volti disponibili.</small>
+              <input id="avatarChoice" name="avatar_id" type="hidden">
+              <button id="avatarRerollButton" type="button">Cambia volto</button>
+            </div>
+          </div>
+          <label class="toggle"><input name="invite" type="checkbox" checked>
+            invita subito nella stanza attiva</label>
+          <button type="submit">Crea agente</button>
+        </form>
+      </details>
+    </section>
+
+    <section id="launcherControls" class="control-section" hidden>
+      <h3>Applicazione</h3>
+      <p class="control-note">Il launcher mantiene attivo il backend locale anche se chiudi questa scheda.</p>
+      <button id="shutdownButton" class="danger-button" type="button">Chiudi Symposium</button>
+    </section>
+  </aside>
+
+  <section id="shutdownScreen" class="shutdown-screen" hidden aria-live="assertive">
+    <div>
+      <span class="eyebrow">applicazione chiusa</span>
+      <h2>Symposium è stato arrestato.</h2>
+      <p>Puoi chiudere questa scheda. Per riaprire il workspace fai doppio clic su Symposium.app.</p>
+    </div>
+  </section>
 
   <script src="/static/app.js"></script>
 </body>

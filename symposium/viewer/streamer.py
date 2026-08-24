@@ -3,7 +3,7 @@
 Pure, read-only transforms over the run directory's ``config.json`` and
 ``transcript.jsonl``. Two responsibilities:
 
-1. :func:`config_event` — derive the circle layout inputs (panel personas
+1. :func:`config_event` — derive the meeting-grid inputs (panel personas
    + coordinator + the problem statement) from ``config.json``.
 2. :class:`EdgeResolver` — turn each ``branch_turn`` into a directed-arrow
    edge by looking back at the message it answers. A ``branch_turn``'s
@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from symposium.avatars import avatar_for
 
 # Per-type readable text, in priority order. primary/branch turns carry
 # `.text`; synthesis carries `integrated_answer`; coordination (Verdict)
@@ -52,23 +54,26 @@ def _direct_requests(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _persona_entry(persona_ref: Any, agent_id: str) -> Dict[str, Any]:
     """Normalize an agent's persona_ref (str id or embedded Persona dict)."""
+    agent_id = _safe_id(agent_id, "?")
     if isinstance(persona_ref, dict):
-        pid = persona_ref.get("id") or agent_id
+        pid = _safe_id(persona_ref.get("id"), agent_id)
         return {
             "id": agent_id,
             "label": _label(pid),
             "persona_id": pid,
             "persona_class": persona_ref.get("persona_class"),
             "reasoning_scope": persona_ref.get("reasoning_scope"),
+            "avatar": avatar_for(pid).viewer_payload(),
         }
     # bare string id (unresolved ref)
-    pid = persona_ref if isinstance(persona_ref, str) else agent_id
+    pid = _safe_id(persona_ref, agent_id)
     return {
         "id": agent_id,
         "label": _label(pid),
         "persona_id": pid,
         "persona_class": None,
         "reasoning_scope": None,
+        "avatar": avatar_for(pid).viewer_payload(),
     }
 
 
@@ -76,12 +81,16 @@ def _label(pid: str) -> str:
     return pid.replace("_", " ").replace("-", " ").strip().title() or pid
 
 
+def _safe_id(value: Any, fallback: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
 def config_event(run_dir: Path) -> Dict[str, Any]:
     """Build the ``config`` SSE payload from ``<run_dir>/config.json``.
 
     Degrades gracefully: if config.json is missing/partial, returns
     whatever can be derived (the message stream alone still drives the
-    chat; the circle just starts empty and fills as speakers appear).
+    chat; the meeting grid simply starts empty).
     """
     run_dir = Path(run_dir)
     cfg_path = run_dir / "config.json"
@@ -89,6 +98,7 @@ def config_event(run_dir: Path) -> Dict[str, Any]:
         "session_id": run_dir.name,
         "personas": [],
         "coordinator": None,
+        "coordinator_profile": None,
         "problem_statement": "",
     }
     if not cfg_path.exists():
@@ -110,10 +120,20 @@ def config_event(run_dir: Path) -> Dict[str, Any]:
 
     coord = cfg.get("coordinator")
     if isinstance(coord, dict):
-        payload["coordinator"] = coord.get("id")
+        payload["coordinator"] = _safe_id(coord.get("id"), "coordinator")
+        payload["coordinator_profile"] = _persona_entry(
+            coord.get("persona_ref"), payload["coordinator"]
+        )
     selector = cfg.get("selector")
     if not payload["coordinator"] and isinstance(selector, dict):
-        payload["coordinator"] = selector.get("coordinator_agent")
+        payload["coordinator"] = _safe_id(
+            selector.get("coordinator_agent"), "coordinator"
+        )
+    if payload["coordinator"] and payload["coordinator_profile"] is None:
+        coordinator_id = payload["coordinator"]
+        payload["coordinator_profile"] = _persona_entry(
+            coordinator_id, coordinator_id
+        )
     return payload
 
 

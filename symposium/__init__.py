@@ -62,11 +62,11 @@ def __getattr__(name: str):
     # Lazy import of scheduler-side symbols so models can be imported
     # before the scheduler module is built.
     if name in ("Session", "run_session"):
-        from symposium.scheduler import Session, run_session  # type: ignore
+        from symposium.scheduler import Session, run_session
 
         return {"Session": Session, "run_session": run_session}[name]
     if name == "run_selector":
-        from symposium.selector import run_selector  # type: ignore
+        from symposium.selector import run_selector
 
         return run_selector
     raise AttributeError(f"module 'symposium' has no attribute {name!r}")

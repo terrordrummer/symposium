@@ -74,6 +74,8 @@ import httpx
 import jsonschema
 
 from symposium.models import (
+    ErrorKind,
+    FinishReason,
     ProviderError,
     ProviderRawMessage,
     ProviderRequest,
@@ -399,7 +401,11 @@ class AnthropicProvider(ProviderAdapter):
                     "content": content_blocks,
                 }
                 next_messages: List[Dict[str, Any]] = list(current_messages) + [assistant_entry]
-                tools_by_name = {t.get("name"): t for t in (request.tools or [])}
+                tools_by_name: Dict[str, Dict[str, Any]] = {}
+                for t in request.tools or []:
+                    tname = t.get("name")
+                    if isinstance(tname, str):
+                        tools_by_name[tname] = t
 
                 aborted, tool_result_blocks = self._run_tool_iteration(
                     tool_use_blocks=tool_use_blocks,
@@ -801,6 +807,8 @@ class AnthropicProvider(ProviderAdapter):
         vendor_type = err.get("type") or ""
         vendor_message = err.get("message") or (resp.text or f"HTTP {status}")
 
+        kind: ErrorKind
+        retriable: bool
         if status == 408:
             kind, retriable = "timeout", True
         elif status == 429:
@@ -980,7 +988,7 @@ def _first_text_block(blocks: Any) -> str:
     return ""
 
 
-def _normalize_finish_reason(vendor_stop: Optional[str]) -> str:
+def _normalize_finish_reason(vendor_stop: Optional[str]) -> FinishReason:
     """§6.10 Anthropic terminal mapping."""
     if vendor_stop == "end_turn":
         return "stop"

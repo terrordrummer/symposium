@@ -5,21 +5,26 @@ from __future__ import annotations
 import errno
 import json
 import os
-import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 from symposium.models import (
     Artifact,
     Config,
     Message,
+    ProducerInfo,
     RunManifest,
     SelectorOutput,
     TerminationArtifact,
     now_utc_iso,
 )
+from symposium.storage.atomic import atomic_write_text
 from symposium.storage.digest import serialize_pretty
 from symposium.storage.paths import RunDirectory
+
+# Historical internal name, kept so any external caller patching or
+# importing the writer-private helper keeps working.
+_atomic_write_text = atomic_write_text
 
 
 _LOCKFILE_NAME = ".lock"
@@ -106,7 +111,7 @@ class RunWriter:
 
     def __init__(self, run_dir: RunDirectory) -> None:
         self.run_dir = run_dir
-        self._journal_fp = None
+        self._journal_fp: Optional[TextIO] = None
         self._lock_path: Optional[Path] = None
         # Only set once `_acquire_lock` succeeds: a writer whose start()
         # failed with RunDirectoryLocked must never release (unlink) the
@@ -134,40 +139,65 @@ class RunWriter:
         self._session_id = config.session_id
         self._started_at = started_at
 
+        manifest_started = False
         try:
             config_dump = config.model_dump(mode="json", exclude_none=True)
             _atomic_write_text(self.run_dir.config_path, serialize_pretty(config_dump))
-        except Exception:
-            # Pre-journal failure: release the lock so the dir is not stuck.
+            in_progress = RunManifest(
+                session_id=config.session_id,
+                status="in_progress",
+                producer=ProducerInfo(name=PRODUCER_NAME, version=PRODUCER_VERSION),
+                created_at=started_at,
+                updated_at=started_at,
+                artifact_path="artifact.json",
+                config_path="config.json",
+                journal_path="transcript.jsonl",
+            )
+            self._write_manifest(in_progress)
+            manifest_started = True
+            # Open the journal fresh ("w") in line-buffered mode (crash-safe up
+            # to the granularity of one line per turn). Truncation matters: a
+            # reused session_id (or a second replay into the same directory)
+            # must not concatenate two runs into one transcript.jsonl while the
+            # manifest / artifact are atomically replaced.
+            self._journal_fp = open(
+                self.run_dir.journal_path, "w", encoding="utf-8", buffering=1
+            )
+            # Match the 0600 mode of the atomically written files: the journal
+            # carries the same deliberation content and must not be more
+            # permissive than the artifact.
+            try:
+                os.chmod(self.run_dir.journal_path, 0o600)
+            except OSError:
+                pass
+        except BaseException:
+            # Any failure after acquisition — config/manifest persistence,
+            # journal open, or an interruption — must leave the directory
+            # immediately re-lockable. Relying on __del__ would make recovery
+            # depend on garbage-collection timing and can wedge long-lived
+            # hosts such as the MCP server.
+            if manifest_started:
+                try:
+                    # Once an in-progress manifest is visible, replace it with
+                    # a truthful terminal diagnostic instead of leaving a
+                    # lock-free run that still claims to be in progress.
+                    self.mark_crashed(updated_at=now_utc_iso())
+                except Exception:  # noqa: BLE001 — preserve the setup failure
+                    pass
+            # mark_crashed() also releases the lock, even if its manifest
+            # rewrite fails. The cleanup below is a no-op in that normal path
+            # and covers failures that happened before the manifest existed.
+            if self._journal_fp is not None:
+                try:
+                    self._journal_fp.close()
+                except Exception:  # noqa: BLE001 — teardown must release the lock
+                    pass
+                finally:
+                    self._journal_fp = None
             self._release_lock()
+            # Preserve the original setup exception rather than a best-effort
+            # crash-diagnostic failure.
             raise
-
-        in_progress = RunManifest(
-            session_id=config.session_id,
-            status="in_progress",
-            producer={"name": PRODUCER_NAME, "version": PRODUCER_VERSION},
-            created_at=started_at,
-            updated_at=started_at,
-            artifact_path="artifact.json",
-            config_path="config.json",
-            journal_path="transcript.jsonl",
-        )
-        self._write_manifest(in_progress)
-        # Open the journal fresh ("w") in line-buffered mode (crash-safe up
-        # to the granularity of one line per turn). Truncation matters: a
-        # reused session_id (or a second replay into the same directory)
-        # must not concatenate two runs into one transcript.jsonl while the
-        # manifest / artifact are atomically replaced.
-        self._journal_fp = open(
-            self.run_dir.journal_path, "w", encoding="utf-8", buffering=1
-        )
-        # Match the 0600 mode of the atomically written files: the journal
-        # carries the same deliberation content and must not be more
-        # permissive than the artifact.
-        try:
-            os.chmod(self.run_dir.journal_path, 0o600)
-        except OSError:
-            pass
 
     def append_message(self, msg: Message) -> None:
         if self._journal_fp is None:
@@ -216,14 +246,14 @@ class RunWriter:
         final_manifest = RunManifest(
             session_id=artifact.session_id,
             status=status,  # type: ignore[arg-type]
-            producer={"name": PRODUCER_NAME, "version": PRODUCER_VERSION},
+            producer=ProducerInfo(name=PRODUCER_NAME, version=PRODUCER_VERSION),
             created_at=artifact.started_at,
             updated_at=updated_at or artifact.ended_at,
             artifact_path="artifact.json",
             config_path="config.json",
             journal_path="transcript.jsonl",
             transcript_digest=artifact.transcript_digest,
-            outcome_kind=outcome_kind,  # type: ignore[arg-type]
+            outcome_kind=outcome_kind,
         )
         self._write_manifest(final_manifest)
 
@@ -246,22 +276,29 @@ class RunWriter:
         crashed = RunManifest(
             session_id=self._session_id,
             status="crashed",
-            producer={"name": PRODUCER_NAME, "version": PRODUCER_VERSION},
+            producer=ProducerInfo(name=PRODUCER_NAME, version=PRODUCER_VERSION),
             created_at=self._started_at or ts,
             updated_at=ts,
             artifact_path="artifact.json",
             config_path="config.json",
             journal_path="transcript.jsonl",
         )
-        self._write_manifest(crashed)
-        if self._journal_fp is not None:
-            try:
-                self._journal_fp.flush()
-                self._journal_fp.close()
-            except OSError:
-                pass
-            self._journal_fp = None
-        self._release_lock()
+        try:
+            self._write_manifest(crashed)
+        finally:
+            # Teardown is unconditional even when the crash-manifest write
+            # itself fails (for example, a full or read-only filesystem).
+            # The original persistence error still propagates, but it must
+            # never strand an open journal or an owned lock.
+            if self._journal_fp is not None:
+                try:
+                    self._journal_fp.flush()
+                    self._journal_fp.close()
+                except Exception:  # noqa: BLE001 — best-effort crash teardown
+                    pass
+                finally:
+                    self._journal_fp = None
+            self._release_lock()
 
     def _acquire_lock_breaking_stale(self, started_at: str) -> None:
         """Acquire the lock, breaking at most one confirmed-stale lock per pass.
@@ -280,17 +317,20 @@ class RunWriter:
                 self._acquire_lock(started_at)
                 return
             except RunDirectoryLocked:
-                observed = _read_lock_pid(self._lock_path)
+                lock_path = self._lock_path
+                if lock_path is None:  # pragma: no cover — set before this loop
+                    raise
+                observed = _read_lock_pid(lock_path)
                 if observed is None or observed <= 0 or not _pid_is_dead(observed):
                     raise
                 # TOCTOU guard: only unlink while the lock still holds the
                 # pid we observed as stale. A changed pid (or a vanished
                 # file) means another starter already broke it — retry the
                 # acquisition from scratch.
-                if _read_lock_pid(self._lock_path) != observed:
+                if _read_lock_pid(lock_path) != observed:
                     continue
                 try:
-                    os.unlink(self._lock_path)
+                    os.unlink(lock_path)
                 except FileNotFoundError:
                     pass
         raise RunDirectoryLocked(
@@ -339,46 +379,4 @@ class RunWriter:
 
     def _write_manifest(self, manifest: RunManifest) -> None:
         dump = manifest.model_dump(mode="json", exclude_none=True)
-        _atomic_write_text(self.run_dir.manifest_path, serialize_pretty(dump))
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text atomically by writing to a sibling tempfile then renaming.
-
-    Order of operations: write → flush → fsync → rename → fsync(dir). The
-    extra fsync of the parent directory makes the rename durable across a
-    crash on POSIX file systems (without it, a post-crash recovery may see
-    the file under its old name or not at all). `os.replace` is atomic on
-    POSIX and on Windows for same-volume renames; the fsyncs make the
-    durability promise survive power loss.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass  # fsync not supported (e.g. some Windows / shared FS)
-        os.replace(tmp_path, path)
-        # mkstemp creates the tempfile 0600 and os.replace carries that mode
-        # over. Keep it: run files hold full deliberation content, so they
-        # stay private to the owning user (the journal is tightened to match
-        # when it is opened).
-        # Fsync the parent directory so the rename is durable.
-        try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except (OSError, AttributeError):
-            pass  # not supported on Windows or some filesystems
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+        atomic_write_text(self.run_dir.manifest_path, serialize_pretty(dump))

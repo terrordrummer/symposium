@@ -38,6 +38,9 @@ Tools exposed:
     default panel + coordinator).
   * ``generate_persona``              — design ONE new domain expert
     persona from a free-text capability need.
+  * ``sartori_*``                     — initialize/inspect the local 2.x
+    workspace and create, switch, staff, or clear persistent rooms. These
+    records remain outside the frozen v1 run artifacts.
 
 The `mcp` SDK is an OPTIONAL dependency (the ``[mcp]`` extra). It is
 imported at *this module's* import time, NOT at `symposium` package
@@ -65,6 +68,12 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from symposium.control_plane import ControlPlane
+from symposium.control_plane.models import MembershipRole
+from symposium.integrations.persona_factory import (
+    generate_persona as _generate_persona,
+    make_cli_persona_caller,
+)
 from symposium.models import (
     AgentConfig,
     Artifact,
@@ -75,10 +84,6 @@ from symposium.models import (
     RuntimeConfig,
     SelectorBudget,
     SelectorConfig,
-)
-from symposium.integrations.persona_factory import (
-    generate_persona as _generate_persona,
-    make_cli_persona_caller,
 )
 from symposium.observability import compute_metrics
 from symposium.personas import COORDINATOR, DEFAULT_PANEL, persona_by_id
@@ -689,6 +694,122 @@ def list_personas() -> List[Dict[str, str]]:
         return [_error(exc)]
 
 
+def _sartori_control_plane(state_dir: str) -> ControlPlane:
+    cp = ControlPlane(Path(state_dir))
+    cp.ensure_initialized()
+    return cp
+
+
+@mcp.tool()
+def sartori_workspace_status(state_dir: str = ".symposium") -> Dict[str, Any]:
+    """Inspect Sartori's active room, participants, rooms, and recent events.
+
+    The local workspace is initialized on first use. This reads product state,
+    not v1 run artifacts, and performs no model or network call.
+    """
+    try:
+        return _sartori_control_plane(state_dir).public_snapshot()
+    except Exception as exc:  # noqa: BLE001 — structured MCP result
+        return _error(exc)
+
+
+@mcp.tool()
+def sartori_create_room(
+    name: str,
+    purpose: str,
+    room_id: Optional[str] = None,
+    state_dir: str = ".symposium",
+) -> Dict[str, Any]:
+    """Create a persistent room with Sartori present in listening mode."""
+    try:
+        cp = _sartori_control_plane(state_dir)
+        room = cp.create_room(name, purpose, room_id=room_id)
+        return {
+            "room": room.model_dump(mode="json"),
+            "sartori_presence": "listening",
+        }
+    except Exception as exc:  # noqa: BLE001 — structured MCP result
+        return _error(exc)
+
+
+@mcp.tool()
+def sartori_switch_room(
+    room: str, state_dir: str = ".symposium"
+) -> Dict[str, Any]:
+    """Switch Sartori and the viewer context to an existing active room."""
+    try:
+        cp = _sartori_control_plane(state_dir)
+        selected = cp.switch_room(room)
+        return {
+            "active_room": selected.model_dump(mode="json"),
+            "participants": cp.public_snapshot()["participants"],
+        }
+    except Exception as exc:  # noqa: BLE001 — structured MCP result
+        return _error(exc)
+
+
+@mcp.tool()
+def sartori_create_agent(
+    agent_id: str,
+    display_name: str,
+    instructions: str,
+    capabilities: Optional[List[str]] = None,
+    state_dir: str = ".symposium",
+) -> Dict[str, Any]:
+    """Create one globally reusable agent without placing it in a room."""
+    try:
+        cp = _sartori_control_plane(state_dir)
+        agent = cp.create_agent(
+            agent_id,
+            display_name,
+            instructions,
+            capabilities=capabilities,
+        )
+        return {
+            "agent": agent.model_dump(mode="json"),
+            "avatar": agent.avatar_id or "local-fallback",
+        }
+    except Exception as exc:  # noqa: BLE001 — structured MCP result
+        return _error(exc)
+
+
+@mcp.tool()
+def sartori_invite_agent(
+    agent: str,
+    room: Optional[str] = None,
+    role: MembershipRole = "guest",
+    onboarding_context: Optional[str] = None,
+    state_dir: str = ".symposium",
+) -> Dict[str, Any]:
+    """Invite an existing agent into a room with bounded disclosed context."""
+    try:
+        cp = _sartori_control_plane(state_dir)
+        membership = cp.invite_agent(
+            agent,
+            room=room,
+            role=role,
+            onboarding_context=onboarding_context,
+        )
+        return {"membership": membership.model_dump(mode="json")}
+    except Exception as exc:  # noqa: BLE001 — structured MCP result
+        return _error(exc)
+
+
+@mcp.tool()
+def sartori_dismiss_agent(
+    agent: str,
+    room: Optional[str] = None,
+    state_dir: str = ".symposium",
+) -> Dict[str, Any]:
+    """Dismiss an agent from a room while retaining the auditable visit."""
+    try:
+        cp = _sartori_control_plane(state_dir)
+        membership = cp.dismiss_agent(agent, room=room)
+        return {"membership": membership.model_dump(mode="json")}
+    except Exception as exc:  # noqa: BLE001 — structured MCP result
+        return _error(exc)
+
+
 @mcp.tool()
 def get_version() -> Dict[str, Any]:
     """Return the running MCP server's version + provenance + key defaults.
@@ -1169,11 +1290,11 @@ def _run_adaptive(
     generated: List[Dict[str, Any]] = []
 
     # --- early-start expansion ------------------------------------------------
-    for need in (experts or []):
-        persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+    for early_need in (experts or []):
+        persona = _generate_persona(early_need, caller=persona_caller, existing_ids=existing)
         config = _add_persona(config, persona, provider=add_provider, model=add_model)
         existing.add(persona.id)
-        generated.append({"id": persona.id, "need": need, "phase": "early_start"})
+        generated.append({"id": persona.id, "need": early_need, "phase": "early_start"})
 
     # --- run + runtime expansion ---------------------------------------------
     sessions: List[Dict[str, Any]] = []
@@ -1305,18 +1426,18 @@ def stream_adaptive(
     sessions: List[Dict[str, Any]] = []
 
     # --- early-start expansion ---------------------------------------------
-    for need in (experts or []):
+    for early_need in (experts or []):
         try:
-            persona = _generate_persona(need, caller=persona_caller, existing_ids=existing)
+            persona = _generate_persona(early_need, caller=persona_caller, existing_ids=existing)
         except Exception as exc:  # noqa: BLE001
             yield {"event": "error", "error": _error(exc)["error"]}
             return
         config = _add_persona(config, persona, provider=add_provider, model=add_model)
         existing.add(persona.id)
-        generated.append({"id": persona.id, "need": need, "phase": "early_start"})
+        generated.append({"id": persona.id, "need": early_need, "phase": "early_start"})
         yield {
             "event": "agent_generated",
-            "id": persona.id, "need": need, "phase": "early_start",
+            "id": persona.id, "need": early_need, "phase": "early_start",
         }
 
     # --- run + runtime expansion -------------------------------------------
